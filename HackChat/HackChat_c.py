@@ -18,7 +18,7 @@ except ImportError:
 if sys.platform == "win32":
     ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("myapp.chat.client")
 
-HOST = "IP"
+HOST = "127.0.0.1"  # Change this to your Chat server IP address
 PORT = 8080
 
 username = getpass.getuser()

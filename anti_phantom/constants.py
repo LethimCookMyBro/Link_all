@@ -64,7 +64,10 @@ SEARCH_LOCATION_TEMPLATES = (
 
 HOSTS_PATH_TEMPLATE = r"%WINDIR%\System32\drivers\etc\hosts"
 REPORT_FILENAME = "PhantomLink_Removal_Report.txt"
-MALICIOUS_IP_MARKER = "IP"
+MALICIOUS_IP_MARKER = {
+    "81.10.55.8",
+    # Add other known C2 IPs here
+}
 
 
 def expand_path_templates(templates):

