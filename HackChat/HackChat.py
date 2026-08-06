@@ -3,6 +3,8 @@ import threading
 import tkinter as tk
 from tkinter.scrolledtext import ScrolledText
 import time
+import sys
+from pathlib import Path
 
 version = 1.0 #22/2/2026
 
@@ -12,22 +14,25 @@ PORT = 8080
 connected_client = None
 client_username  = None
 
-def is_arabic(text):
-    for ch in text:
-        if '\u0600' <= ch <= '\u06FF':
-            return True
-    return False
+_CURRENT_DIR = Path(__file__).resolve().parent
+_REPO_ROOT = _CURRENT_DIR.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+if str(_CURRENT_DIR) not in sys.path:
+    sys.path.insert(0, str(_CURRENT_DIR))
 
-def fix_arabic(text):
-    if is_arabic(text):
-        try:
-            import arabic_reshaper
-            from bidi.algorithm import get_display
-            reshaped = arabic_reshaper.reshape(text)
-            return get_display(reshaped)
-        except ImportError:
-            pass
-    return text
+try:
+    from HackChat.text import is_arabic, fix_arabic, has_bidi_support
+    from HackChat.theme import (
+        BACKGROUND, PANEL, CHAT_BACKGROUND, ENTRY_BACKGROUND,
+        ACCENT, INCOMING, ERROR, MUTED, SYSTEM, MONO, BOLD
+    )
+except ImportError:
+    from text import is_arabic, fix_arabic, has_bidi_support
+    from theme import (
+        BACKGROUND, PANEL, CHAT_BACKGROUND, ENTRY_BACKGROUND,
+        ACCENT, INCOMING, ERROR, MUTED, SYSTEM, MONO, BOLD
+    )
 
 def gui_log(msg, tag=""):
     def _do():
@@ -42,7 +47,7 @@ def gui_log(msg, tag=""):
         chat_box.config(state=tk.DISABLED)
     root.after(0, _do)
 
-def set_status(text, color="#555"):
+def set_status(text, color=MUTED):
     root.after(0, lambda: (status_var.set(text), status_lbl.config(fg=color)))
 
 def listen_for_messages():
@@ -57,7 +62,7 @@ def listen_for_messages():
             break
 
     gui_log(f"[*] {client_username} disconnected.", "system")
-    set_status("Waiting for connection…", "#555")
+    set_status("Waiting for connection…", MUTED)
     connected_client = None
     client_username  = None
     root.after(0, disable_input)
@@ -68,7 +73,7 @@ def accept_one_client():
     global connected_client, client_username
 
     gui_log("[*] Waiting for client to connect…", "system")
-    set_status("Waiting for connection…", "#555")
+    set_status("Waiting for connection…", MUTED)
 
     client_sock, addr = server_socket.accept()
     connected_client = client_sock
@@ -79,7 +84,7 @@ def accept_one_client():
         client_username = f"User@{addr[0]}"
 
     gui_log(f"[+] {client_username} connected from {addr[0]}:{addr[1]}", "system")
-    set_status(f"Chatting with  {client_username}", "#00ff88")
+    set_status(f"Chatting with  {client_username}", ACCENT)
     root.after(0, enable_input)
     threading.Thread(target=listen_for_messages, daemon=True).start()
 
@@ -113,41 +118,38 @@ root = tk.Tk()
 root.title("Chat Server")
 root.geometry("540x460")
 root.minsize(400, 320)
-root.configure(bg="#0d0d0d")
+root.configure(bg=BACKGROUND)
 
-MONO = ("Consolas", 10)
-BOLD = ("Consolas", 9, "bold")
-
-top = tk.Frame(root, bg="#111")
+top = tk.Frame(root, bg=PANEL)
 top.pack(fill="x")
-tk.Label(top, text="SERVER", fg="#00ff88", bg="#111",
+tk.Label(top, text="SERVER", fg=ACCENT, bg=PANEL,
          font=("Consolas", 12, "bold"), padx=12, pady=8).pack(side="left")
 status_var = tk.StringVar(value="Starting…")
-status_lbl = tk.Label(top, textvariable=status_var, fg="#555", bg="#111", font=BOLD, padx=12)
+status_lbl = tk.Label(top, textvariable=status_var, fg=MUTED, bg=PANEL, font=BOLD, padx=12)
 status_lbl.pack(side="right")
 
-chat_box = ScrolledText(root, bg="#0a0a0a", fg="#ccc", font=MONO,
+chat_box = ScrolledText(root, bg=CHAT_BACKGROUND, fg="#ccc", font=MONO,
                         state=tk.DISABLED, relief="flat", bd=0,
                         wrap=tk.WORD, padx=8, pady=6)
 chat_box.pack(fill="both", expand=True, padx=8, pady=6)
-chat_box.tag_config("system",   foreground="#444")
-chat_box.tag_config("incoming", foreground="#00ccff")
-chat_box.tag_config("outgoing", foreground="#00ff88")
-chat_box.tag_config("error",    foreground="#ff4444")
+chat_box.tag_config("system",   foreground=SYSTEM)
+chat_box.tag_config("incoming", foreground=INCOMING)
+chat_box.tag_config("outgoing", foreground=ACCENT)
+chat_box.tag_config("error",    foreground=ERROR)
 
 chat_box.tag_config("rtl", justify="right")
 chat_box.tag_config("ltr", justify="left")
 
-bottom = tk.Frame(root, bg="#111")
+bottom = tk.Frame(root, bg=PANEL)
 bottom.pack(fill="x", side="bottom")
 
-entry = tk.Entry(bottom, bg="#1a1a1a", fg="#e0e0e0", insertbackground="#00ff88",
+entry = tk.Entry(bottom, bg=ENTRY_BACKGROUND, fg="#e0e0e0", insertbackground=ACCENT,
                  font=MONO, relief="flat", bd=0, state=tk.DISABLED)
 entry.pack(side="left", fill="both", expand=True, padx=(8, 4), pady=8)
 entry.bind("<Return>", send_message)
 
-send_btn = tk.Button(bottom, text="SEND →", bg="#1a2e22", fg="#00ff88",
-                     activebackground="#1e3a2c", activeforeground="#00ff88",
+send_btn = tk.Button(bottom, text="SEND →", bg="#1a2e22", fg=ACCENT,
+                     activebackground="#1e3a2c", activeforeground=ACCENT,
                      relief="flat", bd=0, font=BOLD, cursor="hand2",
                      state=tk.DISABLED, command=send_message)
 send_btn.pack(side="left", padx=(0, 8), pady=8, ipadx=10)

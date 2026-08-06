@@ -6,22 +6,9 @@ def is_arabic(text):
 
 
 def fix_arabic(text):
-    if is_arabic(text):
-        try:
-            import arabic_reshaper
-            from bidi.algorithm import get_display
-
-            reshaped = arabic_reshaper.reshape(text)
-            return get_display(reshaped)
-        except ImportError:
-            pass
     return text
 
 
 def has_bidi_support():
-    try:
-        import bidi.algorithm  # noqa: F401
+    return False
 
-        return True
-    except ImportError:
-        return False

