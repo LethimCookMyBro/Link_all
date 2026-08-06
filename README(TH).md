@@ -16,7 +16,7 @@ PhantomLink คือระบบ Command and Control (C2) และเครื
 | **[`C2/`](file:///g:/for_hack_all/Link_all/C2)** | เซิร์ฟเวอร์ Command & Control (`C2.py`) รองรับการเชื่อมต่อพร้อมกันหลายเครื่อง, จัดเก็บสถิติตอบสนองเน็ตเวิร์ก (Latency), ส่งคำสั่งแบบกลุ่ม และระบบ Log แจ้งเตือนผ่าน Discord Webhook |
 | **[`client/`](file:///g:/for_hack_all/Link_all/client)** | ไฟล์ Client หลัก (`PhantomLink.py`) ทำงานร่วมกับโมดูลช่วยยุติโปรเซสแอนตี้ไวรัสและตั้งค่าข้อยกเว้น (`av_bypass.py`, `av_killer.py`) |
 | **[`anti_phantom/`](file:///g:/for_hack_all/Link_all/anti_phantom)** / **[`Anti-Phantom/`](file:///g:/for_hack_all/Link_all/Anti-Phantom)** | เครื่องมือสแกนและล้างการติดเชื้อ (`Anti-Phantom.py` / `remover.py`) ทำการตรวจหาและลบ Registry คีย์เริ่มต้นระบบ, งานที่ถูกตั้งเวลา (Scheduled Tasks) และคลีนระบบ hosts |
-| **[`HackChat/`](file:///g:/for_hack_all/Link_all/HackChat)** | แพลตฟอร์มแชท GUI (Tkinter) รองรับการแสดงผลภาษาอาหรับแบบสลับทิศทางตัวอักษรขวาไปซ้าย (Arabic BiDi text shaping) |
+| **[`HackChat/`](file:///g:/for_hack_all/Link_all/HackChat)** | แพลตฟอร์มแชท GUI (Tkinter) สำหรับส่งข้อความและสื่อสารผ่านเครือข่าย |
 | **[`more-tools/`](file:///g:/for_hack_all/Link_all/more-tools)** | คลังเครื่องมือเสริม เช่น ระบบ Keylogger, Screenshoter อัตโนมัติ และโปรแกรมจำลอง Ransomware หน้าจอเรียกค่าไถ่แบบ GUI (`its_your_ransom.py`) |
 | **[`tests/`](file:///g:/for_hack_all/Link_all/tests)** | โมดูลช่วยตรวจสอบและรันการทดสอบระบบแบบอัตโนมัติ |
 | **[`Quick Commands.md`](file:///g:/for_hack_all/Link_all/Quick%20Commands.md)** | คู่มือรวมคำสั่งย่อยสำเร็จรูปสำหรับใช้ควบคุมผ่าน C2 ในรูปแบบ Markdown |
@@ -82,11 +82,4 @@ PhantomLink คือระบบ Command and Control (C2) และเครื
    ```bash
    pyinstaller --onefile --noconsole client/PhantomLink.py
    ```
-
 ---
-<<<<<<< HEAD
-=======
-
-## ข้อตกลงทางกฎหมาย
-ระบบนี้อนุญาตให้ใช้งานเฉพาะบนอุปกรณ์ที่ผู้ทดสอบเป็นเจ้าของ หรือได้รับอนุญาตเป็นลายลักษณ์อักษรอย่างเป็นทางการเท่านั้น การนำไปติดตั้งโดยไม่มีการอนุญาตอาจเข้าข่ายการกระทำผิดทางกฎหมายร้ายแรง
->>>>>>> eeae1ab (docs: update readmes and add gitignore)

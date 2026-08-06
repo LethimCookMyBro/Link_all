@@ -66,21 +66,34 @@ class PhantomLinkRemover:
             try:
                 name = proc.info["name"] or ""
                 exe_path = proc.info["exe"]
-                _cmdline = " ".join(proc.info["cmdline"] or [])
-                _suspicious_cmdline_indicators = SUSPICIOUS_CMDLINE_INDICATORS
+                cmdline = " ".join(proc.info["cmdline"] or [])
+                suspicious_cmdline_indicators = SUSPICIOUS_CMDLINE_INDICATORS
+                terminated = False
 
                 if name.lower() in self.suspicious_names:
                     self.terminate_process(proc, f"Suspicious process: {name}")
                     killed_processes.append(name)
+                    terminated = True
                     continue
 
-                if exe_path:
+                if exe_path and not terminated:
                     for sus_path in self.suspicious_paths:
                         if sus_path.lower() in exe_path.lower():
                             self.terminate_process(
                                 proc, f"Process in suspicious location: {exe_path}"
                             )
                             killed_processes.append(name)
+                            terminated = True
+                            break
+
+                if cmdline and not terminated:
+                    for indicator in suspicious_cmdline_indicators:
+                        if indicator.lower() in cmdline.lower():
+                            self.terminate_process(
+                                proc, f"Process with suspicious command line indicator '{indicator}': {cmdline}"
+                            )
+                            killed_processes.append(name)
+                            terminated = True
                             break
 
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):

