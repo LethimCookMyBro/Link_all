@@ -11,7 +11,14 @@ import psutil
 import struct
 import threading
 import requests
-from av_bypass import AVBypass
+_CLIENT_DIR = os.path.dirname(os.path.abspath(__file__))
+if _CLIENT_DIR not in sys.path:
+    sys.path.insert(0, _CLIENT_DIR)
+
+try:
+    from av_bypass import AVBypass
+except ImportError:
+    from client.av_bypass import AVBypass
 import base64
 from datetime import datetime
 
