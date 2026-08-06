@@ -20,10 +20,12 @@ class DiscordBotCoverageTests(unittest.TestCase):
     def test_discord_bot_on_ready_and_events(self):
         with patch.object(discord_bot.client, "get_channel") as mock_get_ch:
             mock_ch = MagicMock()
+            async def mock_async_send(*args, **kwargs):
+                return MagicMock()
+            mock_ch.send = mock_async_send
             mock_get_ch.return_value = mock_ch
-
-            # Test event handlers
-            discord_bot.on_ready()
+            import asyncio
+            asyncio.run(discord_bot.on_ready())
             self.assertTrue(mock_get_ch.called or True)
 
     def test_c2_connection_helper(self):
