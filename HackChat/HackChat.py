@@ -109,50 +109,56 @@ def disable_input():
     entry.config(state=tk.DISABLED)
     send_btn.config(state=tk.DISABLED)
 
-server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-server_socket.bind((HOST, PORT))
-server_socket.listen(5)
+def main():
+    global server_socket, root, status_var, status_lbl, chat_box, entry, send_btn
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server_socket.bind((HOST, PORT))
+    server_socket.listen(5)
 
-root = tk.Tk()
-root.title("Chat Server")
-root.geometry("540x460")
-root.minsize(400, 320)
-root.configure(bg=BACKGROUND)
+    root = tk.Tk()
+    root.title("Chat Server")
+    root.geometry("540x460")
+    root.minsize(400, 320)
+    root.configure(bg=BACKGROUND)
 
-top = tk.Frame(root, bg=PANEL)
-top.pack(fill="x")
-tk.Label(top, text="SERVER", fg=ACCENT, bg=PANEL,
-         font=("Consolas", 12, "bold"), padx=12, pady=8).pack(side="left")
-status_var = tk.StringVar(value="Starting…")
-status_lbl = tk.Label(top, textvariable=status_var, fg=MUTED, bg=PANEL, font=BOLD, padx=12)
-status_lbl.pack(side="right")
+    top = tk.Frame(root, bg=PANEL)
+    top.pack(fill="x")
+    tk.Label(top, text="SERVER", fg=ACCENT, bg=PANEL,
+             font=("Consolas", 12, "bold"), padx=12, pady=8).pack(side="left")
+    status_var = tk.StringVar(value="Starting…")
+    status_lbl = tk.Label(top, textvariable=status_var, fg=MUTED, bg=PANEL, font=BOLD, padx=12)
+    status_lbl.pack(side="right")
 
-chat_box = ScrolledText(root, bg=CHAT_BACKGROUND, fg="#ccc", font=MONO,
-                        state=tk.DISABLED, relief="flat", bd=0,
-                        wrap=tk.WORD, padx=8, pady=6)
-chat_box.pack(fill="both", expand=True, padx=8, pady=6)
-chat_box.tag_config("system",   foreground=SYSTEM)
-chat_box.tag_config("incoming", foreground=INCOMING)
-chat_box.tag_config("outgoing", foreground=ACCENT)
-chat_box.tag_config("error",    foreground=ERROR)
+    chat_box = ScrolledText(root, bg=CHAT_BACKGROUND, fg="#ccc", font=MONO,
+                            state=tk.DISABLED, relief="flat", bd=0,
+                            wrap=tk.WORD, padx=8, pady=6)
+    chat_box.pack(fill="both", expand=True, padx=8, pady=6)
+    chat_box.tag_config("system",   foreground=SYSTEM)
+    chat_box.tag_config("incoming", foreground=INCOMING)
+    chat_box.tag_config("outgoing", foreground=ACCENT)
+    chat_box.tag_config("error",    foreground=ERROR)
 
-chat_box.tag_config("rtl", justify="right")
-chat_box.tag_config("ltr", justify="left")
+    chat_box.tag_config("rtl", justify="right")
+    chat_box.tag_config("ltr", justify="left")
 
-bottom = tk.Frame(root, bg=PANEL)
-bottom.pack(fill="x", side="bottom")
+    bottom = tk.Frame(root, bg=PANEL)
+    bottom.pack(fill="x", side="bottom")
 
-entry = tk.Entry(bottom, bg=ENTRY_BACKGROUND, fg="#e0e0e0", insertbackground=ACCENT,
-                 font=MONO, relief="flat", bd=0, state=tk.DISABLED)
-entry.pack(side="left", fill="both", expand=True, padx=(8, 4), pady=8)
-entry.bind("<Return>", send_message)
+    entry = tk.Entry(bottom, bg=ENTRY_BACKGROUND, fg="#e0e0e0", insertbackground=ACCENT,
+                     font=MONO, relief="flat", bd=0, state=tk.DISABLED)
+    entry.pack(side="left", fill="both", expand=True, padx=(8, 4), pady=8)
+    entry.bind("<Return>", send_message)
 
-send_btn = tk.Button(bottom, text="SEND →", bg="#1a2e22", fg=ACCENT,
-                     activebackground="#1e3a2c", activeforeground=ACCENT,
-                     relief="flat", bd=0, font=BOLD, cursor="hand2",
-                     state=tk.DISABLED, command=send_message)
-send_btn.pack(side="left", padx=(0, 8), pady=8, ipadx=10)
+    send_btn = tk.Button(bottom, text="SEND →", bg="#1a2e22", fg=ACCENT,
+                         activebackground="#1e3a2c", activeforeground=ACCENT,
+                         relief="flat", bd=0, font=BOLD, cursor="hand2",
+                         state=tk.DISABLED, command=send_message)
+    send_btn.pack(side="left", padx=(0, 8), pady=8, ipadx=10)
 
-threading.Thread(target=accept_one_client, daemon=True).start()
-root.mainloop()
+    threading.Thread(target=accept_one_client, daemon=True).start()
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()

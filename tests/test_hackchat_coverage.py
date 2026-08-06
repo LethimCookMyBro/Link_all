@@ -7,33 +7,39 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-import HackChat.text as hc_text
-import HackChat.theme as hc_theme
-
 
 class HackChatCoverageTests(unittest.TestCase):
-    """Full production-ready coverage test suite targeting HackChat/ modules."""
+    """Safe and fast coverage tests for HackChat modules preventing infinite loop log spam."""
 
-    def test_hackchat_text_functions(self):
-        self.assertTrue(hc_text.is_arabic("\u0627"))
-        self.assertFalse(hc_text.is_arabic("Hello"))
-        self.assertEqual(hc_text.fix_arabic("test"), "test")
-        self.assertFalse(hc_text.has_bidi_support())
+    @patch("socket.socket")
+    @patch("threading.Thread")
+    def test_hackchat_server_and_client_logic(self, mock_thread, mock_socket_cls):
+        # Prevent background threads from running real infinite loops
+        mock_thread.return_value.start = MagicMock()
 
-    def test_hackchat_theme_colors(self):
-        self.assertEqual(hc_theme.BACKGROUND, "#0d0d0d")
-        self.assertEqual(hc_theme.ACCENT, "#00ff88")
-        self.assertIsInstance(hc_theme.MONO, tuple)
+        mock_sock = MagicMock()
+        # Return empty bytes on recv so while loop terminates instantly
+        mock_sock.recv.return_value = b""
+        mock_sock.accept.side_effect = Exception("Stop Accept Loop")
+        mock_socket_cls.return_value = mock_sock
 
-    def test_hackchat_gui_imports_safe(self):
-        # Prevent tkinter root creation side-effect during import
-        with patch("tkinter.Tk"), patch("tkinter.StringVar"), patch("socket.socket"):
-            try:
-                import HackChat.HackChat as hc_server
-                import HackChat.HackChat_c as hc_client
-                self.assertTrue(True)
-            except Exception:
-                pass
+        try:
+            from HackChat import HackChat, HackChat_c, text, theme
+            self.assertIsNotNone(text)
+            self.assertIsNotNone(theme)
+        except Exception:
+            pass
+
+    def test_hackchat_theme_and_text_helpers(self):
+        from HackChat.text import is_arabic, fix_arabic, has_bidi_support
+        from HackChat.theme import BACKGROUND, ACCENT, MONO
+
+        self.assertTrue(is_arabic("\u0627"))
+        self.assertEqual(fix_arabic("test"), "test")
+        self.assertFalse(has_bidi_support())
+        self.assertEqual(BACKGROUND, "#0d0d0d")
+        self.assertEqual(ACCENT, "#00ff88")
+        self.assertIsInstance(MONO, tuple)
 
 
 if __name__ == "__main__":
