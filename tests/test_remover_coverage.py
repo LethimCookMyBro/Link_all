@@ -59,9 +59,9 @@ class RemoverCoverageTests(unittest.TestCase):
 
         # Scheduled tasks
         with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(stdout='"TaskName","Next Run Time"\n"PhantomTask","12:00"\n', returncode=0)
+            mock_run.return_value = MagicMock(stdout='"TaskName","Next Run Time"\n"phantomlink_task","12:00"\n', returncode=0)
             remover.remove_scheduled_tasks()
-            self.assertTrue(any("PhantomTask" in item for item in remover.removed_items))
+            self.assertTrue(any("phantomlink_task" in item for item in remover.removed_items))
 
     def test_remover_file_and_system_cleaning(self):
         remover = PhantomLinkRemover()
