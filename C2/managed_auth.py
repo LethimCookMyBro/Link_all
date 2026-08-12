@@ -43,6 +43,7 @@ class EnrollmentStore:
         self.path = Path(path)
         self._now = now
         self._lock = threading.Lock()
+        self._needs_migration = False
         self._acl_inspector = acl_inspector
         self._acl_applier = acl_applier or _apply_private_acl
 
@@ -119,19 +120,26 @@ class EnrollmentStore:
 
     def _read_unlocked(self) -> dict[str, dict]:
         if not self.path.exists():
+            self._needs_migration = False
             return {}
         try:
             raw = _read_private_file(self.path, self._acl_inspector)
             records = json.loads(raw.decode("utf-8"))
             if not isinstance(records, dict):
                 raise TypeError
+            needs_migration = False
             for digest, record in records.items():
+                fields = set(record) if isinstance(record, dict) else set()
+                if fields == {"expires_at", "consumed"}:
+                    record["pending"] = False
+                    needs_migration = True
+                elif fields != {"expires_at", "consumed", "pending"}:
+                    raise ValueError
                 if (
                     not isinstance(digest, str)
                     or len(digest) != 64
                     or any(character not in "0123456789abcdef" for character in digest)
                     or not isinstance(record, dict)
-                    or set(record) != {"expires_at", "consumed", "pending"}
                     or not isinstance(record["expires_at"], (int, float))
                     or isinstance(record["expires_at"], bool)
                     or not math.isfinite(record["expires_at"])
@@ -140,6 +148,7 @@ class EnrollmentStore:
                     or (record["consumed"] and record["pending"])
                 ):
                     raise ValueError
+            self._needs_migration = needs_migration
             return records
         except (
             OSError,
@@ -155,6 +164,7 @@ class EnrollmentStore:
             "utf-8"
         )
         _atomic_private_write(self.path, payload, self._acl_applier)
+        self._needs_migration = False
 
 
 class DeviceRegistry:
@@ -170,6 +180,7 @@ class DeviceRegistry:
         self._test_boundary = protector is not None
         self._protector = protector or _DpapiProtector()
         self._lock = threading.Lock()
+        self._needs_migration = False
         self._acl_inspector = acl_inspector
         self._acl_applier = (
             acl_applier
@@ -254,11 +265,12 @@ class DeviceRegistry:
                 for identity, record in records.items()
                 if record["active"] and record["pending_digest"] is None
             }
-            if len(active_records) != len(records):
+            if len(active_records) != len(records) or self._needs_migration:
                 self._write_unlocked(active_records)
 
     def _read_unlocked(self) -> dict[tuple[str, str], dict]:
         if not self.path.exists():
+            self._needs_migration = False
             return {}
         if not self._test_boundary or self._acl_inspector is not None:
             protected = _read_private_file(self.path, self._acl_inspector)
@@ -274,19 +286,27 @@ class DeviceRegistry:
             ):
                 raise ValueError
             records = {}
+            needs_migration = False
             for device in devices:
-                if not isinstance(device, dict) or set(device) != {
+                current_fields = {
                     "active",
                     "agent_id",
                     "key_id",
                     "pending_digest",
                     "secret",
-                }:
+                }
+                legacy_fields = current_fields - {"pending_digest"}
+                fields = set(device) if isinstance(device, dict) else set()
+                if fields == legacy_fields:
+                    pending_digest = None
+                    needs_migration = True
+                elif fields == current_fields:
+                    pending_digest = device["pending_digest"]
+                else:
                     raise ValueError
                 agent_id = device["agent_id"]
                 key_id = device["key_id"]
                 active = device["active"]
-                pending_digest = device["pending_digest"]
                 if (
                     not isinstance(agent_id, str)
                     or not agent_id
@@ -313,6 +333,7 @@ class DeviceRegistry:
                     "active": active,
                     "pending_digest": pending_digest,
                 }
+            self._needs_migration = needs_migration
             return records
         except (
             OSError,
@@ -341,6 +362,7 @@ class DeviceRegistry:
         _atomic_private_write(
             self.path, self._protector.protect(raw), self._acl_applier
         )
+        self._needs_migration = False
 
 
 class EnrollmentService:
@@ -357,7 +379,7 @@ class EnrollmentService:
     def _reconcile_unlocked(self) -> dict[str, dict]:
         records = self._tokens._read_unlocked()
         pending = [digest for digest, record in records.items() if record["pending"]]
-        if pending:
+        if pending or self._tokens._needs_migration:
             for digest in pending:
                 self._tokens._burn_unlocked(records, digest)
             self._tokens._write_unlocked(records)

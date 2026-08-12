@@ -36,6 +36,61 @@ def test_token_is_consumed_once_and_never_stored_verbatim(tmp_path):
     assert hashlib.sha256(token.encode("ascii")).hexdigest() in raw
 
 
+def test_legacy_token_records_consume_and_upgrade_without_resetting_consumed(tmp_path):
+    path = tmp_path / "tokens.json"
+    store = EnrollmentStore(path, now=lambda: 1000)
+    issued = base64.urlsafe_b64encode(b"i" * 32).rstrip(b"=").decode("ascii")
+    consumed = base64.urlsafe_b64encode(b"c" * 32).rstrip(b"=").decode("ascii")
+    issued_digest = hashlib.sha256(issued.encode("ascii")).hexdigest()
+    consumed_digest = hashlib.sha256(consumed.encode("ascii")).hexdigest()
+    store.issue(ttl_seconds=60)  # Establish the production-private file ACL.
+    path.write_text(
+        json.dumps(
+            {
+                issued_digest: {"expires_at": 1060, "consumed": False},
+                consumed_digest: {"expires_at": 1060, "consumed": True},
+            }
+        ),
+        "utf-8",
+    )
+
+    assert store.consume(issued) is True
+
+    upgraded = json.loads(path.read_text("utf-8"))
+    assert upgraded[issued_digest] == {
+        "expires_at": 1060,
+        "consumed": True,
+        "pending": False,
+    }
+    assert upgraded[consumed_digest] == {
+        "expires_at": 1060,
+        "consumed": True,
+        "pending": False,
+    }
+    assert store.consume(consumed) is False
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        {"expires_at": 1060, "consumed": False, "pending": "false"},
+        {"expires_at": 1060, "consumed": False, "unexpected": False},
+    ],
+)
+def test_token_migration_rejects_wrong_present_types_and_unknown_fields(
+    tmp_path, record
+):
+    path = tmp_path / "tokens.json"
+    store = EnrollmentStore(path, now=lambda: 1000)
+    token = base64.urlsafe_b64encode(b"t" * 32).rstrip(b"=").decode("ascii")
+    digest = hashlib.sha256(token.encode("ascii")).hexdigest()
+    store.issue(ttl_seconds=60)
+    path.write_text(json.dumps({digest: record}), "utf-8")
+
+    with pytest.raises(ValueError, match="invalid enrollment store"):
+        store.consume(token)
+
+
 def test_expired_token_is_rejected(tmp_path):
     current_time = [1000]
     store = EnrollmentStore(tmp_path / "tokens.json", now=lambda: current_time[0])
@@ -99,11 +154,119 @@ def test_registry_round_trip_is_protected_and_revoke_removes_device(tmp_path):
     assert registry.get(credential.agent_id, credential.key_id) is None
 
 
+def test_legacy_device_records_get_revoke_and_upgrade_remaining_device(tmp_path):
+    path = tmp_path / "devices.bin"
+    protector = FakeProtector()
+    secret_a = b"a" * 32
+    secret_b = b"b" * 32
+    legacy = {
+        "devices": [
+            {
+                "active": True,
+                "agent_id": "legacy-a",
+                "key_id": "key-a",
+                "secret": base64.b64encode(secret_a).decode("ascii"),
+            },
+            {
+                "active": True,
+                "agent_id": "legacy-b",
+                "key_id": "key-b",
+                "secret": base64.b64encode(secret_b).decode("ascii"),
+            },
+        ]
+    }
+    path.write_bytes(protector.protect(json.dumps(legacy).encode("utf-8")))
+    registry = DeviceRegistry(path, protector)
+
+    assert registry.get("legacy-a", "key-a") == secret_a
+    assert registry.revoke("legacy-a", "key-a") is True
+
+    upgraded = json.loads(protector.unprotect(path.read_bytes()))
+    assert upgraded == {
+        "devices": [
+            {
+                "active": True,
+                "agent_id": "legacy-b",
+                "key_id": "key-b",
+                "pending_digest": None,
+                "secret": base64.b64encode(secret_b).decode("ascii"),
+            }
+        ]
+    }
+    assert registry.get("legacy-b", "key-b") == secret_b
+
+
+def test_reconciliation_upgrades_legacy_devices_and_drops_inactive_record(tmp_path):
+    token_path = tmp_path / "tokens.json"
+    registry_path = tmp_path / "devices.bin"
+    protector = FakeProtector()
+    secret = b"a" * 32
+    legacy = {
+        "devices": [
+            {
+                "active": True,
+                "agent_id": "active-agent",
+                "key_id": "active-key",
+                "secret": base64.b64encode(secret).decode("ascii"),
+            },
+            {
+                "active": False,
+                "agent_id": "inactive-agent",
+                "key_id": "inactive-key",
+                "secret": base64.b64encode(b"i" * 32).decode("ascii"),
+            },
+        ]
+    }
+    registry_path.write_bytes(protector.protect(json.dumps(legacy).encode("utf-8")))
+    registry = DeviceRegistry(registry_path, protector)
+
+    EnrollmentService(
+        EnrollmentStore(token_path, now=lambda: 1000), registry
+    ).reconcile()
+
+    upgraded = json.loads(protector.unprotect(registry_path.read_bytes()))
+    assert upgraded["devices"] == [
+        {
+            "active": True,
+            "agent_id": "active-agent",
+            "key_id": "active-key",
+            "pending_digest": None,
+            "secret": base64.b64encode(secret).decode("ascii"),
+        }
+    ]
+    assert registry.get("active-agent", "active-key") == secret
+    assert registry.get("inactive-agent", "inactive-key") is None
+
+
 def test_registry_rejects_corrupt_or_wrong_length_secrets(tmp_path):
     path = tmp_path / "devices.bin"
     protector = FakeProtector()
     invalid = json.dumps({"agent": {"key": "eA=="}}).encode("utf-8")
     path.write_bytes(protector.protect(invalid))
+
+    with pytest.raises(ValueError, match="invalid device registry"):
+        DeviceRegistry(path, protector).get("agent", "key")
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [{"pending_digest": 1}, {"unexpected": False}],
+)
+def test_device_migration_rejects_wrong_present_types_and_unknown_fields(
+    tmp_path, extra
+):
+    path = tmp_path / "devices.bin"
+    protector = FakeProtector()
+    device = {
+        "active": True,
+        "agent_id": "agent",
+        "key_id": "key",
+        "secret": base64.b64encode(b"s" * 32).decode("ascii"),
+        **extra,
+    }
+    path.write_bytes(
+        protector.protect(json.dumps({"devices": [device]}).encode("utf-8"))
+    )
 
     with pytest.raises(ValueError, match="invalid device registry"):
         DeviceRegistry(path, protector).get("agent", "key")
