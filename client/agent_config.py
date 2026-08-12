@@ -140,18 +140,41 @@ def _inspect_windows_acl(path: Path) -> Mapping[str, bool]:
         | win32con.GENERIC_ALL
     )
     allowed_types = {
-        win32security.ACCESS_ALLOWED_ACE_TYPE,
-        win32security.ACCESS_ALLOWED_OBJECT_ACE_TYPE,
+        ntsecuritycon.ACCESS_ALLOWED_ACE_TYPE,
+        ntsecuritycon.ACCESS_ALLOWED_CALLBACK_ACE_TYPE,
+        ntsecuritycon.ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE,
+        ntsecuritycon.ACCESS_ALLOWED_COMPOUND_ACE_TYPE,
+        ntsecuritycon.ACCESS_ALLOWED_OBJECT_ACE_TYPE,
+    }
+    denied_types = {
+        ntsecuritycon.ACCESS_DENIED_ACE_TYPE,
+        ntsecuritycon.ACCESS_DENIED_CALLBACK_ACE_TYPE,
+        ntsecuritycon.ACCESS_DENIED_CALLBACK_OBJECT_ACE_TYPE,
+        ntsecuritycon.ACCESS_DENIED_OBJECT_ACE_TYPE,
+    }
+    non_grant_types = {
+        ntsecuritycon.SYSTEM_ALARM_ACE_TYPE,
+        ntsecuritycon.SYSTEM_ALARM_CALLBACK_ACE_TYPE,
+        ntsecuritycon.SYSTEM_ALARM_CALLBACK_OBJECT_ACE_TYPE,
+        ntsecuritycon.SYSTEM_ALARM_OBJECT_ACE_TYPE,
+        ntsecuritycon.SYSTEM_AUDIT_ACE_TYPE,
+        ntsecuritycon.SYSTEM_AUDIT_CALLBACK_ACE_TYPE,
+        ntsecuritycon.SYSTEM_AUDIT_CALLBACK_OBJECT_ACE_TYPE,
+        ntsecuritycon.SYSTEM_AUDIT_OBJECT_ACE_TYPE,
+        ntsecuritycon.SYSTEM_MANDATORY_LABEL_ACE_TYPE,
     }
     result.update({name: False for name in broad_sids})
+    result["unknown_allow_write"] = False
     for index in range(dacl.GetAceCount()):
         ace = dacl.GetAce(index)
-        if ace[0][0] not in allowed_types or not ace[1] & write_mask:
+        ace_type = ace[0][0]
+        if not ace[1] & write_mask or ace_type in denied_types | non_grant_types:
             continue
-        ace_sid = ace[-1]
         for name, broad_sid in broad_sids.items():
-            if ace_sid == broad_sid:
+            if any(value == broad_sid for value in ace[2:]):
                 result[name] = True
+        if ace_type not in allowed_types:
+            result["unknown_allow_write"] = True
     return result
 
 
@@ -175,6 +198,21 @@ def _apply_private_acl(path: Path) -> None:
     )
 
 
+def _validate_acl(path: Path, acl: Mapping[str, bool]) -> None:
+    broad_write = any(
+        acl.get(name, False)
+        for name in (
+            "world_write",
+            "everyone_write",
+            "builtin_users_write",
+            "authenticated_users_write",
+            "unknown_allow_write",
+        )
+    )
+    if acl.get("owner") is not True or broad_write:
+        raise ValueError(f"ACL is not private to the current Windows user: {path}")
+
+
 def validate_private_file(path: os.PathLike[str] | str, acl_inspector: AclInspector | None = None) -> None:
     file_path = Path(path)
     try:
@@ -184,27 +222,34 @@ def validate_private_file(path: os.PathLike[str] | str, acl_inspector: AclInspec
     if not stat.S_ISREG(mode):
         raise ValueError(f"private path must be a regular file: {file_path}")
     acl = (acl_inspector or _inspect_windows_acl)(file_path)
-    broad_write = any(
-        acl.get(name, False)
-        for name in (
-            "world_write",
-            "everyone_write",
-            "builtin_users_write",
-            "authenticated_users_write",
-        )
-    )
-    if acl.get("owner") is not True or broad_write:
-        raise ValueError(f"ACL is not private to the current Windows user: {file_path}")
+    _validate_acl(file_path, acl)
+
+
+def _read_private_file(path: Path, acl_inspector: AclInspector | None) -> bytes:
+    try:
+        with path.open("rb") as file:
+            opened = os.fstat(file.fileno())
+            if not stat.S_ISREG(opened.st_mode):
+                raise ValueError(f"private path must be a regular file: {path}")
+            acl = (acl_inspector or _inspect_windows_acl)(path)
+            current = path.lstat()
+            if not stat.S_ISREG(current.st_mode) or not os.path.samestat(opened, current):
+                raise ValueError(f"private file changed during ACL validation: {path}")
+            _validate_acl(path, acl)
+            return file.read()
+    except ValueError:
+        raise
+    except OSError as exc:
+        raise ValueError(f"private file is unavailable: {path}") from exc
 
 
 def load_config(
     path: os.PathLike[str] | str, acl_inspector: AclInspector | None = None
 ) -> AgentConfig:
     file_path = Path(path)
-    validate_private_file(file_path, acl_inspector)
     try:
-        data = json.loads(file_path.read_text("utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        data = json.loads(_read_private_file(file_path, acl_inspector).decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError(f"invalid config file: {file_path}") from exc
     return AgentConfig.from_mapping(data)
 
@@ -285,9 +330,11 @@ class DpapiCredentialStore:
         if not self.path.exists():
             return None
         if not self._test_boundary or self._acl_inspector is not None:
-            validate_private_file(self.path, self._acl_inspector)
+            protected = _read_private_file(self.path, self._acl_inspector)
+        else:
+            protected = self.path.read_bytes()
         try:
-            raw = self._protector.unprotect(self.path.read_bytes())
+            raw = self._protector.unprotect(protected)
             data = json.loads(raw.decode("utf-8"))
             return DeviceCredential(
                 agent_id=data["agent_id"],
