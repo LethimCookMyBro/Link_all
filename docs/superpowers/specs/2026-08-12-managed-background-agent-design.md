@@ -1,7 +1,7 @@
 # Managed Background Agent Foundation — Design Specification
 
 วันที่: 2026-08-12
-สถานะ: Draft for written-spec review
+สถานะ: Approved — 2026-08-12
 ขอบเขต: Phase 1 — agent lifecycle foundation
 
 ## 1. เป้าหมาย
