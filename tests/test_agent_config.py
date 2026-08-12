@@ -174,13 +174,7 @@ def test_production_dpapi_and_acl_round_trip(tmp_path):
     assert store.load() == expected
 
 
-@pytest.mark.parametrize(
-    ("ace_type", "ace_sid", "result_key"),
-    [(9, "everyone", "everyone_write"), (99, "current-user", "unknown_allow_write")],
-)
-def test_write_capable_callback_and_unknown_aces_fail_closed(
-    monkeypatch, ace_type, ace_sid, result_key
-):
+def fake_windows_modules(ace_type, ace_sid):
     class FakeDacl:
         def GetAceCount(self):
             return 1
@@ -206,6 +200,7 @@ def test_write_capable_callback_and_unknown_aces_fail_closed(
         ACCESS_ALLOWED_ACE_TYPE=0,
         ACCESS_ALLOWED_OBJECT_ACE_TYPE=5,
         GetNamedSecurityInfo=lambda *_: FakeDescriptor(),
+        GetSecurityInfo=lambda *_: FakeDescriptor(),
         CreateWellKnownSid=lambda sid, _: {1: "everyone", 2: "users", 3: "authenticated"}[sid],
         OpenProcessToken=lambda *_: object(),
         GetTokenInformation=lambda *_: ("current-user", None),
@@ -239,12 +234,69 @@ def test_write_capable_callback_and_unknown_aces_fail_closed(
     )
     win32api = SimpleNamespace(GetCurrentProcess=lambda: object())
     win32con = SimpleNamespace(TOKEN_QUERY=1, GENERIC_WRITE=0x40000000, GENERIC_ALL=0x10000000)
+    return ntsecuritycon, win32api, win32con, object(), security
+
+
+@pytest.mark.parametrize(
+    ("ace_type", "ace_sid", "result_key"),
+    [
+        (9, "everyone", "everyone_write"),
+        (11, "everyone", "everyone_write"),
+        (99, "current-user", "unknown_allow_write"),
+    ],
+)
+def test_write_capable_callback_and_unknown_aces_fail_closed(
+    monkeypatch, ace_type, ace_sid, result_key
+):
     monkeypatch.setattr(
         agent_config,
         "_windows_modules",
-        lambda: (ntsecuritycon, win32api, win32con, object(), security),
+        lambda: fake_windows_modules(ace_type, ace_sid),
     )
     assert agent_config._inspect_windows_acl(Path(os.devnull))[result_key] is True
+
+
+def test_callback_object_ace_is_rejected_end_to_end(monkeypatch, tmp_path):
+    path = tmp_path / "agent.json"
+    path.write_text(json.dumps(valid_config(tmp_path)), "utf-8")
+    monkeypatch.setattr(
+        agent_config,
+        "_windows_modules",
+        lambda: fake_windows_modules(11, "everyone"),
+    )
+
+    with pytest.raises(ValueError, match="ACL"):
+        load_config(path, acl_inspector=lambda _: agent_config._inspect_windows_acl(path))
+
+
+def test_load_config_inspects_open_handle_not_aba_path(tmp_path):
+    path = tmp_path / "agent.json"
+    path.write_text(json.dumps(valid_config(tmp_path)), "utf-8")
+
+    def aba_inspector(target):
+        # A pathname query can observe a transient safe B after A is opened and
+        # before A is restored; only inspecting the open A handle is binding.
+        if hasattr(target, "fileno"):
+            return {"owner": True, "world_write": True}
+        return {"owner": True}
+
+    with pytest.raises(ValueError, match="ACL"):
+        load_config(path, acl_inspector=aba_inspector)
+
+
+def test_credential_load_inspects_open_handle(tmp_path):
+    path = tmp_path / "credential.bin"
+    DpapiCredentialStore(path, FakeProtector()).save(
+        DeviceCredential("agent-1", "key-1", b"secret")
+    )
+    inspected = []
+
+    def inspect(target):
+        inspected.append(hasattr(target, "fileno"))
+        return {"owner": True}
+
+    assert DpapiCredentialStore(path, FakeProtector(), acl_inspector=inspect).load()
+    assert inspected == [True]
 
 
 def test_load_config_rejects_path_replacement_during_acl_check(tmp_path):

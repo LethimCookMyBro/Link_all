@@ -9,10 +9,10 @@ import stat
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, BinaryIO, Callable, Mapping
 
 
-AclInspector = Callable[[Path], Mapping[str, bool]]
+AclInspector = Callable[[Path | BinaryIO], Mapping[str, bool]]
 AclApplier = Callable[[Path], None]
 _CRYPTPROTECT_UI_FORBIDDEN = 0x1
 
@@ -106,12 +106,33 @@ def _current_user_sid(win32api, win32con, win32security):
 
 
 def _inspect_windows_acl(path: Path) -> Mapping[str, bool]:
-    ntsecuritycon, win32api, win32con, _, win32security = _windows_modules()
+    modules = _windows_modules()
+    win32security = modules[4]
     descriptor = win32security.GetNamedSecurityInfo(
         str(path),
         win32security.SE_FILE_OBJECT,
         win32security.OWNER_SECURITY_INFORMATION | win32security.DACL_SECURITY_INFORMATION,
     )
+    return _summarize_windows_acl(descriptor, modules)
+
+
+def _inspect_windows_handle(file: BinaryIO) -> Mapping[str, bool]:
+    try:
+        import msvcrt
+    except ImportError as exc:
+        raise RuntimeError("Windows handle APIs are unavailable") from exc
+    modules = _windows_modules()
+    win32security = modules[4]
+    descriptor = win32security.GetSecurityInfo(
+        msvcrt.get_osfhandle(file.fileno()),
+        win32security.SE_FILE_OBJECT,
+        win32security.OWNER_SECURITY_INFORMATION | win32security.DACL_SECURITY_INFORMATION,
+    )
+    return _summarize_windows_acl(descriptor, modules)
+
+
+def _summarize_windows_acl(descriptor, modules) -> Mapping[str, bool]:
+    ntsecuritycon, win32api, win32con, _, win32security = modules
     owner = descriptor.GetSecurityDescriptorOwner()
     dacl = descriptor.GetSecurityDescriptorDacl()
     broad_sids = {
@@ -231,7 +252,7 @@ def _read_private_file(path: Path, acl_inspector: AclInspector | None) -> bytes:
             opened = os.fstat(file.fileno())
             if not stat.S_ISREG(opened.st_mode):
                 raise ValueError(f"private path must be a regular file: {path}")
-            acl = (acl_inspector or _inspect_windows_acl)(path)
+            acl = (acl_inspector or _inspect_windows_handle)(file)
             current = path.lstat()
             if not stat.S_ISREG(current.st_mode) or not os.path.samestat(opened, current):
                 raise ValueError(f"private file changed during ACL validation: {path}")
