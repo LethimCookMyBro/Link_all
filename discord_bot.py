@@ -20,8 +20,7 @@ if __name__ == "__main__":
     if hasattr(sys.stdout, "buffer") and getattr(sys.stdout, "encoding", "").lower() != "utf-8":
         sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 import os
-
-DISCORD_BOT_TOKEN = os.getenv("PHANTOMLINK_BOT_TOKEN", "")
+import config
 DISCORD_CHANNEL_ID = 1525081606501568577
 DISCORD_WEBHOOK = "***REMOVED***"
 
@@ -535,8 +534,11 @@ def _send_commands_sync(commands):
 
 
 async def main():
+    token = config.DISCORD_BOT_TOKEN
+    if not token:
+        return
     try:
-        await client.start(DISCORD_BOT_TOKEN)
+        await client.start(token)
     except discord.LoginFailure:
         print("[!] Invalid Bot Token!")
     except Exception as e:
