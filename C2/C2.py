@@ -884,8 +884,41 @@ def main():
     client_manager = ClientManager()
     managed_stop_event = threading.Event()
     managed_server = None
+    managed_thread = None
     enrollment_server = None
     enrollment_thread = None
+
+    def cleanup_managed_services():
+        managed_stop_event.set()
+        errors = []
+        if enrollment_server is not None:
+            try:
+                if enrollment_thread is not None and enrollment_thread.ident is not None:
+                    enrollment_server.shutdown()
+            except Exception as error:
+                errors.append(f"enrollment shutdown: {error}")
+            finally:
+                try:
+                    enrollment_server.server_close()
+                except Exception as error:
+                    errors.append(f"enrollment close: {error}")
+        if managed_server is not None:
+            try:
+                managed_server.stop(timeout=5)
+            except Exception as error:
+                errors.append(f"managed stop: {error}")
+        current_thread = threading.current_thread()
+        for thread in (managed_thread, enrollment_thread):
+            if (
+                thread is not None
+                and thread.ident is not None
+                and thread is not current_thread
+            ):
+                try:
+                    thread.join(timeout=5)
+                except Exception as error:
+                    errors.append(f"{thread.name} join: {error}")
+        return errors
 
     try:
         from dashboard import start_dashboard
@@ -954,12 +987,7 @@ def main():
                 MANAGED_TLS_KEY,
                 enrollment_service,
             )
-            threading.Thread(
-                target=managed_server.serve_forever,
-                args=(managed_stop_event,),
-                name="managed-listener",
-                daemon=False,
-            ).start()
+            managed_thread = managed_server.start(managed_stop_event)
             enrollment_thread = threading.Thread(
                 target=enrollment_server.serve_forever,
                 name="enrollment-listener",
@@ -971,15 +999,14 @@ def main():
                 f"enrollment HTTPS on {HOST}:{ENROLLMENT_PORT}"
             )
         except Exception as e:
-            managed_stop_event.set()
-            if managed_server is not None:
-                managed_server.stop(timeout=5)
-            if enrollment_server is not None:
-                enrollment_server.server_close()
+            cleanup_errors = cleanup_managed_services()
             managed_server = None
+            managed_thread = None
             enrollment_server = None
             enrollment_thread = None
             print(f"[!] Managed services failed: {e}")
+            for cleanup_error in cleanup_errors:
+                print(f"[!] Managed services cleanup error: {cleanup_error}")
     else:
         print("Managed services disabled")
 
@@ -1359,25 +1386,8 @@ def main():
     finally:
         # Cleanup
         print("[+] Cleaning up...")
-        managed_stop_event.set()
-        try:
-            if managed_server is not None:
-                managed_server.stop(timeout=5)
-        except Exception as e:
-            print(f"[!] Managed listener cleanup error: {e}")
-        try:
-            if enrollment_server is not None:
-                try:
-                    enrollment_server.shutdown()
-                finally:
-                    enrollment_server.server_close()
-        except Exception as e:
-            print(f"[!] Enrollment listener cleanup error: {e}")
-        try:
-            if enrollment_thread is not None:
-                enrollment_thread.join(timeout=5)
-        except Exception as e:
-            print(f"[!] Enrollment thread cleanup error: {e}")
+        for cleanup_error in cleanup_managed_services():
+            print(f"[!] Managed services cleanup error: {cleanup_error}")
         try:
             s.close()
         except Exception:

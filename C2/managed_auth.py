@@ -547,8 +547,29 @@ class ManagedServer:
         self._listener.settimeout(0.2)
         self.port = self._listener.getsockname()[1]
 
+    def start(self, stop_event: threading.Event) -> threading.Thread:
+        with self._lock:
+            if self._stopped.is_set():
+                raise RuntimeError("managed server is stopped")
+            if self._accept_thread is not None:
+                raise RuntimeError("managed server is already started")
+            thread = threading.Thread(
+                target=self.serve_forever,
+                args=(stop_event,),
+                name="managed-listener",
+                daemon=False,
+            )
+            self._accept_thread = thread
+            thread.start()
+            return thread
+
     def serve_forever(self, stop_event: threading.Event) -> None:
-        self._accept_thread = threading.current_thread()
+        current = threading.current_thread()
+        with self._lock:
+            if self._accept_thread is None:
+                self._accept_thread = current
+            elif self._accept_thread is not current:
+                raise RuntimeError("managed server is already started")
         try:
             while not self._stopped.is_set() and not stop_event.is_set():
                 try:
@@ -588,13 +609,14 @@ class ManagedServer:
         except (ConnectionError, OSError, ssl.SSLError, ValueError):
             pass
         finally:
-            with self._lock:
-                self._connections.discard(raw_conn)
-                self._connections.discard(conn)
             try:
                 conn.close()
             except OSError:
                 pass
+            with self._lock:
+                self._connections.discard(raw_conn)
+                self._connections.discard(conn)
+                self._threads.discard(threading.current_thread())
 
     def _authenticate_and_heartbeat(self, conn) -> None:
         try:
@@ -648,15 +670,20 @@ class ManagedServer:
         heartbeat = threading.Event()
         with self._lock:
             self._heartbeats[hello["agent_id"]] = heartbeat
-        if self._stopped.wait(self._initial_ping_delay):
-            return
-        while not self._stopped.is_set():
-            _send_frame(conn, b"PING", max_size=4)
-            if _recv_frame(conn, timeout=self._pong_timeout, max_size=4) != b"PONG":
+        try:
+            if self._stopped.wait(self._initial_ping_delay):
                 return
-            heartbeat.set()
-            if self._stopped.wait(self._ping_interval):
-                return
+            while not self._stopped.is_set():
+                _send_frame(conn, b"PING", max_size=4)
+                if _recv_frame(conn, timeout=self._pong_timeout, max_size=4) != b"PONG":
+                    return
+                heartbeat.set()
+                if self._stopped.wait(self._ping_interval):
+                    return
+        finally:
+            with self._lock:
+                if self._heartbeats.get(hello["agent_id"]) is heartbeat:
+                    del self._heartbeats[hello["agent_id"]]
 
     def wait_for_heartbeat(self, agent_id: str, timeout: float) -> bool:
         deadline = monotonic() + timeout
@@ -703,9 +730,12 @@ class _EnrollmentHTTPServer(http.server.ThreadingHTTPServer):
     daemon_threads = False
     block_on_close = True
 
-    def __init__(self, address, handler, context, enrollment_service):
+    def __init__(
+        self, address, handler, context, enrollment_service, handshake_timeout
+    ):
         self._context = context
         self.enrollment_service = enrollment_service
+        self._handshake_timeout = handshake_timeout
         self._closing = threading.Event()
         self._connections = set()
         self._connections_lock = threading.Lock()
@@ -726,16 +756,26 @@ class _EnrollmentHTTPServer(http.server.ThreadingHTTPServer):
 
     def finish_handshake(self, conn):
         conn.setblocking(False)
+        deadline = monotonic() + self._handshake_timeout
         while not self._closing.is_set():
             try:
                 conn.do_handshake()
                 conn.settimeout(10.0)
                 return
             except ssl.SSLWantReadError:
-                select.select([conn], [], [], 0.1)
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("TLS handshake timed out")
+                select.select([conn], [], [], min(0.1, remaining))
             except ssl.SSLWantWriteError:
-                select.select([], [conn], [], 0.1)
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("TLS handshake timed out")
+                select.select([], [conn], [], min(0.1, remaining))
         raise ConnectionAbortedError("server is shutting down")
+
+    def handle_error(self, request, client_address):
+        pass
 
     def begin_shutdown(self):
         self._closing.set()
@@ -824,12 +864,22 @@ class EnrollmentServer:
         certfile: os.PathLike[str] | str,
         keyfile: os.PathLike[str] | str,
         service: EnrollmentService,
+        *,
+        handshake_timeout: float = 10.0,
     ) -> None:
+        if (
+            not isinstance(handshake_timeout, (int, float))
+            or isinstance(handshake_timeout, bool)
+            or not math.isfinite(handshake_timeout)
+            or handshake_timeout <= 0
+        ):
+            raise ValueError("handshake_timeout must be positive")
         self._server = _EnrollmentHTTPServer(
             (host, port),
             _EnrollmentHandler,
             _server_context(certfile, keyfile),
             service,
+            handshake_timeout,
         )
         self.port = self._server.server_address[1]
 

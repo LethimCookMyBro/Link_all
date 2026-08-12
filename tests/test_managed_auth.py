@@ -121,6 +121,15 @@ def _send_raw_frame(conn, payload):
     conn.sendall(len(payload).to_bytes(4, "big") + payload)
 
 
+def _wait_until(predicate, timeout=1.0):
+    deadline = monotonic() + timeout
+    while monotonic() < deadline:
+        if predicate():
+            return True
+        threading.Event().wait(0.01)
+    return bool(predicate())
+
+
 def test_token_is_consumed_once_and_never_stored_verbatim(tmp_path):
     path = tmp_path / "tokens.json"
     store = EnrollmentStore(path, now=lambda: 1000)
@@ -696,7 +705,7 @@ def test_managed_server_rejects_wrong_message_fields(tls_material, tmp_path):
         thread.join(2)
 
 
-def test_managed_stop_closes_idle_authenticated_tls_session(tls_material, tmp_path):
+def test_managed_server_prunes_completed_session_threads(tls_material, tmp_path):
     cert, key = tls_material
     server = ManagedServer(
         "127.0.0.1",
@@ -709,15 +718,64 @@ def test_managed_stop_closes_idle_authenticated_tls_session(tls_material, tmp_pa
     thread = threading.Thread(target=server.serve_forever, args=(stop_event,))
     thread.start()
     client = _tls_client(server.port)
+    try:
+        send_json_frame(client, {"type": "not-hello"})
+        assert recv_json_frame(client) == {"type": "AUTH_REJECT"}
+        client.close()
+        assert _wait_until(lambda: not server._threads)
+    finally:
+        client.close()
+        server.stop(timeout=1)
+        thread.join(1)
+
+
+def test_managed_stop_closes_authenticated_heartbeat_wait(tls_material, tmp_path):
+    cert, key = tls_material
+    registry = DeviceRegistry(tmp_path / "devices.bin", FakeProtector())
+    credential = registry.enroll()
+    server = ManagedServer(
+        "127.0.0.1",
+        0,
+        cert,
+        key,
+        registry,
+        initial_ping_delay=30,
+    )
+    stop_event = threading.Event()
+    thread = threading.Thread(target=server.serve_forever, args=(stop_event,))
+    thread.start()
+    client = _tls_client(server.port)
     started = monotonic()
     try:
+        assert _authenticate(client, credential) == "AUTH_OK"
+        assert _wait_until(lambda: credential.agent_id in server._heartbeats)
         server.stop(timeout=1)
         thread.join(1)
     finally:
         client.close()
     assert not thread.is_alive()
-    assert not any(worker.is_alive() for worker in server._threads)
+    assert not server._threads
+    assert credential.agent_id not in server._heartbeats
     assert monotonic() - started < 2
+
+
+def test_managed_start_registers_accept_thread_before_immediate_stop(
+    tls_material, tmp_path
+):
+    cert, key = tls_material
+    server = ManagedServer(
+        "127.0.0.1",
+        0,
+        cert,
+        key,
+        DeviceRegistry(tmp_path / "devices.bin", FakeProtector()),
+    )
+
+    thread = server.start(threading.Event())
+    server.stop(timeout=1)
+
+    assert server._accept_thread is thread
+    assert not thread.is_alive()
 
 
 def test_enrollment_https_consumes_token_once(tls_material, tmp_path):
@@ -832,6 +890,29 @@ def test_enrollment_shutdown_closes_idle_tcp_session(tls_material, tmp_path):
     assert monotonic() - started < 2
 
 
+def test_enrollment_tls_handshake_has_deadline(tls_material, tmp_path):
+    cert, key = tls_material
+    service = EnrollmentService(
+        EnrollmentStore(tmp_path / "tokens.json", acl_applier=lambda _: None),
+        DeviceRegistry(tmp_path / "devices.bin", FakeProtector()),
+    )
+    server = EnrollmentServer(
+        "127.0.0.1", 0, cert, key, service, handshake_timeout=0.05
+    )
+    thread = threading.Thread(target=server.serve_forever)
+    thread.start()
+    stalled = socket.create_connection(("127.0.0.1", server.port), timeout=2)
+    try:
+        assert _wait_until(lambda: bool(server._server._connections))
+        assert _wait_until(lambda: not server._server._connections, timeout=0.5)
+    finally:
+        stalled.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(2)
+    assert not thread.is_alive()
+
+
 def test_operator_cli_prints_token_once_and_not_found_is_nonzero(tmp_path, capsys):
     store = tmp_path / "store"
 
@@ -905,3 +986,77 @@ def test_controller_starts_and_cleans_up_managed_services(tls_material, tmp_path
     enrollment.shutdown.assert_called_once_with()
     enrollment.server_close.assert_called_once_with()
     legacy_socket.close.assert_called_once_with()
+
+
+def test_controller_rolls_back_after_enrollment_thread_started(tls_material, tmp_path):
+    import builtins
+
+    import C2.C2 as controller
+
+    class TrackingThread:
+        def __init__(self, *, target=None, args=(), name=None, daemon=None):
+            self.target = target
+            self.args = args
+            self.name = name
+            self.daemon = daemon
+            self.ident = None
+            self.joined = False
+            tracked.append(self)
+
+        def start(self):
+            self.ident = id(self)
+
+        def is_alive(self):
+            return self.ident is not None and not self.joined
+
+        def join(self, timeout=None):
+            self.joined = True
+
+    cert, key = tls_material
+    tracked = []
+    managed = MagicMock()
+    enrollment = MagicMock()
+    managed_owned_thread = TrackingThread(name="managed-listener", daemon=False)
+
+    def managed_start(_stop_event):
+        managed_owned_thread.start()
+        return managed_owned_thread
+
+    managed.start.side_effect = managed_start
+    real_print = builtins.print
+    raised = False
+
+    def fail_after_start(*args, **kwargs):
+        nonlocal raised
+        if args and str(args[0]).startswith("[+] Managed TLS") and not raised:
+            raised = True
+            raise RuntimeError("post-start failure")
+        return real_print(*args, **kwargs)
+
+    with (
+        patch.object(controller, "MANAGED_TLS_CERT", str(cert)),
+        patch.object(controller, "MANAGED_TLS_KEY", str(key)),
+        patch.object(controller, "MANAGED_STORE", str(tmp_path / "store")),
+        patch.object(controller, "ManagedServer", return_value=managed),
+        patch.object(controller, "EnrollmentServer", return_value=enrollment),
+        patch.object(controller, "EnrollmentStore"),
+        patch.object(controller, "DeviceRegistry"),
+        patch.object(controller, "EnrollmentService"),
+        patch.object(controller.socket, "socket", return_value=MagicMock()),
+        patch.object(controller.threading, "Thread", TrackingThread),
+        patch.object(controller.time, "sleep"),
+        patch.object(controller._console, "prompt", return_value="quit"),
+        patch("builtins.print", side_effect=fail_after_start),
+    ):
+        controller.main()
+
+    enrollment.shutdown.assert_called_once_with()
+    enrollment.server_close.assert_called_once_with()
+    managed.stop.assert_called_once_with(timeout=5)
+    managed_threads = [
+        thread
+        for thread in tracked
+        if thread.name in {"managed-listener", "enrollment-listener"}
+    ]
+    assert len(managed_threads) == 2
+    assert all(thread.joined for thread in managed_threads)
