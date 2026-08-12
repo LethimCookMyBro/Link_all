@@ -779,8 +779,14 @@ def test_managed_start_registers_accept_thread_before_immediate_stop(
 
 
 def test_direct_managed_thread_stop_waits_for_accept_registration(
-    monkeypatch, tls_material, tmp_path
+    tls_material, tmp_path
 ):
+    class ObservableCondition(threading.Condition):
+        def wait(self, timeout=None):
+            assert self._is_owned()
+            entered_wait.set()
+            return super().wait(timeout)
+
     class DelayedThread(threading.Thread):
         def run(self):
             entered.set()
@@ -795,8 +801,10 @@ def test_direct_managed_thread_stop_waits_for_accept_registration(
         key,
         DeviceRegistry(tmp_path / "devices.bin", FakeProtector()),
     )
+    entered_wait = threading.Event()
     entered = threading.Event()
     release = threading.Event()
+    server._startup = ObservableCondition()
     direct = DelayedThread(
         target=server.serve_forever,
         args=(threading.Event(),),
@@ -804,16 +812,6 @@ def test_direct_managed_thread_stop_waits_for_accept_registration(
         daemon=False,
     )
     stopped = threading.Event()
-    stop_wait_entered = threading.Event()
-    original_wait = server._wait_for_accept_registration
-
-    def observe_registration_wait(deadline):
-        stop_wait_entered.set()
-        return original_wait(deadline)
-
-    monkeypatch.setattr(
-        server, "_wait_for_accept_registration", observe_registration_wait
-    )
     direct.start()
     assert entered.wait(1)
 
@@ -824,9 +822,10 @@ def test_direct_managed_thread_stop_waits_for_accept_registration(
     stopper = threading.Thread(target=stop_server)
     stopper.start()
     try:
-        assert stop_wait_entered.wait(1)
+        assert entered_wait.wait(1)
         assert stopper.is_alive()
         assert not stopped.is_set()
+        assert server._accept_thread is None
     finally:
         release.set()
         stopper.join(2)

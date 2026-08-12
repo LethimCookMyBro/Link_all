@@ -711,7 +711,13 @@ class ManagedServer:
         deadline = monotonic() + timeout
         self._stopped.set()
         self._close_listener()
-        accept_thread = self._wait_for_accept_registration(deadline)
+        with self._startup:
+            while self._serve_requested and self._accept_thread is None:
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    break
+                self._startup.wait(remaining)
+            accept_thread = self._accept_thread
         with self._lock:
             connections = list(self._connections)
             threads = list(self._threads)
@@ -730,15 +736,6 @@ class ManagedServer:
         for thread in threads:
             if thread is not current:
                 thread.join(max(0.0, deadline - monotonic()))
-
-    def _wait_for_accept_registration(self, deadline: float) -> threading.Thread | None:
-        with self._startup:
-            while self._serve_requested and self._accept_thread is None:
-                remaining = deadline - monotonic()
-                if remaining <= 0:
-                    break
-                self._startup.wait(remaining)
-            return self._accept_thread
 
     def _close_listener(self) -> None:
         try:
