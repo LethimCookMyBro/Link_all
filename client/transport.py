@@ -105,6 +105,8 @@ class FrameDecoder:
                 self.expected = int.from_bytes(self.buffer[:4], "big")
                 del self.buffer[:4]
                 if self.expected > self.max_size:
+                    self.expected = None
+                    self.buffer.clear()
                     raise ValueError("frame too large")
             if len(self.buffer) < self.expected:
                 return frames

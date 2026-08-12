@@ -28,6 +28,15 @@ def test_frame_decoder_rejects_oversized_frame():
         decoder.feed(oversized)
 
 
+def test_frame_decoder_cannot_emit_rejected_oversized_frame_on_reuse():
+    decoder = FrameDecoder(max_size=4)
+    with pytest.raises(ValueError, match="frame too large"):
+        decoder.feed((5).to_bytes(4, "big"))
+
+    valid_frame = b"".join(encode_message(b"ok"))
+    assert decoder.feed(valid_frame) == [b"ok"]
+
+
 def test_frame_decoder_returns_all_complete_frames():
     first = b"".join(encode_message(b"one"))
     second = b"".join(encode_message(b"two"))

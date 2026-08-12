@@ -15,22 +15,16 @@ _CLIENT_DIR = os.path.dirname(os.path.abspath(__file__))
 if _CLIENT_DIR not in sys.path:
     sys.path.insert(0, _CLIENT_DIR)
 
-try:
-    from .transport import (
-        MAX_FRAME_SIZE,
-        decrypt as _decrypt,
-        derive_key as _derive_key,
-        encode_message,
-        encrypt as _encrypt,
-    )
-except ImportError:
-    from transport import (
-        MAX_FRAME_SIZE,
-        decrypt as _decrypt,
-        derive_key as _derive_key,
-        encode_message,
-        encrypt as _encrypt,
-    )
+if __package__:
+    from . import transport as _transport
+else:
+    import transport as _transport
+
+MAX_FRAME_SIZE = _transport.MAX_FRAME_SIZE
+_decrypt = _transport.decrypt
+_derive_key = _transport.derive_key
+encode_message = _transport.encode_message
+_encrypt = _transport.encrypt
 
 try:
     from av_bypass import AVBypass
