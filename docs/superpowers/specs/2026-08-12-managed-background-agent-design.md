@@ -14,8 +14,11 @@ Phase 1 ต้องส่งมอบ:
 - lifecycle state machine ที่สังเกตและทดสอบได้
 - reconnect/retry พร้อม exponential backoff และ jitter
 - application heartbeat และ read deadline
+- bounded socket polling ที่ตรวจ stop signal และ deadline ได้แม้ peer เงียบ
+- side-effect-free client transport module ที่ legacy และ managed client ใช้ร่วมกัน
 - clean shutdown ที่ยกเลิก connect/read/backoff ได้
 - configuration ที่ไม่เก็บ production credential เป็น plaintext
+- first-run enrollment flow และ authenticated managed handshake ที่มีผลตอบรับชัดเจน
 - unit tests และ real loopback integration tests
 - แนวทางรันแบบไม่มี console ระหว่างพัฒนา โดยยังคงวินิจฉัยปัญหาได้จาก rotating log
 
@@ -39,13 +42,16 @@ Phase นี้ยังไม่เพิ่ม:
 - Unified Command Center UI
 - Discord logic ภายใน agent process
 - PyInstaller production release
-- protocol migration ครั้งใหญ่
+- การย้าย legacy clients ไป managed protocol
+- enrollment/revocation UI เต็มรูปแบบ; Phase 1 มีเฉพาะ endpoint และ CLI ขั้นต่ำ
 
 ## 4. เหตุผลที่ไม่ใช้ Legacy Entry Point
 
 `client/PhantomLink.py` รวม network client และ startup side effects หลายชนิดไว้ในไฟล์เดียว การเรียก `PhantomLink.main()` จาก Managed Agent จะทำให้ lifecycle ใหม่ผูกกับพฤติกรรมที่อยู่นอก Phase 1
 
-จึงสร้าง entry point ใหม่และไม่เรียก legacy `main()` โดย Phase 1 จะ reuse เฉพาะ transport/encryption contract ที่แยกและทดสอบได้เท่านั้น
+ไฟล์นี้ยังมี import ของ AV helper และสร้าง working directory ที่ module scope จึงไม่เหมาะเป็น dependency ของ managed entry point
+
+จึงสร้าง entry point ใหม่และไม่ import หรือเรียก legacy `main()` จาก managed process โดย Phase 1 ต้องสกัด transport/encryption primitives ออกเป็นโมดูลที่ไม่มี side effect แล้วให้ทั้ง legacy และ managed client ใช้ร่วมกัน
 
 ## 5. Architecture
 
@@ -56,10 +62,16 @@ Phase นี้ยังไม่เพิ่ม:
 | `client/managed_agent.py` | entry point; ประกอบ config, credential store, connector และ runtime |
 | `client/agent_runtime.py` | state machine, retry policy, heartbeat, socket ownership และ shutdown |
 | `client/agent_config.py` | โหลด/validate non-secret config และเชื่อมต่อ credential provider |
+| `client/transport.py` | framing, incremental decode, key derivation และ encryption primitives ที่ไม่มี side effect |
+| `C2/managed_auth.py` | managed-agent listener, enrollment endpoint core และ versioned handshake |
 | `tests/test_agent_runtime.py` | deterministic unit tests ด้วย fake clock/connector |
 | `tests/test_agent_runtime_integration.py` | real TCP loopback tests |
+| `tests/test_client_transport.py` | byte/encryption compatibility ระหว่าง legacy, managed และ controller |
+| `tests/test_managed_auth.py` | enrollment, replay protection และ explicit auth result |
 
-อาจเพิ่ม shared transport module เฉพาะเมื่อจำเป็นต่อการ reuse framing/encryption โดยต้องรักษา byte contract เดิมและมี regression test ก่อนย้ายโค้ด
+`client/transport.py` เป็นข้อบังคับของ Phase 1 ไม่อนุญาตให้ managed runtime import `PhantomLink.py` หรือ copy framing/encryption ไปสร้าง implementation ชุดที่สอง
+
+Legacy `ShellClient` ต้องเปลี่ยนเฉพาะจุดเรียก framing/encryption ให้ import primitives จากโมดูลใหม่นี้ พฤติกรรม wire เดิมต้องถูกตรึงด้วย regression tests ก่อนและหลังการสกัด
 
 ### 5.2 State machine
 
@@ -81,7 +93,7 @@ STOPPED
 สถานะที่อนุญาต:
 
 - `STARTING`: validate config และโหลด device credential
-- `CONNECTING`: เปิด socket และทำ handshake
+- `CONNECTING`: เปิด socket ทำ versioned handshake และรอ authenticated result
 - `ONLINE`: session พร้อม heartbeat และรับ protocol frames
 - `BACKOFF`: รอ retry แบบ interruptible
 - `STOPPED`: ปิด socket และ worker ทั้งหมดแล้ว
@@ -92,12 +104,23 @@ STOPPED
 
 ### 6.1 Agent process
 
-- มี runtime owner thread หนึ่งตัว
+- มี runtime owner thread หนึ่งตัวและ logging writer thread หนึ่งตัว
 - runtime owner เป็นผู้เปิด ปิด อ่าน และเขียน agent socket แต่เพียงผู้เดียว
+- logging writer ไม่อ่านหรือแก้ state และไม่เข้าถึง socket
 - ใช้ `threading.Event` เป็น stop signal
 - ใช้ `stop_event.wait(timeout)` แทน `time.sleep()` เพื่อหยุด backoff/heartbeat ได้ทันที
 - state mutation ใช้ lock เดียวและไม่ถือ lock ระหว่าง blocking network I/O
-- lifecycle logs ส่งผ่าน local queue หรือ synchronous local logger ที่มีเวลาทำงานจำกัด
+- lifecycle logs ส่งผ่าน bounded queue ไปยัง logging writer เท่านั้น
+
+เมื่อเข้าสู่ `ONLINE` runtime ต้อง:
+
+- ตั้ง `socket.settimeout(io_poll_interval)` โดยค่าเริ่มต้น `io_poll_interval = 1.0` วินาที
+- เรียก `recv()` เป็นช่วงสั้นและเก็บข้อมูลใน persistent receive buffer
+- มอง `socket.timeout` ว่าเป็น poll tick ไม่ใช่ disconnect
+- หลังทุก poll tick ตรวจ `stop_event` และ `read_deadline`
+- ไม่ใช้ blocking `recv_exactly()` ที่ทิ้ง partial frame เมื่อ timeout
+- ให้ `FrameDecoder` ใน `client/transport.py` ประกอบ fragmented header/payload ข้ามหลาย poll ได้
+- ใช้ bounded socket timeout เดียวกันกับ send path เพื่อไม่ให้ `sendall()` ค้างไม่มีกำหนด
 
 Phase 1 ไม่มี command worker pool จึงไม่มีหลาย thread แข่งใช้ socket
 
@@ -114,15 +137,33 @@ Phase 1 ไม่มี command worker pool จึงไม่มีหลาย
 1. โหลดและ validate non-secret config
 2. โหลด device credential จาก credential provider
 3. สร้าง socket ใหม่สำหรับ connection attempt
-4. connect ภายใน configured connect timeout
-5. ทำ authenticated handshake ตาม protocol contract
-6. เมื่อสำเร็จ เปลี่ยนเป็น `ONLINE` และ reset backoff
-7. ส่ง/รับ heartbeat ตาม interval
-8. เมื่อ timeout, EOF, invalid frame หรือ socket error ให้ปิด socket เดิมก่อน
-9. เปลี่ยนเป็น `BACKOFF` แล้วรอแบบ interruptible
-10. retry จน stop, credential revoked หรือพบ fatal configuration/authentication error
+4. ตั้ง connect timeout แล้ว connect ไป managed-agent port
+5. ทำ managed TLS handshake และรอ `AUTH_OK` หรือ `AUTH_REJECT` ผ่าน TLS channel
+6. หลัง `AUTH_OK` ให้ตั้ง socket timeout เป็น `io_poll_interval`
+7. เปลี่ยนเป็น `ONLINE` และ reset backoff
+8. รับ frame แบบ incremental, ตอบ heartbeat และตรวจ read deadline ทุก poll tick
+9. เมื่อ EOF, invalid frame, deadline หรือ socket error ให้ปิด socket เดิมก่อน
+10. เปลี่ยนเป็น `BACKOFF` แล้วรอแบบ interruptible
+11. retry จน stop, credential revoked หรือพบ fatal configuration/authentication error
 
 ห้าม reuse socket หลัง connection attempt ล้มเหลว
+
+### 7.1 Managed handshake และ explicit authentication result
+
+Legacy handshake ปัจจุบันปิด socket เมื่อ credential ผิดแต่ไม่ส่งผล `AUTH_OK/AUTH_REJECT` ทำให้ client แยก auth failure ออกจาก network failure ไม่ได้ Phase 1 จึงเพิ่ม managed TLS listener บน port แยกจาก legacy listener เพื่อไม่เปลี่ยน legacy wire behavior
+
+Managed handshake version 1:
+
+1. Agent เปิด TLS connection และตรวจ certificate/public-key pin ก่อนส่ง credential proof
+2. Agent ส่ง framed hello ที่มี protocol version, agent ID และ credential key ID; ไม่มี secret ใน hello
+3. Controller lookup device credential และส่ง random challenge nonce ผ่าน TLS
+4. Agent ส่ง HMAC-SHA256 proof ครอบ canonical length-prefixed encoding ของ version, agent ID, key ID และ nonce
+5. Controller ตรวจ proof ด้วย constant-time comparison
+6. Controller ส่ง `AUTH_OK` หรือ `AUTH_REJECT` ผ่าน authenticated TLS channel
+7. Agent เปลี่ยนเป็น `ONLINE` และ reset backoff หลังรับ `AUTH_OK` สำเร็จเท่านั้น
+8. `AUTH_REJECT` จาก pinned TLS peer ถือเป็น fatal credential error และหยุด retry; timeout/EOF ก่อนผล auth ถือเป็น transient network failure
+
+Nonce ต้องสุ่มใหม่ทุก connection attempt เพื่อป้องกัน replay การทดสอบต้องยืนยันว่า proof จาก session เก่าใช้ซ้ำไม่ได้ TLS เป็น encryption/authentication layer ของ managed transport; legacy SecretBox behavior ยังคงเดิมสำหรับ legacy listener
 
 ## 8. Retry Policy
 
@@ -151,14 +192,17 @@ Phase 1 ไม่มี command worker pool จึงไม่มีหลาย
 
 OS TCP keepalive เพียงอย่างเดียวอาจใช้เวลานานเกินไปสำหรับการตรวจ half-open จึงใช้ application heartbeat เพิ่มเติม:
 
-- reuse heartbeat contract เดิม: controller ส่ง `PING` และ agent ตอบ `PONG`
-- ไม่เพิ่ม frame type หรือบังคับแก้ controller ใน Phase 1
+- โค้ด controller ปัจจุบันถูกตรวจแล้วว่าเริ่มส่ง `PING` ครั้งแรกหลังประมาณ 10 วินาที รอ `PONG` สูงสุด 10 วินาที และเว้นประมาณ 30 วินาทีก่อนรอบถัดไป
+- managed listener ต้องรักษา contract เดียวกัน: controller ส่ง `PING` และ agent ตอบ `PONG`
+- heartbeat support เป็น requirement ของ managed listener ไม่ใช่ optional behavior
+- ค่าเริ่มต้น `controller_ping_interval = 30` วินาที, `controller_pong_timeout = 10` วินาที และ `agent_read_deadline = 90` วินาที
+- config validation ต้องบังคับ `agent_read_deadline >= 3 * controller_ping_interval`
 - runtime บันทึกเวลาของ frame/heartbeat ล่าสุด
 - หากเกิน read deadline โดยไม่มี frame ที่ยอมรับได้ ให้ถือว่า session เสีย
 - close socket แล้วเข้าสู่ retry path เดียวกับ network failure
 - heartbeat ไม่สร้าง thread เพิ่มและถูกจัดการโดย runtime owner
 
-ค่า interval/deadline ต้อง config ได้และ validate ว่า deadline มากกว่า interval
+ใน Phase 1 managed agent ไม่มี command execution จึงไม่มีช่วง `command_in_progress` ที่เลื่อน heartbeat Integration test ต้องใช้ managed listener จริงเพื่อพิสูจน์ cadence และป้องกัน connection flapping
 
 ## 10. Configuration และ Secret Storage
 
@@ -167,12 +211,14 @@ OS TCP keepalive เพียงอย่างเดียวอาจใช้
 เก็บในไฟล์ config ที่จำกัด ACL:
 
 - controller host และ port
+- managed-agent port และ enrollment HTTPS endpoint
+- certificate/public-key pin ของ controller สำหรับ managed TLS และ enrollment HTTPS
 - agent identifier
-- connect/read/heartbeat timeout
+- connect timeout, I/O poll interval และ heartbeat/read deadline
 - retry base/max/jitter
 - log path และ rotation limits
 
-Server address ไม่ถือเป็น secret แต่ไฟล์ต้อง validate type/range และปฏิเสธค่าที่ผิดก่อนเริ่ม network I/O
+Server address และ certificate/public-key pin ไม่ถือเป็น secret แต่ไฟล์ต้อง validate type/range และปฏิเสธค่าที่ผิดก่อนเริ่ม network I/O โดยบังคับ `0 < io_poll_interval <= 1.0`, timeout ทุกค่าเป็นบวก และ `agent_read_deadline >= 3 * controller_ping_interval`
 
 ### 10.2 Credential lifecycle
 
@@ -187,9 +233,47 @@ Server address ไม่ถือเป็น secret แต่ไฟล์ต้
 
 ไม่ hardcode credential และไม่ใช้ reversible encryption key ที่ฝังอยู่ใน executable เพราะสามารถ extract key และ plaintext คืนได้
 
+### 10.3 First-run enrollment interface
+
+Background mode ห้าม prompt หรือรับ token ผ่าน process command line
+
+CLI ที่กำหนด:
+
+```text
+python.exe client/managed_agent.py enroll
+python.exe client/managed_agent.py enroll --token-file PATH
+python.exe client/managed_agent.py run
+pythonw.exe client/managed_agent.py run
+```
+
+- `enroll` ทำงาน foreground เท่านั้น ต้องตรวจ `sys.stdin.isatty()` ก่อนรับ token ผ่าน `getpass()` และ fail fast เมื่อไม่มี interactive TTY
+- `--token-file` ใช้สำหรับ automation โดยไฟล์ต้องเป็น absolute path, เป็น regular file, owner ตรงกับผู้รัน และ ACL ไม่เปิดกว้าง
+- อ่าน token ได้ครั้งเดียวแล้วลบไฟล์ทันที; หาก exchange ล้มเหลวต้อง provision token ใหม่
+- ไม่รองรับ `--enrollment-token VALUE`, stdin pipe หรือ environment variable เพื่อไม่ให้ token ปรากฏใน command history/process metadata
+- Enrollment client ติดต่อ controller ผ่าน HTTPS พร้อม certificate/public-key pin ที่ provision อยู่ใน non-secret config
+- Controller เก็บเฉพาะ hash ของ one-time token พร้อม expiry และ consumed flag
+- เมื่อแลกสำเร็จ controller คืน agent ID, key ID และ device credential; agent เก็บ credential ด้วย DPAPI ก่อนรายงาน success
+- Token ถูก mark consumed หลัง controller ยืนยัน issuance สำเร็จเพียงครั้งเดียว
+- `run` ต้อง fail fast ด้วย event `ENROLLMENT_REQUIRED` หากไม่พบ DPAPI credential และห้ามเข้า reconnect loop
+- `pythonw.exe` รองรับเฉพาะ `run`; enrollment ผ่าน `python.exe` เท่านั้น
+
+Phase 1 จึงต้องมี enrollment endpoint ขั้นต่ำและ token-issuance CLI ฝั่ง controller แต่ยังไม่มี enrollment UI
+
 ## 11. Logging และ Observability
 
 Agent ไม่มี popup และไม่พึ่ง stdout เมื่อรันผ่าน `pythonw.exe` จึงต้องมี rotating file log
+
+Logging architecture:
+
+- runtime ใช้ `QueueHandler` เขียนลง bounded queue แบบไม่ block
+- `QueueListener` หนึ่งตัวเป็นเจ้าของ file handler เพียงตัวเดียว; ห้ามเปิด log path เดียวกันจากหลาย handler/process
+- queue เต็มให้ drop event ตามนโยบายที่นับจำนวนได้และเขียน summary เมื่อระบบฟื้น ห้าม block socket owner
+- file handler ต้องเป็น resilient wrapper รอบ `RotatingFileHandler`
+- หาก rollover เจอ `PermissionError`/`WinError 32` ให้หยุด rollover รอบนั้น, reopen base file แบบ append และหน่วง rollover attempt ถัดไปเพื่อป้องกัน error spam
+- background mode ตั้ง `logging.raiseExceptions = False`; logging failure ถูกนับแต่ไม่ propagate กลับ runtime
+- shutdown ต้อง stop/flush `QueueListener` แบบ bounded แล้วจึงจบ process
+
+`QueueHandler/QueueListener` ลด contention และแยก I/O ออกจาก runtime แต่ไม่ได้แก้ external file lock ด้วยตัวเอง จึงต้องมี rollover recovery ข้างต้น
 
 Lifecycle event ขั้นต่ำ:
 
@@ -212,8 +296,9 @@ Log ต้อง:
 
 ### 12.1 Development modes
 
-- Debug: รัน `python.exe client/managed_agent.py` เพื่อเห็น traceback
-- Background smoke test: รัน `pythonw.exe client/managed_agent.py` และตรวจ rotating log
+- Debug: รัน `python.exe client/managed_agent.py run` เพื่อเห็น traceback
+- Enrollment: รัน `python.exe client/managed_agent.py enroll` ใน interactive terminal
+- Background smoke test: รัน `pythonw.exe client/managed_agent.py run` และตรวจ rotating log
 - ทั้งสอง mode ใช้ code path เดียวกัน ต่างกันเฉพาะ console availability
 
 ### 12.2 Production packaging
@@ -245,6 +330,10 @@ Log ต้อง:
 - socket close ทุก failure path
 - stop ระหว่าง connect, online และ backoff
 - credential redaction ใน log
+- `socket.timeout` ทำหน้าที่เป็น poll tick และไม่ล้าง partial receive buffer
+- fragmented frame ประกอบต่อได้ข้ามหลาย poll tick
+- logging queue เต็มและ rollover failure ไม่ propagate เข้า runtime
+- enrollment mode ปฏิเสธ missing TTY, insecure token file และ missing certificate pin
 
 ### 13.2 Real loopback integration tests
 
@@ -254,11 +343,19 @@ Log ต้อง:
 - server ส่ง FIN ระหว่าง session
 - server บังคับ RST ระหว่าง session
 - proxy/listener หยุดส่งข้อมูลโดยไม่ปิด endpoint เพื่อจำลอง blackhole/half-open
+- peer เงียบขณะ runtime สั่ง stop; runtime ต้องออกจาก `recv()` ภายใน `io_poll_interval` บวก tolerance
 - fragmented length header และ fragmented payload
+- fragmented frame ที่เว้นช่วงนานกว่า poll interval แต่สั้นกว่า read deadline
 - partial frame แล้วหยุดตอบ
 - oversized/malformed frame
-- server restart บน port เดิมแล้ว agent reconnect
+- managed listener ส่ง PING ตาม contract และ agent ตอบ PONG โดยไม่ connection flap
+- managed listener หยุดส่ง PING แล้ว agent ตัด session เมื่อถึง read deadline
+- server restart บน managed port เดิมแล้ว agent reconnect
 - authenticated reconnect reset backoff
+- `AUTH_OK` ผ่าน pinned TLS channel reset backoff; authenticated `AUTH_REJECT` หยุด retry
+- replay proof จาก nonce เก่าถูกปฏิเสธ
+- enrollment HTTPS test server แลก one-time token ได้ครั้งเดียวและ reuse ไม่ได้
+- Windows-only rollover test ถือ handle ของ rotated target ไว้เพื่อจำลอง `WinError 32` และยืนยันว่า runtime/log writer ฟื้นได้
 - shutdown ระหว่าง connect/read/backoff
 - หลัง test ไม่มี runtime thread หรือ socket ค้าง
 
@@ -272,6 +369,7 @@ Integration tests ต้องใช้ timeout สั้นและ bounded �
 - strict pytest ไม่มี unawaited coroutine หรือ unhandled thread exception
 - `pythonw.exe` smoke test สร้าง lifecycle log และหยุดได้สะอาด
 - protocol regression tests ยืนยัน byte framing/encryption contract เดิม
+- clean test environment ไม่มี import จาก `client/PhantomLink.py` ใน managed entry point
 
 ## 14. Error Handling
 
@@ -285,9 +383,11 @@ Integration tests ต้องใช้ timeout สั้นและ bounded �
 ## 15. Compatibility
 
 - ไม่เปลี่ยน command catalog เดิม
-- ไม่เปลี่ยน C2/Discord behavior เดิมใน Phase 1
+- legacy C2 listener และ Discord behavior เดิมต้องไม่เปลี่ยน
+- เพิ่ม managed listener บน port แยกและ enrollment HTTPS endpoint ขั้นต่ำ
 - ไม่ให้ Discord เข้าถึง agent socket
-- transport/encryption contract เดิมต้องผ่าน regression tests
+- legacy transport/encryption contract เดิมต้องผ่าน regression tests ก่อนและหลังย้าย primitives ไป `client/transport.py`
+- managed handshake เป็น versioned protocol แยกและต้องมี explicit auth result ผ่าน pinned TLS channel
 - legacy `PhantomLink.py` ยังคงอยู่และไม่ถูกเรียกจาก managed entry point
 
 ## 16. Rollout และ Rollback
@@ -296,11 +396,13 @@ Phase 1 rollout:
 
 1. unit tests
 2. loopback integration tests
-3. foreground local smoke test
-4. `pythonw.exe` background smoke test บนเครื่องทดสอบ
-5. ตรวจ log, shutdown และ reconnect behavior
+3. สร้าง one-time token ด้วย controller CLI
+4. foreground enrollment ผ่าน pinned HTTPS endpoint
+5. foreground local runtime smoke test
+6. `pythonw.exe` background runtime smoke test บนเครื่องทดสอบ
+7. ตรวจ log, shutdown, heartbeat และ reconnect behavior
 
-Rollback คือคืน entry point/config references ที่เปลี่ยนและลบไฟล์ agent foundation ใหม่ โดยไม่แตะ legacy client หรือ controller protocol
+Rollback คือปิด managed listener/enrollment endpoint, คืน legacy client imports ไป implementation เดิมหากจำเป็น และลบไฟล์ agent foundation ใหม่ โดย legacy listener ต้องยังใช้งานได้ตลอด rollback
 
 ## 17. Acceptance Criteria
 
@@ -308,20 +410,26 @@ Rollback คือคืน entry point/config references ที่เปลี�
 
 1. Agent รัน foreground และ background ผ่าน entry point ใหม่ได้
 2. ไม่มี legacy startup side effect ถูกเรียก
-3. Agent reconnect หลัง server เริ่มช้า, restart, FIN, RST และ heartbeat deadline
-4. Retry delay อยู่ใน exponential/jitter bounds และ reset หลัง auth สำเร็จ
-5. Auth rejection/revocation หยุด retry
-6. Stop request ยกเลิก backoff และ network wait ภายในเวลาที่ test กำหนด
-7. Production credential ไม่ปรากฏใน `.env`, config file หรือ log
-8. Agent และ Discord ไม่มี shared event loop/thread/socket ownership
-9. Unit, loopback integration และ full existing suite ผ่าน
-10. ไม่เหลือ thread หรือ socket หลัง shutdown
+3. Runtime ตรวจ stop signal/read deadline อย่างน้อยทุก `io_poll_interval` แม้ peer เงียบ
+4. Fragmented frame ไม่สูญหายเมื่อเกิด socket poll timeout
+5. Agent reconnect หลัง server เริ่มช้า, restart, FIN, RST และ heartbeat deadline
+6. Managed controller ส่ง PING ตาม cadence และ normal session ไม่เกิด connection flapping
+7. Retry delay อยู่ใน exponential/jitter bounds และ reset หลังรับ `AUTH_OK` ผ่าน pinned TLS channel สำเร็จ
+8. Auth rejection/revocation ที่ยืนยันตัวตนได้หยุด retry
+9. One-time enrollment token ใช้ซ้ำไม่ได้และ production credential อยู่ใน DPAPI store เท่านั้น
+10. Stop request ยกเลิก backoff และ network wait ภายในเวลาที่ test กำหนด
+11. Production credential ไม่ปรากฏใน `.env`, config file, command line หรือ log
+12. Logging rollover failure ไม่ทำให้ runtime ตายหรือสร้าง error spam ไม่จำกัด
+13. Agent และ Discord ไม่มี shared event loop/thread/socket ownership
+14. Legacy wire behavior ไม่เปลี่ยนหลังสกัด `client/transport.py`
+15. Unit, loopback integration และ full existing suite ผ่าน
+16. ไม่เหลือ runtime/logging thread หรือ socket หลัง shutdown
 
 ## 18. Future Phases
 
 หลัง Phase 1 ผ่าน acceptance gates แล้วจึงออกแบบแยกสำหรับ:
 
-- per-device enrollment API และ revocation UI เต็มรูปแบบ
+- enrollment/revocation UI เต็มรูปแบบ
 - job ID, acknowledgement, timeout และ audit model
 - Unified Command Center
 - signed installer/Windows Service
