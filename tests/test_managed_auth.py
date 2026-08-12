@@ -779,7 +779,7 @@ def test_managed_start_registers_accept_thread_before_immediate_stop(
 
 
 def test_direct_managed_thread_stop_waits_for_accept_registration(
-    tls_material, tmp_path
+    monkeypatch, tls_material, tmp_path
 ):
     class DelayedThread(threading.Thread):
         def run(self):
@@ -803,9 +803,19 @@ def test_direct_managed_thread_stop_waits_for_accept_registration(
         name="direct-managed-listener",
         daemon=False,
     )
+    stopped = threading.Event()
+    stop_wait_entered = threading.Event()
+    original_wait = server._wait_for_accept_registration
+
+    def observe_registration_wait(deadline):
+        stop_wait_entered.set()
+        return original_wait(deadline)
+
+    monkeypatch.setattr(
+        server, "_wait_for_accept_registration", observe_registration_wait
+    )
     direct.start()
     assert entered.wait(1)
-    stopped = threading.Event()
 
     def stop_server():
         server.stop(timeout=1)
@@ -814,7 +824,9 @@ def test_direct_managed_thread_stop_waits_for_accept_registration(
     stopper = threading.Thread(target=stop_server)
     stopper.start()
     try:
-        assert not stopped.wait(0.05)
+        assert stop_wait_entered.wait(1)
+        assert stopper.is_alive()
+        assert not stopped.is_set()
     finally:
         release.set()
         stopper.join(2)
