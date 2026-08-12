@@ -243,6 +243,14 @@ class DiscordBotGatewayTests(unittest.TestCase):
                 asyncio.run(discord_bot.main())
                 mock_start.assert_not_called()
 
+    def test_whitespace_token_skips_start(self):
+        import discord_bot
+
+        with patch("config.DISCORD_BOT_TOKEN", "   "):
+            with patch("discord_bot.client.start") as mock_start:
+                asyncio.run(discord_bot.main())
+                mock_start.assert_not_called()
+
     def test_login_failure_swallowed(self):
         import discord
 

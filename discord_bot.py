@@ -535,7 +535,7 @@ def _send_commands_sync(commands):
 
 async def main():
     token = config.DISCORD_BOT_TOKEN
-    if not token:
+    if not token.strip():
         return
     try:
         await client.start(token)
