@@ -36,6 +36,10 @@ class AuthRejected(Exception):
     pass
 
 
+class _HeartbeatDeadline(TimeoutError):
+    pass
+
+
 class RetryPolicy:
     def __init__(self, base, maximum, jitter, random=None):
         self.base = base
@@ -179,7 +183,7 @@ class ManagedConnector:
         if not isinstance(nonce_text, str) or len(nonce_text) > 64:
             raise ValueError("invalid CHALLENGE")
         nonce = base64.b64decode(nonce_text, validate=True)
-        if len(nonce) != 32:
+        if len(nonce) != 32 or base64.b64encode(nonce).decode("ascii") != nonce_text:
             raise ValueError("invalid CHALLENGE")
 
         proof = build_proof(
@@ -225,6 +229,22 @@ def _validate_credential(credential: DeviceCredential) -> None:
         raise ValueError("credential secret is invalid")
 
 
+def _failure_category(exc) -> str:
+    if isinstance(exc, _HeartbeatDeadline):
+        return "heartbeat"
+    if isinstance(exc, ssl.SSLError):
+        return "tls"
+    if isinstance(exc, TimeoutError):
+        return "timeout"
+    if isinstance(exc, ValueError):
+        return "protocol"
+    return "network"
+
+
+def _discard_event(_event) -> None:
+    pass
+
+
 class AgentRuntime:
     def __init__(
         self,
@@ -235,6 +255,7 @@ class AgentRuntime:
         retry_policy=None,
         stop_event=None,
         clock=monotonic,
+        event_sink=None,
     ) -> None:
         self.config = config
         self.credential = credential
@@ -243,7 +264,10 @@ class AgentRuntime:
         self._lock = threading.Lock()
         self._run_lock = threading.Lock()
         self._state = AgentState.STARTING
+        self._attempt = 0
         self._connection = None
+        self._pending_close_category = None
+        self._event_sink = event_sink if event_sink is not None else _discard_event
         self.connector = connector or ManagedConnector()
         bind = getattr(self.connector, "set_socket_hooks", None)
         if bind is not None:
@@ -261,7 +285,26 @@ class AgentRuntime:
 
     def _set_state(self, state) -> None:
         with self._lock:
+            if self._state is state:
+                return
             self._state = state
+        self._emit("STATE_TRANSITION", state=state)
+
+    def _emit(self, event, *, state=None, category=None, delay=None) -> None:
+        current = state or self.state
+        record = {
+            "event": event,
+            "state": current.name,
+            "attempt": self._attempt,
+        }
+        if category is not None:
+            record["category"] = category
+        if delay is not None:
+            record["delay"] = delay
+        try:
+            self._event_sink(record)
+        except Exception:  # noqa: BLE001 - observability must not kill the owner loop
+            return
 
     def _publish_connection(self, current, previous=None):
         with self._lock:
@@ -276,6 +319,16 @@ class AgentRuntime:
         with self._lock:
             if self._connection is current:
                 self._connection = None
+                self._pending_close_category = (
+                    "forced" if self.stop_event.is_set() else "clean"
+                )
+
+    def _emit_pending_close(self) -> None:
+        with self._lock:
+            category = self._pending_close_category
+            self._pending_close_category = None
+        if category is not None:
+            self._emit("SOCKET_CLOSE", category=category)
 
     @staticmethod
     def _shutdown(conn) -> None:
@@ -324,7 +377,8 @@ class AgentRuntime:
             if self.stop_event.is_set():
                 return
             if self.clock() >= deadline:
-                raise TimeoutError("heartbeat deadline")
+                self._emit("HEARTBEAT_DEADLINE")
+                raise _HeartbeatDeadline("heartbeat deadline")
 
     def run(self) -> None:
         if not self._run_lock.acquire(blocking=False):
@@ -333,32 +387,59 @@ class AgentRuntime:
             self._run_lock.release()
             return
         try:
-            _validate_credential(self.credential)
+            self._emit("PROCESS_START")
+            try:
+                _validate_credential(self.credential)
+            except (TypeError, ValueError):
+                self._emit("CONNECTION_FAILURE", category="credential")
+                raise
             while not self.stop_event.is_set():
+                self._attempt += 1
                 self._set_state(AgentState.CONNECTING)
+                if self.stop_event.is_set():
+                    break
+                self._emit("CONNECTION_ATTEMPT")
+                if self.stop_event.is_set():
+                    break
                 conn = None
                 transient = False
                 try:
                     conn = self.connector.connect(self.config, self.credential)
+                    self._emit("AUTH_ACCEPTED")
+                    self._emit("CONNECTION_SUCCESS")
                     if not self._publish_connection(conn):
                         continue
                     self.retry_policy.reset()
                     self._set_state(AgentState.ONLINE)
                     self.run_one_session(conn)
                 except AuthRejected:
+                    self._emit("AUTH_REJECTED")
+                    self._emit("CONNECTION_FAILURE", category="auth")
                     break
-                except (OSError, ValueError):
+                except (OSError, ValueError) as exc:
                     transient = True
+                    if not self.stop_event.is_set():
+                        self._emit(
+                            "CONNECTION_FAILURE",
+                            category=_failure_category(exc),
+                        )
                 finally:
                     self._close_connection(conn)
+                    self._emit_pending_close()
 
                 if self.stop_event.is_set():
                     break
                 if transient:
                     self._set_state(AgentState.BACKOFF)
-                    if self.stop_event.wait(self.retry_policy.next_delay()):
+                    delay = self.retry_policy.next_delay()
+                    self._emit("RETRY_DELAY", delay=delay)
+                    if self.stop_event.wait(delay):
                         break
         finally:
-            self._close_connection()
-            self._set_state(AgentState.STOPPED)
-            self._run_lock.release()
+            try:
+                self._close_connection()
+                self._emit_pending_close()
+                self._set_state(AgentState.STOPPED)
+                self._emit("PROCESS_STOP")
+            finally:
+                self._run_lock.release()

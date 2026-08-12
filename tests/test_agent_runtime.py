@@ -227,6 +227,26 @@ def test_only_complete_ping_resets_deadline(config):
         runtime.run_one_session(conn)
 
 
+def test_complete_ping_extends_deadline_with_advancing_clock(config):
+    ticks = iter([0, 2, 4, 5])
+    conn = FakeSocket([frame(b"PING"), TimeoutError()])
+    runtime = runtime_for_session(config, conn, clock=lambda: next(ticks))
+
+    with pytest.raises(TimeoutError, match="heartbeat deadline"):
+        runtime.run_one_session(conn)
+
+    assert conn.incoming == []
+    assert conn.sent_frames == [b"PONG"]
+
+
+def test_online_decoder_rejects_frame_over_64_kib(config):
+    conn = FakeSocket([(65537).to_bytes(4, "big")])
+    runtime = runtime_for_session(config, conn)
+
+    with pytest.raises(ValueError, match="frame too large"):
+        runtime.run_one_session(conn)
+
+
 class FakeRawSocket:
     def __init__(self, events):
         self.events = events
@@ -396,6 +416,76 @@ def test_default_connector_context_requires_tls_1_2_or_newer():
     assert context.minimum_version is ssl.TLSVersion.TLSv1_2
     assert context.check_hostname is False
     assert context.verify_mode is ssl.CERT_NONE
+
+
+def test_connector_rejects_missing_peer_certificate(config, credential):
+    connector, _, tls, _, _, _ = make_connector(config, credential)
+    tls.certificate = None
+
+    with pytest.raises(ssl.SSLError, match="certificate unavailable"):
+        connector.connect(config, credential)
+
+    assert tls.sent == []
+    assert tls.closed
+
+
+@pytest.mark.parametrize(
+    "challenge",
+    [
+        {"type": "CHALLENGE"},
+        {"type": "CHALLENGE", "nonce": "", "extra": True},
+        {"type": "WRONG", "nonce": ""},
+        {"type": "CHALLENGE", "nonce": 1},
+        {"type": "CHALLENGE", "nonce": "not-base64!"},
+        {
+            "type": "CHALLENGE",
+            "nonce": base64.b64encode(b"n" * 32).decode("ascii") + "=",
+        },
+        {
+            "type": "CHALLENGE",
+            "nonce": base64.b64encode(b"n" * 31).decode("ascii"),
+        },
+    ],
+)
+def test_connector_rejects_malformed_challenge(config, credential, challenge):
+    connector, _, tls, _, _, _ = make_connector(config, credential)
+    tls.incoming = [json_frame(challenge)]
+
+    with pytest.raises(ValueError):
+        connector.connect(config, credential)
+
+    assert tls.closed
+
+
+def test_connector_normalizes_recursive_auth_json(config, credential):
+    connector, _, tls, _, _, _ = make_connector(config, credential)
+    nested = b"[" * 5000 + b"]" * 5000
+    tls.incoming = [frame(b'{"type":"CHALLENGE","nonce":' + nested + b"}")]
+
+    with pytest.raises(ValueError, match="invalid authentication message") as raised:
+        connector.connect(config, credential)
+
+    assert isinstance(raised.value.__cause__, RecursionError)
+    assert tls.closed
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        {},
+        {"type": "AUTH_OK", "extra": True},
+        {"type": "WRONG"},
+        {"type": 1},
+    ],
+)
+def test_connector_rejects_malformed_auth_result(config, credential, result):
+    connector, _, tls, _, _, _ = make_connector(config, credential)
+    tls.incoming[-1] = json_frame(result)
+
+    with pytest.raises(ValueError, match="authentication result"):
+        connector.connect(config, credential)
+
+    assert tls.closed
 
 
 def test_connector_uses_fresh_socket_and_closes_before_clear(config, credential):
@@ -584,31 +674,114 @@ def test_auth_rejection_stops_without_backoff(config, credential):
     assert retry.next_calls == 0
 
 
-def test_invalid_local_credential_fails_before_socket(config):
+@pytest.mark.parametrize(
+    ("credential", "error", "message"),
+    [
+        (object(), TypeError, "DeviceCredential"),
+        (DeviceCredential("", "key-1", b"s" * 32), ValueError, "agent_id"),
+        (DeviceCredential("a" * 129, "key-1", b"s" * 32), ValueError, "agent_id"),
+        (DeviceCredential(1, "key-1", b"s" * 32), ValueError, "agent_id"),
+        (DeviceCredential("agent-1", "", b"s" * 32), ValueError, "key_id"),
+        (DeviceCredential("agent-1", "k" * 129, b"s" * 32), ValueError, "key_id"),
+        (DeviceCredential("agent-1", 1, b"s" * 32), ValueError, "key_id"),
+        (DeviceCredential("agent-1", "key-1", b"s" * 31), ValueError, "secret"),
+        (DeviceCredential("agent-1", "key-1", b"s" * 33), ValueError, "secret"),
+        (DeviceCredential("agent-1", "key-1", bytearray(32)), ValueError, "secret"),
+    ],
+)
+def test_invalid_local_credential_fails_before_socket(
+    config, credential, error, message
+):
     connector = ScriptedConnector()
+    events = []
     runtime = AgentRuntime(
-        config,
-        DeviceCredential("", "key-1", b"s" * 32),
-        connector=connector,
+        config, credential, connector=connector, event_sink=events.append
     )
 
-    with pytest.raises(ValueError, match="agent_id"):
+    with pytest.raises(error, match=message):
         runtime.run()
 
     assert connector.calls == 0
     assert runtime.state is AgentState.STOPPED
+    assert [event for event in events if event["event"] == "CONNECTION_FAILURE"] == [
+        {
+            "event": "CONNECTION_FAILURE",
+            "state": "STARTING",
+            "attempt": 0,
+            "category": "credential",
+        }
+    ]
+
+
+@pytest.mark.parametrize("size", [1, 128])
+def test_valid_credential_boundaries_reach_connector(config, size):
+    connector = ScriptedConnector(AuthRejected())
+    runtime = AgentRuntime(
+        config,
+        DeviceCredential("a" * size, "k" * size, b"s" * 32),
+        connector=connector,
+    )
+
+    runtime.run()
+
+    assert connector.calls == 1
+    assert runtime.state is AgentState.STOPPED
+
+
+def test_second_concurrent_run_is_rejected_without_second_owner(config, credential):
+    entered = threading.Event()
+    release = threading.Event()
+    events = []
+
+    class BlockingConnector:
+        calls = 0
+
+        def connect(self, _config, _credential):
+            self.calls += 1
+            entered.set()
+            assert release.wait(1)
+            raise OSError("offline")
+
+    connector = BlockingConnector()
+    runtime = AgentRuntime(
+        config, credential, connector=connector, event_sink=events.append
+    )
+    owner = threading.Thread(target=runtime.run, name="runtime-owner")
+    owner.start()
+    try:
+        assert entered.wait(1)
+        with pytest.raises(RuntimeError, match="already running"):
+            runtime.run()
+        assert connector.calls == 1
+        runtime.stop()
+        release.set()
+        owner.join(1)
+    finally:
+        release.set()
+        runtime.stop()
+        owner.join(1)
+
+    assert not owner.is_alive()
+    assert runtime.state is AgentState.STOPPED
+    assert [event["event"] for event in events].count("PROCESS_START") == 1
+    assert [event["event"] for event in events].count("PROCESS_STOP") == 1
 
 
 def test_stopped_runtime_has_no_outgoing_transition(config, credential):
     connector = ScriptedConnector(AuthRejected())
-    runtime = AgentRuntime(config, credential, connector=connector)
+    events = []
+    runtime = AgentRuntime(
+        config, credential, connector=connector, event_sink=events.append
+    )
 
     runtime.run()
+    completed_events = list(events)
     transitions = []
     runtime._set_state = transitions.append
     runtime.run()
 
     assert connector.calls == 1
+    assert events == completed_events
     assert transitions == []
     assert runtime.state is AgentState.STOPPED
 
@@ -680,6 +853,230 @@ def test_exact_owner_state_sequence(config, credential):
         AgentState.CONNECTING,
         AgentState.STOPPED,
     ]
+
+
+def test_lifecycle_events_are_exact_ordered_and_sanitized(config, credential):
+    events = []
+    conn = FakeSocket([b""])
+    connector = ScriptedConnector(
+        conn,
+        OSError("controller.test credential payload PING AUTH_REJECT"),
+        AuthRejected("secret exception text"),
+    )
+    runtime = AgentRuntime(
+        config,
+        credential,
+        connector=connector,
+        retry_policy=FakeRetryPolicy(),
+        event_sink=events.append,
+    )
+
+    runtime.run()
+
+    assert events == [
+        {"event": "PROCESS_START", "state": "STARTING", "attempt": 0},
+        {"event": "STATE_TRANSITION", "state": "CONNECTING", "attempt": 1},
+        {"event": "CONNECTION_ATTEMPT", "state": "CONNECTING", "attempt": 1},
+        {"event": "AUTH_ACCEPTED", "state": "CONNECTING", "attempt": 1},
+        {"event": "CONNECTION_SUCCESS", "state": "CONNECTING", "attempt": 1},
+        {"event": "STATE_TRANSITION", "state": "ONLINE", "attempt": 1},
+        {
+            "event": "CONNECTION_FAILURE",
+            "state": "ONLINE",
+            "attempt": 1,
+            "category": "network",
+        },
+        {
+            "event": "SOCKET_CLOSE",
+            "state": "ONLINE",
+            "attempt": 1,
+            "category": "clean",
+        },
+        {"event": "STATE_TRANSITION", "state": "BACKOFF", "attempt": 1},
+        {"event": "RETRY_DELAY", "state": "BACKOFF", "attempt": 1, "delay": 0},
+        {"event": "STATE_TRANSITION", "state": "CONNECTING", "attempt": 2},
+        {"event": "CONNECTION_ATTEMPT", "state": "CONNECTING", "attempt": 2},
+        {
+            "event": "CONNECTION_FAILURE",
+            "state": "CONNECTING",
+            "attempt": 2,
+            "category": "network",
+        },
+        {"event": "STATE_TRANSITION", "state": "BACKOFF", "attempt": 2},
+        {"event": "RETRY_DELAY", "state": "BACKOFF", "attempt": 2, "delay": 0},
+        {"event": "STATE_TRANSITION", "state": "CONNECTING", "attempt": 3},
+        {"event": "CONNECTION_ATTEMPT", "state": "CONNECTING", "attempt": 3},
+        {"event": "AUTH_REJECTED", "state": "CONNECTING", "attempt": 3},
+        {
+            "event": "CONNECTION_FAILURE",
+            "state": "CONNECTING",
+            "attempt": 3,
+            "category": "auth",
+        },
+        {"event": "STATE_TRANSITION", "state": "STOPPED", "attempt": 3},
+        {"event": "PROCESS_STOP", "state": "STOPPED", "attempt": 3},
+    ]
+    serialized = json.dumps(events)
+    for sensitive in (
+        config.controller_host,
+        credential.agent_id,
+        credential.key_id,
+        "credential",
+        "payload",
+        "PING",
+        "secret exception text",
+    ):
+        assert sensitive not in serialized
+
+
+def test_production_auth_reject_emits_cause_before_single_close(config, credential):
+    events = []
+    connector, _, tls, _, _, _ = make_connector(
+        config, credential, result="AUTH_REJECT"
+    )
+    runtime = AgentRuntime(
+        config, credential, connector=connector, event_sink=events.append
+    )
+
+    runtime.run()
+
+    relevant = [
+        event
+        for event in events
+        if event["event"] in {"AUTH_REJECTED", "CONNECTION_FAILURE", "SOCKET_CLOSE"}
+    ]
+    assert relevant == [
+        {"event": "AUTH_REJECTED", "state": "CONNECTING", "attempt": 1},
+        {
+            "event": "CONNECTION_FAILURE",
+            "state": "CONNECTING",
+            "attempt": 1,
+            "category": "auth",
+        },
+        {
+            "event": "SOCKET_CLOSE",
+            "state": "CONNECTING",
+            "attempt": 1,
+            "category": "clean",
+        },
+    ]
+    assert tls.closed
+
+
+def test_protocol_and_heartbeat_failures_emit_safe_categories(config, credential):
+    events = []
+    protocol_conn = FakeSocket([frame(b"unexpected")])
+    heartbeat_conn = FakeSocket([TimeoutError()])
+    connector = ScriptedConnector(protocol_conn, heartbeat_conn, AuthRejected())
+    ticks = iter([0, 3, 6])
+    runtime = AgentRuntime(
+        config,
+        credential,
+        connector=connector,
+        retry_policy=FakeRetryPolicy(),
+        clock=lambda: next(ticks),
+        event_sink=events.append,
+    )
+
+    runtime.run()
+
+    categories = [
+        event["category"] for event in events if event["event"] == "CONNECTION_FAILURE"
+    ]
+    assert categories == ["protocol", "heartbeat", "auth"]
+    assert [event for event in events if event["event"] == "HEARTBEAT_DEADLINE"] == [
+        {"event": "HEARTBEAT_DEADLINE", "state": "ONLINE", "attempt": 2}
+    ]
+
+
+def test_failure_categories_use_exception_classes_not_text(config, credential):
+    events = []
+    connector = ScriptedConnector(
+        TimeoutError("tls auth protocol secret"),
+        ssl.SSLError("network timeout secret"),
+        AuthRejected(),
+    )
+    runtime = AgentRuntime(
+        config,
+        credential,
+        connector=connector,
+        retry_policy=FakeRetryPolicy(),
+        event_sink=events.append,
+    )
+
+    runtime.run()
+
+    assert [
+        event["category"] for event in events if event["event"] == "CONNECTION_FAILURE"
+    ] == ["timeout", "tls", "auth"]
+    assert "secret" not in json.dumps(events)
+
+
+def test_event_sink_failure_never_kills_owner_loop(config, credential):
+    connector = ScriptedConnector(AuthRejected())
+
+    def broken_sink(_event):
+        raise RuntimeError("logging unavailable")
+
+    runtime = AgentRuntime(
+        config, credential, connector=connector, event_sink=broken_sink
+    )
+
+    runtime.run()
+
+    assert connector.calls == 1
+    assert runtime.state is AgentState.STOPPED
+
+
+def test_event_sink_is_reentrant_and_called_outside_state_lock(config, credential):
+    events = []
+    conn = FakeSocket()
+    connector = ScriptedConnector(conn)
+    runtime = None
+
+    def sink(event):
+        events.append(event)
+        if event == {
+            "event": "STATE_TRANSITION",
+            "state": "ONLINE",
+            "attempt": 1,
+        }:
+            assert runtime.state is AgentState.ONLINE
+            runtime.stop()
+
+    runtime = AgentRuntime(config, credential, connector=connector, event_sink=sink)
+    thread = threading.Thread(target=runtime.run, name="runtime-reentrant-sink")
+    thread.start()
+    thread.join(1)
+    if thread.is_alive():
+        runtime.stop()
+        thread.join(1)
+
+    assert not thread.is_alive()
+    assert runtime.state is AgentState.STOPPED
+    assert events[-1] == {"event": "PROCESS_STOP", "state": "STOPPED", "attempt": 1}
+
+
+@pytest.mark.parametrize("stop_event", ["STATE_TRANSITION", "CONNECTION_ATTEMPT"])
+def test_reentrant_sink_stop_before_dial_skips_connection(
+    config, credential, stop_event
+):
+    events = []
+    connector = ScriptedConnector()
+    runtime = None
+
+    def sink(event):
+        events.append(event)
+        if event["event"] == stop_event:
+            runtime.stop()
+
+    runtime = AgentRuntime(config, credential, connector=connector, event_sink=sink)
+
+    runtime.run()
+
+    assert connector.calls == 0
+    assert runtime.state is AgentState.STOPPED
+    assert events[-1] == {"event": "PROCESS_STOP", "state": "STOPPED", "attempt": 1}
 
 
 def test_close_error_does_not_abort_transient_retry(config, credential):
@@ -765,9 +1162,12 @@ class BlockingOnlineSocket(FakeSocket):
 def test_stop_interrupts_online_io_without_thread_leak(config, credential, operation):
     entered = threading.Event()
     released = threading.Event()
+    events = []
     conn = BlockingOnlineSocket(operation, entered, released)
     connector = ScriptedConnector(conn)
-    runtime = AgentRuntime(config, credential, connector=connector)
+    runtime = AgentRuntime(
+        config, credential, connector=connector, event_sink=events.append
+    )
     thread = threading.Thread(target=runtime.run, name=f"runtime-online-{operation}")
     thread.start()
     try:
@@ -784,6 +1184,14 @@ def test_stop_interrupts_online_io_without_thread_leak(config, credential, opera
     assert socket.SHUT_RDWR in conn.shutdown_calls
     assert conn.closed
     assert runtime.state is AgentState.STOPPED
+    assert [event for event in events if event["event"] == "SOCKET_CLOSE"] == [
+        {
+            "event": "SOCKET_CLOSE",
+            "state": "ONLINE",
+            "attempt": 1,
+            "category": "forced",
+        }
+    ]
 
 
 class BlockingRaw(FakeRawSocket):
