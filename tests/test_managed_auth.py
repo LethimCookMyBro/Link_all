@@ -778,6 +778,53 @@ def test_managed_start_registers_accept_thread_before_immediate_stop(
     assert not thread.is_alive()
 
 
+def test_direct_managed_thread_stop_waits_for_accept_registration(
+    tls_material, tmp_path
+):
+    class DelayedThread(threading.Thread):
+        def run(self):
+            entered.set()
+            release.wait()
+            super().run()
+
+    cert, key = tls_material
+    server = ManagedServer(
+        "127.0.0.1",
+        0,
+        cert,
+        key,
+        DeviceRegistry(tmp_path / "devices.bin", FakeProtector()),
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    direct = DelayedThread(
+        target=server.serve_forever,
+        args=(threading.Event(),),
+        name="direct-managed-listener",
+        daemon=False,
+    )
+    direct.start()
+    assert entered.wait(1)
+    stopped = threading.Event()
+
+    def stop_server():
+        server.stop(timeout=1)
+        stopped.set()
+
+    stopper = threading.Thread(target=stop_server)
+    stopper.start()
+    try:
+        assert not stopped.wait(0.05)
+    finally:
+        release.set()
+        stopper.join(2)
+        direct.join(2)
+
+    assert stopped.is_set()
+    assert server._accept_thread is direct
+    assert not direct.is_alive()
+
+
 def test_enrollment_https_consumes_token_once(tls_material, tmp_path):
     tokens = EnrollmentStore(tmp_path / "tokens.json", acl_applier=lambda _: None)
     registry = DeviceRegistry(tmp_path / "devices.bin", FakeProtector())

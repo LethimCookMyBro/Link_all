@@ -536,6 +536,8 @@ class ManagedServer:
         self._pong_timeout = pong_timeout
         self._stopped = threading.Event()
         self._lock = threading.Lock()
+        self._startup = threading.Condition()
+        self._serve_requested = False
         self._connections: set[socket.socket] = set()
         self._threads: set[threading.Thread] = set()
         self._heartbeats: dict[str, threading.Event] = {}
@@ -548,13 +550,14 @@ class ManagedServer:
         self.port = self._listener.getsockname()[1]
 
     def start(self, stop_event: threading.Event) -> threading.Thread:
-        with self._lock:
+        with self._startup:
             if self._stopped.is_set():
                 raise RuntimeError("managed server is stopped")
-            if self._accept_thread is not None:
+            if self._serve_requested or self._accept_thread is not None:
                 raise RuntimeError("managed server is already started")
+            self._serve_requested = True
             thread = threading.Thread(
-                target=self.serve_forever,
+                target=self._serve_forever,
                 args=(stop_event,),
                 name="managed-listener",
                 daemon=False,
@@ -563,13 +566,21 @@ class ManagedServer:
             thread.start()
             return thread
 
-    def serve_forever(self, stop_event: threading.Event) -> None:
+    @property
+    def serve_forever(self) -> Callable[[threading.Event], None]:
+        with self._startup:
+            self._serve_requested = True
+            self._startup.notify_all()
+        return self._serve_forever
+
+    def _serve_forever(self, stop_event: threading.Event) -> None:
         current = threading.current_thread()
-        with self._lock:
+        with self._startup:
             if self._accept_thread is None:
                 self._accept_thread = current
             elif self._accept_thread is not current:
                 raise RuntimeError("managed server is already started")
+            self._startup.notify_all()
         try:
             while not self._stopped.is_set() and not stop_event.is_set():
                 try:
@@ -700,11 +711,18 @@ class ManagedServer:
         deadline = monotonic() + timeout
         self._stopped.set()
         self._close_listener()
+        with self._startup:
+            while self._serve_requested and self._accept_thread is None:
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    break
+                self._startup.wait(remaining)
+            accept_thread = self._accept_thread
         with self._lock:
             connections = list(self._connections)
             threads = list(self._threads)
-            if self._accept_thread is not None:
-                threads.append(self._accept_thread)
+        if accept_thread is not None:
+            threads.append(accept_thread)
         for conn in connections:
             try:
                 conn.shutdown(socket.SHUT_RDWR)
