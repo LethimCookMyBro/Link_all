@@ -1,17 +1,23 @@
 from __future__ import annotations
 
+import argparse
 import base64
 import hashlib
+import http.server
 import json
 import math
 import os
 import secrets
+import select
+import socket
+import ssl
 import threading
 from collections.abc import Callable, Mapping
 from pathlib import Path
-from time import time
+from time import monotonic, time
 from uuid import uuid4
 
+from client import transport
 from client.agent_config import (
     DeviceCredential,
     _apply_private_acl,
@@ -23,12 +29,58 @@ from client.transport import build_proof, canonical_auth_input, verify_proof
 
 __all__ = [
     "DeviceRegistry",
+    "EnrollmentServer",
     "EnrollmentService",
     "EnrollmentStore",
+    "ManagedServer",
     "build_proof",
     "canonical_auth_input",
+    "recv_json_frame",
+    "send_json_frame",
     "verify_proof",
 ]
+
+_MAX_JSON_SIZE = 64 * 1024
+_MAX_ID_SIZE = 128
+
+
+def _recv_exactly(conn, size: int) -> bytes:
+    payload = bytearray()
+    while len(payload) < size:
+        chunk = conn.recv(size - len(payload))
+        if not chunk:
+            raise ConnectionError("connection closed")
+        payload.extend(chunk)
+    return bytes(payload)
+
+
+def _send_frame(conn, payload: bytes, *, max_size: int = _MAX_JSON_SIZE) -> None:
+    if len(payload) > max_size:
+        raise ValueError("frame too large")
+    conn.sendall(len(payload).to_bytes(4, "big") + payload)
+
+
+def _recv_frame(conn, *, timeout: float, max_size: int = _MAX_JSON_SIZE) -> bytes:
+    previous_timeout = conn.gettimeout()
+    conn.settimeout(timeout)
+    try:
+        size = int.from_bytes(_recv_exactly(conn, 4), "big")
+        if size > max_size:
+            raise ValueError("frame too large")
+        return _recv_exactly(conn, size)
+    finally:
+        conn.settimeout(previous_timeout)
+
+
+def send_json_frame(conn, message, *, max_size: int = _MAX_JSON_SIZE) -> None:
+    _send_frame(conn, transport.encode_json_payload(message), max_size=max_size)
+
+
+def recv_json_frame(
+    conn, timeout: float = 10.0, max_size: int = _MAX_JSON_SIZE
+) -> dict:
+    payload = _recv_frame(conn, timeout=timeout, max_size=max_size)
+    return transport.decode_json_payload(payload, max_size=max_size)
 
 
 class EnrollmentStore:
@@ -214,6 +266,14 @@ class DeviceRegistry:
             del records[identity]
             self._write_unlocked(records)
             return True
+
+    def list_devices(self) -> list[dict[str, str]]:
+        with self._lock:
+            return [
+                {"agent_id": agent_id, "key_id": key_id}
+                for (agent_id, key_id), record in sorted(self._read_unlocked().items())
+                if record["active"] and record["pending_digest"] is None
+            ]
 
     def _stage(self, digest: str) -> DeviceCredential:
         return self._create(active=False, pending_digest=digest)
@@ -431,3 +491,393 @@ class EnrollmentService:
     def _note_cleanup_error(error: Exception, cleanup_error: Exception | None) -> None:
         if cleanup_error is not None and hasattr(error, "add_note"):
             error.add_note(f"enrollment cleanup also failed: {cleanup_error}")
+
+
+def _server_context(certfile: os.PathLike[str] | str, keyfile: os.PathLike[str] | str):
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    context.load_cert_chain(certfile, keyfile)
+    return context
+
+
+def _valid_identity(value) -> bool:
+    return isinstance(value, str) and 0 < len(value) <= _MAX_ID_SIZE
+
+
+class ManagedServer:
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        certfile: os.PathLike[str] | str,
+        keyfile: os.PathLike[str] | str,
+        registry: DeviceRegistry,
+        *,
+        initial_ping_delay: float = 10.0,
+        ping_interval: float = 30.0,
+        pong_timeout: float = 10.0,
+    ) -> None:
+        for name, value in (
+            ("initial_ping_delay", initial_ping_delay),
+            ("ping_interval", ping_interval),
+            ("pong_timeout", pong_timeout),
+        ):
+            if (
+                not isinstance(value, (int, float))
+                or isinstance(value, bool)
+                or not math.isfinite(value)
+                or value <= 0
+            ):
+                raise ValueError(f"{name} must be positive")
+        self._context = _server_context(certfile, keyfile)
+        self._registry = registry
+        self._initial_ping_delay = initial_ping_delay
+        self._ping_interval = ping_interval
+        self._pong_timeout = pong_timeout
+        self._stopped = threading.Event()
+        self._lock = threading.Lock()
+        self._connections: set[socket.socket] = set()
+        self._threads: set[threading.Thread] = set()
+        self._heartbeats: dict[str, threading.Event] = {}
+        self._accept_thread: threading.Thread | None = None
+        self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._listener.bind((host, port))
+        self._listener.listen()
+        self._listener.settimeout(0.2)
+        self.port = self._listener.getsockname()[1]
+
+    def serve_forever(self, stop_event: threading.Event) -> None:
+        self._accept_thread = threading.current_thread()
+        try:
+            while not self._stopped.is_set() and not stop_event.is_set():
+                try:
+                    conn, _ = self._listener.accept()
+                except TimeoutError:
+                    continue
+                except OSError:
+                    break
+                thread = threading.Thread(
+                    target=self._serve_connection,
+                    args=(conn,),
+                    name="managed-session",
+                    daemon=False,
+                )
+                with self._lock:
+                    if self._stopped.is_set() or stop_event.is_set():
+                        conn.close()
+                        break
+                    self._connections.add(conn)
+                    self._threads.add(thread)
+                    thread.start()
+        finally:
+            self._close_listener()
+
+    def _serve_connection(self, raw_conn: socket.socket) -> None:
+        conn = raw_conn
+        try:
+            raw_conn.settimeout(10.0)
+            conn = self._context.wrap_socket(raw_conn, server_side=True)
+            with self._lock:
+                self._connections.discard(raw_conn)
+                if self._stopped.is_set():
+                    conn.close()
+                    return
+                self._connections.add(conn)
+            self._authenticate_and_heartbeat(conn)
+        except (ConnectionError, OSError, ssl.SSLError, ValueError):
+            pass
+        finally:
+            with self._lock:
+                self._connections.discard(raw_conn)
+                self._connections.discard(conn)
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    def _authenticate_and_heartbeat(self, conn) -> None:
+        try:
+            hello = recv_json_frame(conn)
+            if (
+                set(hello) != {"type", "version", "agent_id", "key_id"}
+                or hello["type"] != "HELLO"
+                or type(hello["version"]) is not int
+                or hello["version"] != 1
+                or not _valid_identity(hello["agent_id"])
+                or not _valid_identity(hello["key_id"])
+            ):
+                raise ValueError("invalid HELLO")
+
+            nonce = secrets.token_bytes(32)
+            send_json_frame(
+                conn,
+                {
+                    "type": "CHALLENGE",
+                    "nonce": base64.b64encode(nonce).decode("ascii"),
+                },
+            )
+            proof_message = recv_json_frame(conn)
+            if (
+                set(proof_message) != {"type", "proof"}
+                or proof_message["type"] != "AUTH_PROOF"
+                or not isinstance(proof_message["proof"], str)
+                or len(proof_message["proof"]) > 64
+            ):
+                raise ValueError("invalid AUTH_PROOF")
+            proof = base64.b64decode(proof_message["proof"], validate=True)
+            if len(proof) != 32:
+                raise ValueError("invalid AUTH_PROOF")
+            secret = self._registry.get(hello["agent_id"], hello["key_id"])
+            accepted = secret is not None and verify_proof(
+                secret,
+                1,
+                hello["agent_id"],
+                hello["key_id"],
+                nonce,
+                proof,
+            )
+        except (KeyError, TypeError, ValueError):
+            accepted = False
+            hello = None
+
+        send_json_frame(conn, {"type": "AUTH_OK" if accepted else "AUTH_REJECT"})
+        if not accepted:
+            return
+
+        heartbeat = threading.Event()
+        with self._lock:
+            self._heartbeats[hello["agent_id"]] = heartbeat
+        if self._stopped.wait(self._initial_ping_delay):
+            return
+        while not self._stopped.is_set():
+            _send_frame(conn, b"PING", max_size=4)
+            if _recv_frame(conn, timeout=self._pong_timeout, max_size=4) != b"PONG":
+                return
+            heartbeat.set()
+            if self._stopped.wait(self._ping_interval):
+                return
+
+    def wait_for_heartbeat(self, agent_id: str, timeout: float) -> bool:
+        deadline = monotonic() + timeout
+        while monotonic() < deadline:
+            with self._lock:
+                heartbeat = self._heartbeats.get(agent_id)
+            if heartbeat is not None:
+                return heartbeat.wait(max(0.0, deadline - monotonic()))
+            if self._stopped.wait(min(0.01, max(0.0, deadline - monotonic()))):
+                return False
+        return False
+
+    def stop(self, timeout: float = 5.0) -> None:
+        deadline = monotonic() + timeout
+        self._stopped.set()
+        self._close_listener()
+        with self._lock:
+            connections = list(self._connections)
+            threads = list(self._threads)
+            if self._accept_thread is not None:
+                threads.append(self._accept_thread)
+        for conn in connections:
+            try:
+                conn.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                conn.close()
+            except OSError:
+                pass
+        current = threading.current_thread()
+        for thread in threads:
+            if thread is not current:
+                thread.join(max(0.0, deadline - monotonic()))
+
+    def _close_listener(self) -> None:
+        try:
+            self._listener.close()
+        except OSError:
+            pass
+
+
+class _EnrollmentHTTPServer(http.server.ThreadingHTTPServer):
+    daemon_threads = False
+    block_on_close = True
+
+    def __init__(self, address, handler, context, enrollment_service):
+        self._context = context
+        self.enrollment_service = enrollment_service
+        self._closing = threading.Event()
+        self._connections = set()
+        self._connections_lock = threading.Lock()
+        super().__init__(address, handler)
+
+    def get_request(self):
+        conn, address = super().get_request()
+        try:
+            conn = self._context.wrap_socket(
+                conn, server_side=True, do_handshake_on_connect=False
+            )
+        except (OSError, ValueError):
+            conn.close()
+            raise
+        with self._connections_lock:
+            self._connections.add(conn)
+        return conn, address
+
+    def finish_handshake(self, conn):
+        conn.setblocking(False)
+        while not self._closing.is_set():
+            try:
+                conn.do_handshake()
+                conn.settimeout(10.0)
+                return
+            except ssl.SSLWantReadError:
+                select.select([conn], [], [], 0.1)
+            except ssl.SSLWantWriteError:
+                select.select([], [conn], [], 0.1)
+        raise ConnectionAbortedError("server is shutting down")
+
+    def begin_shutdown(self):
+        self._closing.set()
+
+    def close_request(self, request):
+        with self._connections_lock:
+            self._connections.discard(request)
+        super().close_request(request)
+
+    def close_connections(self):
+        with self._connections_lock:
+            connections = list(self._connections)
+        for conn in connections:
+            try:
+                conn.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            conn.close()
+
+    def server_close(self):
+        self.begin_shutdown()
+        self.close_connections()
+        super().server_close()
+
+
+class _EnrollmentHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "Enrollment"
+    sys_version = ""
+
+    def setup(self):
+        self.server.finish_handshake(self.request)
+        super().setup()
+
+    def do_GET(self):
+        self._reply(405, {"error": "method not allowed"})
+
+    def do_POST(self):
+        if self.path != "/v1/enroll":
+            self._reply(404, {"error": "not found"})
+            return
+        try:
+            content_length = int(self.headers.get("Content-Length", ""))
+            if not 0 < content_length <= _MAX_JSON_SIZE:
+                raise ValueError
+            payload = transport.decode_json_payload(
+                self.rfile.read(content_length), max_size=_MAX_JSON_SIZE
+            )
+            if set(payload) != {"token"} or not isinstance(payload["token"], str):
+                raise ValueError
+        except (TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+            self._reply(400, {"error": "invalid request"})
+            return
+        try:
+            credential = self.server.enrollment_service.exchange(payload["token"])
+        except ValueError:
+            self._reply(401, {"error": "invalid enrollment token"})
+            return
+        self._reply(
+            201,
+            {
+                "agent_id": credential.agent_id,
+                "key_id": credential.key_id,
+                "secret": base64.b64encode(credential.secret).decode("ascii"),
+            },
+        )
+
+    def _reply(self, status: int, message: Mapping) -> None:
+        payload = transport.encode_json_payload(message)
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, format, *args):
+        pass
+
+
+class EnrollmentServer:
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        certfile: os.PathLike[str] | str,
+        keyfile: os.PathLike[str] | str,
+        service: EnrollmentService,
+    ) -> None:
+        self._server = _EnrollmentHTTPServer(
+            (host, port),
+            _EnrollmentHandler,
+            _server_context(certfile, keyfile),
+            service,
+        )
+        self.port = self._server.server_address[1]
+
+    def serve_forever(self) -> None:
+        self._server.serve_forever()
+
+    def shutdown(self) -> None:
+        self._server.begin_shutdown()
+        self._server.close_connections()
+        self._server.shutdown()
+
+    def server_close(self) -> None:
+        self._server.server_close()
+
+
+def _store_services(path: os.PathLike[str] | str):
+    root = Path(path)
+    registry = DeviceRegistry(root / "devices.bin")
+    return EnrollmentStore(root / "tokens.json"), registry
+
+
+def _main(argv=None) -> int:
+    parser = argparse.ArgumentParser(prog="python -m C2.managed_auth")
+    commands = parser.add_subparsers(dest="command", required=True)
+    issue = commands.add_parser("issue-token")
+    issue.add_argument("--store", default="managed-store")
+    issue.add_argument("--ttl", type=float, default=600)
+    listing = commands.add_parser("list-devices")
+    listing.add_argument("--store", default="managed-store")
+    revoke = commands.add_parser("revoke")
+    revoke.add_argument("--store", default="managed-store")
+    revoke.add_argument("--agent-id", required=True)
+    revoke.add_argument("--key-id", required=True)
+    args = parser.parse_args(argv)
+
+    tokens, registry = _store_services(args.store)
+    if args.command == "issue-token":
+        print(tokens.issue(args.ttl))
+        return 0
+    if args.command == "list-devices":
+        print(json.dumps(registry.list_devices(), separators=(",", ":")))
+        return 0
+    if registry.revoke(args.agent_id, args.key_id):
+        print("revoked")
+        return 0
+    print("not found")
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())

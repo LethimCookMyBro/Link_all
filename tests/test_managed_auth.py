@@ -1,15 +1,31 @@
 import base64
 import hashlib
+import http.client
 import json
+import socket
+import ssl
+import threading
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
+from time import monotonic
+from unittest.mock import MagicMock, patch
 
 import pytest
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.x509.oid import NameOID
 
 from C2.managed_auth import (
     DeviceRegistry,
+    EnrollmentServer,
     EnrollmentService,
     EnrollmentStore,
+    ManagedServer,
+    _main,
     build_proof,
+    recv_json_frame,
+    send_json_frame,
     verify_proof,
 )
 
@@ -21,6 +37,88 @@ class FakeProtector:
     def unprotect(self, data):
         assert data.startswith(b"protected:")
         return data[len(b"protected:") :][::-1]
+
+
+@pytest.fixture
+def tls_material(tmp_path):
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
+    certificate = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(datetime.now(timezone.utc) - timedelta(days=1))
+        .not_valid_after(datetime.now(timezone.utc) + timedelta(days=1))
+        .add_extension(
+            x509.SubjectAlternativeName([x509.DNSName("localhost")]), critical=False
+        )
+        .sign(key, hashes.SHA256())
+    )
+    cert_path = tmp_path / "server.crt"
+    key_path = tmp_path / "server.key"
+    cert_path.write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
+    key_path.write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.TraditionalOpenSSL,
+            serialization.NoEncryption(),
+        )
+    )
+    return cert_path, key_path
+
+
+def _tls_client(port):
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    return context.wrap_socket(
+        socket.create_connection(("127.0.0.1", port), timeout=2),
+        server_hostname="localhost",
+    )
+
+
+def _authenticate(conn, credential):
+    send_json_frame(
+        conn,
+        {
+            "type": "HELLO",
+            "version": 1,
+            "agent_id": credential.agent_id,
+            "key_id": credential.key_id,
+        },
+    )
+    challenge = recv_json_frame(conn)
+    nonce = base64.b64decode(challenge["nonce"], validate=True)
+    send_json_frame(
+        conn,
+        {
+            "type": "AUTH_PROOF",
+            "proof": base64.b64encode(
+                build_proof(
+                    credential.secret,
+                    1,
+                    credential.agent_id,
+                    credential.key_id,
+                    nonce,
+                )
+            ).decode("ascii"),
+        },
+    )
+    return recv_json_frame(conn)["type"]
+
+
+def _recv_raw_frame(conn):
+    size = int.from_bytes(conn.recv(4), "big")
+    payload = b""
+    while len(payload) < size:
+        payload += conn.recv(size - len(payload))
+    return payload
+
+
+def _send_raw_frame(conn, payload):
+    conn.sendall(len(payload).to_bytes(4, "big") + payload)
 
 
 def test_token_is_consumed_once_and_never_stored_verbatim(tmp_path):
@@ -496,3 +594,314 @@ def test_restart_reconciles_pending_exchange_after_token_and_cleanup_write_failu
         restarted_service.exchange(token)
     payload = json.loads(protector.unprotect(registry_path.read_bytes()))
     assert payload["devices"] == []
+
+
+def test_json_frame_helpers_round_trip_and_reject_oversize():
+    left, right = socket.socketpair()
+    try:
+        send_json_frame(left, {"type": "HELLO", "agent_id": "agent"})
+        assert recv_json_frame(right) == {"type": "HELLO", "agent_id": "agent"}
+
+        left.sendall((65537).to_bytes(4, "big"))
+        with pytest.raises(ValueError, match="frame too large"):
+            recv_json_frame(right)
+    finally:
+        left.close()
+        right.close()
+
+
+def test_managed_handshake_returns_explicit_results(tls_material, tmp_path):
+    registry = DeviceRegistry(tmp_path / "devices.bin", FakeProtector())
+    credential = registry.enroll()
+    cert, key = tls_material
+    server = ManagedServer("127.0.0.1", 0, cert, key, registry)
+    stop_event = threading.Event()
+    thread = threading.Thread(target=server.serve_forever, args=(stop_event,))
+    thread.start()
+    clients = []
+    try:
+        good = _tls_client(server.port)
+        clients.append(good)
+        assert _authenticate(good, credential) == "AUTH_OK"
+
+        bad = _tls_client(server.port)
+        clients.append(bad)
+        wrong = type(credential)(credential.agent_id, credential.key_id, b"z" * 32)
+        assert _authenticate(bad, wrong) == "AUTH_REJECT"
+        assert good.version() == "TLSv1.3" or good.version() == "TLSv1.2"
+    finally:
+        for client in clients:
+            client.close()
+        stop_event.set()
+        server.stop(timeout=2)
+        thread.join(2)
+    assert not thread.is_alive()
+
+
+def test_managed_server_sends_ping_and_accepts_pong(tls_material, tmp_path):
+    registry = DeviceRegistry(tmp_path / "devices.bin", FakeProtector())
+    credential = registry.enroll()
+    cert, key = tls_material
+    server = ManagedServer(
+        "127.0.0.1",
+        0,
+        cert,
+        key,
+        registry,
+        initial_ping_delay=0.05,
+        ping_interval=0.05,
+        pong_timeout=0.2,
+    )
+    stop_event = threading.Event()
+    thread = threading.Thread(target=server.serve_forever, args=(stop_event,))
+    thread.start()
+    client = _tls_client(server.port)
+    try:
+        assert _authenticate(client, credential) == "AUTH_OK"
+        assert _recv_raw_frame(client) == b"PING"
+        _send_raw_frame(client, b"PONG")
+        assert server.wait_for_heartbeat(credential.agent_id, 0.5)
+    finally:
+        client.close()
+        stop_event.set()
+        server.stop(timeout=2)
+        thread.join(2)
+    assert not thread.is_alive()
+
+
+def test_managed_server_rejects_wrong_message_fields(tls_material, tmp_path):
+    registry = DeviceRegistry(tmp_path / "devices.bin", FakeProtector())
+    cert, key = tls_material
+    server = ManagedServer("127.0.0.1", 0, cert, key, registry)
+    stop_event = threading.Event()
+    thread = threading.Thread(target=server.serve_forever, args=(stop_event,))
+    thread.start()
+    client = _tls_client(server.port)
+    try:
+        send_json_frame(
+            client,
+            {
+                "type": "HELLO",
+                "version": 1,
+                "agent_id": "agent",
+                "key_id": "key",
+                "extra": True,
+            },
+        )
+        assert recv_json_frame(client) == {"type": "AUTH_REJECT"}
+    finally:
+        client.close()
+        stop_event.set()
+        server.stop(timeout=2)
+        thread.join(2)
+
+
+def test_managed_stop_closes_idle_authenticated_tls_session(tls_material, tmp_path):
+    cert, key = tls_material
+    server = ManagedServer(
+        "127.0.0.1",
+        0,
+        cert,
+        key,
+        DeviceRegistry(tmp_path / "devices.bin", FakeProtector()),
+    )
+    stop_event = threading.Event()
+    thread = threading.Thread(target=server.serve_forever, args=(stop_event,))
+    thread.start()
+    client = _tls_client(server.port)
+    started = monotonic()
+    try:
+        server.stop(timeout=1)
+        thread.join(1)
+    finally:
+        client.close()
+    assert not thread.is_alive()
+    assert not any(worker.is_alive() for worker in server._threads)
+    assert monotonic() - started < 2
+
+
+def test_enrollment_https_consumes_token_once(tls_material, tmp_path):
+    tokens = EnrollmentStore(tmp_path / "tokens.json", acl_applier=lambda _: None)
+    registry = DeviceRegistry(tmp_path / "devices.bin", FakeProtector())
+    service = EnrollmentService(tokens, registry)
+    token = tokens.issue(60)
+    cert, key = tls_material
+    server = EnrollmentServer("127.0.0.1", 0, cert, key, service)
+    thread = threading.Thread(target=server.serve_forever)
+    thread.start()
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    try:
+        body = json.dumps({"token": token})
+        connection = http.client.HTTPSConnection(
+            "127.0.0.1", server.port, context=context, timeout=2
+        )
+        connection.request(
+            "POST",
+            "/v1/enroll",
+            body=body,
+            headers={"Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        enrolled = json.loads(response.read())
+        assert response.status == 201
+        assert set(enrolled) == {"agent_id", "key_id", "secret"}
+        assert len(base64.b64decode(enrolled["secret"], validate=True)) == 32
+        connection.close()
+
+        connection = http.client.HTTPSConnection(
+            "127.0.0.1", server.port, context=context, timeout=2
+        )
+        connection.request(
+            "POST",
+            "/v1/enroll",
+            body=body,
+            headers={"Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        assert response.status == 401
+        assert response.read() == b'{"error":"invalid enrollment token"}'
+        connection.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(2)
+    assert not thread.is_alive()
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "body", "status"),
+    [
+        ("GET", "/v1/enroll", None, 405),
+        ("POST", "/wrong", "{}", 404),
+        ("POST", "/v1/enroll", "not-json", 400),
+        ("POST", "/v1/enroll", json.dumps({"token": "x", "extra": 1}), 400),
+    ],
+)
+def test_enrollment_https_rejects_unexpected_requests(
+    tls_material, tmp_path, method, path, body, status
+):
+    tokens = EnrollmentStore(tmp_path / "tokens.json", acl_applier=lambda _: None)
+    registry = DeviceRegistry(tmp_path / "devices.bin", FakeProtector())
+    cert, key = tls_material
+    server = EnrollmentServer(
+        "127.0.0.1", 0, cert, key, EnrollmentService(tokens, registry)
+    )
+    thread = threading.Thread(target=server.serve_forever)
+    thread.start()
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    try:
+        connection = http.client.HTTPSConnection(
+            "127.0.0.1", server.port, context=context, timeout=2
+        )
+        connection.request(method, path, body=body)
+        response = connection.getresponse()
+        assert response.status == status
+        response.read()
+        connection.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(2)
+
+
+def test_enrollment_shutdown_closes_idle_tcp_session(tls_material, tmp_path):
+    cert, key = tls_material
+    service = EnrollmentService(
+        EnrollmentStore(tmp_path / "tokens.json", acl_applier=lambda _: None),
+        DeviceRegistry(tmp_path / "devices.bin", FakeProtector()),
+    )
+    server = EnrollmentServer("127.0.0.1", 0, cert, key, service)
+    thread = threading.Thread(target=server.serve_forever)
+    thread.start()
+    stalled = socket.create_connection(("127.0.0.1", server.port), timeout=2)
+    try:
+        deadline = monotonic() + 1
+        while not server._server._connections and monotonic() < deadline:
+            threading.Event().wait(0.01)
+        started = monotonic()
+        server.shutdown()
+        server.server_close()
+        thread.join(2)
+    finally:
+        stalled.close()
+    assert not thread.is_alive()
+    assert monotonic() - started < 2
+
+
+def test_operator_cli_prints_token_once_and_not_found_is_nonzero(tmp_path, capsys):
+    store = tmp_path / "store"
+
+    assert _main(["issue-token", "--store", str(store), "--ttl", "60"]) == 0
+    token_output = capsys.readouterr().out.strip().splitlines()
+    assert len(token_output) == 1
+    assert len(base64.urlsafe_b64decode(token_output[0] + "=")) == 32
+
+    assert _main(["list-devices", "--store", str(store)]) == 0
+    assert capsys.readouterr().out.strip() == "[]"
+    assert (
+        _main(
+            [
+                "revoke",
+                "--store",
+                str(store),
+                "--agent-id",
+                "agent-test",
+                "--key-id",
+                "key-test",
+            ]
+        )
+        == 1
+    )
+    assert capsys.readouterr().out.strip() == "not found"
+
+
+def test_controller_keeps_managed_services_disabled_without_certificates(capsys):
+    import C2.C2 as controller
+
+    legacy_socket = MagicMock()
+    with (
+        patch.object(controller, "MANAGED_TLS_CERT", ""),
+        patch.object(controller, "MANAGED_TLS_KEY", ""),
+        patch.object(controller.socket, "socket", return_value=legacy_socket),
+        patch.object(controller.threading, "Thread") as thread_type,
+        patch.object(controller.time, "sleep"),
+        patch.object(controller._console, "prompt", return_value="quit"),
+    ):
+        controller.main()
+
+    assert capsys.readouterr().out.count("Managed services disabled") == 1
+    legacy_socket.bind.assert_called_once_with((controller.HOST, controller.PORT))
+    assert thread_type.called
+
+
+def test_controller_starts_and_cleans_up_managed_services(tls_material, tmp_path):
+    import C2.C2 as controller
+
+    cert, key = tls_material
+    legacy_socket = MagicMock()
+    managed = MagicMock()
+    enrollment = MagicMock()
+    with (
+        patch.object(controller, "MANAGED_TLS_CERT", str(cert)),
+        patch.object(controller, "MANAGED_TLS_KEY", str(key)),
+        patch.object(controller, "MANAGED_STORE", str(tmp_path / "store")),
+        patch.object(controller, "ManagedServer", return_value=managed),
+        patch.object(controller, "EnrollmentServer", return_value=enrollment),
+        patch.object(controller, "EnrollmentStore"),
+        patch.object(controller, "DeviceRegistry"),
+        patch.object(controller, "EnrollmentService"),
+        patch.object(controller.socket, "socket", return_value=legacy_socket),
+        patch.object(controller.threading, "Thread"),
+        patch.object(controller.time, "sleep"),
+        patch.object(controller._console, "prompt", return_value="quit"),
+    ):
+        controller.main()
+
+    managed.stop.assert_called_once_with(timeout=5)
+    enrollment.shutdown.assert_called_once_with()
+    enrollment.server_close.assert_called_once_with()
+    legacy_socket.close.assert_called_once_with()
