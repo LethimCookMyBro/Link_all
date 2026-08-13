@@ -1384,12 +1384,38 @@ def test_phase2_recovery_guards_copy_and_acl_before_restart_pass():
         "Copy-Item -LiteralPath $SelectedDatabaseBackup "
         "-Destination $env:PHANTOMLINK_MANAGED_DB -Force -ErrorAction Stop"
     ) in recovery
-    assert recovery.count("icacls $PrivatePath") == 2
-    assert recovery.count("if ($LASTEXITCODE -ne 0) { throw \"icacls failed") == 2
+    assert (
+        "Wait-Process -Id $ControllerPid -Timeout 10 -ErrorAction Stop" in recovery
+    )
+    assert (
+        "Get-Process -Id $ControllerPid -ErrorAction SilentlyContinue" in recovery
+    )
+    assert "if ($ControllerStillRunning)" in recovery
+    assert "icacls" not in recovery
+    assert "$Acl = [Security.AccessControl.FileSecurity]::new()" in recovery
+    assert "$Acl.SetAccessRuleProtection($true, $false)" in recovery
+    assert "[IO.File]::SetAccessControl($Path, $Acl)" in recovery
+    assert "$AllowedSidValues = @(" in recovery
+    assert "'S-1-5-18'" in recovery
+    assert "'S-1-5-32-544'" in recovery
+    assert "if ($Rule.AccessControlType -ne $Allow)" in recovery
+    assert "if ($Rule.FileSystemRights -ne $FullControl)" in recovery
+    assert "if ($AllowedSidValues -notcontains $RuleSid)" in recovery
+    assert "if ($Rule.IsInherited)" in recovery
+    assert "DATABASE_ACL_PRIVATE=PASS" in recovery
     assert "$SelectedDatabaseHash = (Get-FileHash" in recovery
     assert "$RestoredDatabaseHash = (Get-FileHash" in recovery
     assert "if ($RestoredDatabaseHash -ne $SelectedDatabaseHash)" in recovery
+    assert recovery.index("Get-Process -Id $ControllerPid") < recovery.index(
+        "'CONTROLLER_STOPPED=PASS'"
+    )
+    assert recovery.index("'CONTROLLER_STOPPED=PASS'") < recovery.index(
+        "Copy-Item -LiteralPath $SelectedDatabaseBackup"
+    )
     assert recovery.index("if ($RestoredDatabaseHash -ne $SelectedDatabaseHash)") < recovery.index(
+        "Set-PhantomLinkPrivateAcl -LiteralPath @($env:PHANTOMLINK_MANAGED_DB"
+    )
+    assert recovery.index("'DATABASE_ACL_PRIVATE=PASS'") < recovery.index(
         "PRAGMA integrity_check"
     )
     assert recovery.index("PRAGMA integrity_check") < recovery.index(
@@ -1398,6 +1424,51 @@ def test_phase2_recovery_guards_copy_and_acl_before_restart_pass():
     assert recovery.index("Start-Process -FilePath $Python") < recovery.index(
         "'RECOVERY_RESTART=PASS'"
     )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows ACL probe")
+def test_phase2_recovery_acl_reset_removes_everyone_rule(tmp_path):
+    runbook = Path(
+        "docs/runbooks/managed-agent-phase2-private-network.md"
+    ).read_text(encoding="utf-8")
+    helper = runbook.split("# ACL-RESET-HELPER-BEGIN", 1)[1].split(
+        "# ACL-RESET-HELPER-END", 1
+    )[0]
+    probe = tmp_path / "acl-probe.db"
+    probe.write_bytes(b"probe")
+    environment = os.environ.copy()
+    environment["PHANTOMLINK_ACL_PROBE"] = str(probe)
+    script = f"""
+$ErrorActionPreference = 'Stop'
+{helper}
+$Path = $env:PHANTOMLINK_ACL_PROBE
+$Everyone = [Security.Principal.SecurityIdentifier]::new('S-1-1-0')
+$Acl = [Security.AccessControl.FileSecurity]::new()
+$Acl.SetAccessRuleProtection($true, $false)
+$Acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+    $Everyone,
+    [Security.AccessControl.FileSystemRights]::FullControl,
+    [Security.AccessControl.AccessControlType]::Allow
+))
+[IO.File]::SetAccessControl($Path, $Acl)
+Set-PhantomLinkPrivateAcl -LiteralPath @($Path)
+$After = Get-Acl -LiteralPath $Path -ErrorAction Stop
+$AfterSids = @($After.Access | ForEach-Object {{
+    $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value
+}})
+if ($AfterSids -contains 'S-1-1-0') {{ throw 'Everyone rule remains' }}
+'ACL_PROBE=PASS'
+"""
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "ACL_PROBE=PASS"
 
 
 def test_cross_process_token_issues_do_not_lose_updates(tmp_path):

@@ -352,7 +352,7 @@ Get-ChildItem $BackupRoot -File -Recurse | Get-FileHash -Algorithm SHA256 | Sele
 
 Expected integrity output: `ok`.
 
-Recover a chosen Phase 2 SQLite backup with this local controller block. It stops the one matching controller process, copies the current database to a timestamped side file, restores the explicitly selected Phase 2 database backup, reapplies private ACLs, runs integrity checking with the project Python, and restarts the controller. It never imports or copies Phase 1 `devices.bin` or `tokens.json` into SQLite.
+Recover a chosen Phase 2 SQLite backup with this local controller block. It stops the one matching controller process, copies the current database to a timestamped side file, restores the explicitly selected Phase 2 database backup, reapplies private ACLs, runs integrity checking with the project Python, and restarts the controller. The protected DACL preserves the existing owner and permits exactly the current operator, Local System (`S-1-5-18`), and built-in Administrators (`S-1-5-32-544`), with no inherited, deny, Everyone, Users, or other access rule. It never imports or copies Phase 1 `devices.bin` or `tokens.json` into SQLite.
 
 ```powershell
 $ErrorActionPreference = 'Stop'
@@ -361,13 +361,68 @@ $Python = (Resolve-Path '.\.venv\Scripts\python.exe').Path
 $SelectedDatabaseBackup = 'C:\ProgramData\PhantomLink\backups\20260813-120000\managed.db'
 if (-not (Test-Path -LiteralPath $SelectedDatabaseBackup -PathType Leaf)) { throw 'chosen Phase 2 database backup is missing' }
 $SelectedDatabaseHash = (Get-FileHash -LiteralPath $SelectedDatabaseBackup -Algorithm SHA256 -ErrorAction Stop).Hash
+# ACL-RESET-HELPER-BEGIN
+function Set-PhantomLinkPrivateAcl {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string[]]$LiteralPath)
+
+    $OperatorSid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+    if ($null -eq $OperatorSid) { throw 'current operator SID is unavailable' }
+    $AllowedSidValues = @(
+        $OperatorSid.Value,
+        'S-1-5-18',
+        'S-1-5-32-544'
+    ) | Select-Object -Unique
+    $FullControl = [Security.AccessControl.FileSystemRights]::FullControl
+    $Allow = [Security.AccessControl.AccessControlType]::Allow
+    foreach ($Path in $LiteralPath) {
+        if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "private path missing: $Path" }
+        $ExistingAcl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+        $OriginalOwnerSid = $ExistingAcl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+        # A fresh protected DACL drops every prior explicit and inherited rule.
+        $Acl = [Security.AccessControl.FileSecurity]::new()
+        $Acl.SetAccessRuleProtection($true, $false)
+        foreach ($SidValue in $AllowedSidValues) {
+            $Sid = [Security.Principal.SecurityIdentifier]::new($SidValue)
+            $AccessRule = [Security.AccessControl.FileSystemAccessRule]::new(
+                $Sid,
+                $FullControl,
+                $Allow
+            )
+            [void]$Acl.AddAccessRule($AccessRule)
+        }
+        [IO.File]::SetAccessControl($Path, $Acl)
+
+        $EffectiveAcl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+        $EffectiveOwnerSid = $EffectiveAcl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+        if ($EffectiveOwnerSid -ne $OriginalOwnerSid) { throw "owner changed: $Path" }
+        $EffectiveRules = @($EffectiveAcl.Access)
+        if ($EffectiveRules.Count -ne $AllowedSidValues.Count) { throw "unexpected ACL rule count: $Path" }
+        $ObservedSidValues = @()
+        foreach ($Rule in $EffectiveRules) {
+            $RuleSid = $Rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value
+            $ObservedSidValues += $RuleSid
+            if ($AllowedSidValues -notcontains $RuleSid) { throw "unexpected ACL identity $RuleSid on $Path" }
+            if ($Rule.AccessControlType -ne $Allow) { throw "deny ACL rule on $Path" }
+            if ($Rule.FileSystemRights -ne $FullControl) { throw "unexpected ACL rights on $Path" }
+            if ($Rule.IsInherited) { throw "inherited ACL rule on $Path" }
+        }
+        foreach ($AllowedSid in $AllowedSidValues) {
+            if ($ObservedSidValues -notcontains $AllowedSid) { throw "required ACL identity missing on $Path" }
+        }
+    }
+}
+# ACL-RESET-HELPER-END
 $ControllerProcesses = @(Get-CimInstance Win32_Process | Where-Object {
     $_.CommandLine -match '(?i)-m\s+C2\.C2' -and $_.ProcessId -ne $PID
 })
 if ($ControllerProcesses.Count -gt 1) { throw 'ambiguous controller process set' }
 if ($ControllerProcesses.Count -eq 1) {
-    Stop-Process -Id $ControllerProcesses[0].ProcessId -Force -ErrorAction Stop
-    Wait-Process -Id $ControllerProcesses[0].ProcessId -Timeout 10 -ErrorAction SilentlyContinue
+    $ControllerPid = [int]$ControllerProcesses[0].ProcessId
+    Stop-Process -Id $ControllerPid -Force -ErrorAction Stop
+    Wait-Process -Id $ControllerPid -Timeout 10 -ErrorAction Stop
+    $ControllerStillRunning = Get-Process -Id $ControllerPid -ErrorAction SilentlyContinue
+    if ($ControllerStillRunning) { throw "controller process still running: $ControllerPid" }
 }
 'CONTROLLER_STOPPED=PASS'
 $RecoveryStamp = Get-Date -Format 'yyyyMMdd-HHmmss'
@@ -378,13 +433,8 @@ if (Test-Path -LiteralPath $env:PHANTOMLINK_MANAGED_DB) {
 Copy-Item -LiteralPath $SelectedDatabaseBackup -Destination $env:PHANTOMLINK_MANAGED_DB -Force -ErrorAction Stop
 $RestoredDatabaseHash = (Get-FileHash -LiteralPath $env:PHANTOMLINK_MANAGED_DB -Algorithm SHA256 -ErrorAction Stop).Hash
 if ($RestoredDatabaseHash -ne $SelectedDatabaseHash) { throw 'restored database hash mismatch' }
-foreach ($PrivatePath in @($env:PHANTOMLINK_MANAGED_DB,$env:PHANTOMLINK_CA_KEY,$env:PHANTOMLINK_TLS_KEY)) {
-    if (-not (Test-Path -LiteralPath $PrivatePath -PathType Leaf)) { throw "private path missing: $PrivatePath" }
-    icacls $PrivatePath /inheritance:r | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "icacls failed to remove inheritance: $PrivatePath" }
-    icacls $PrivatePath /grant:r "${env:USERDOMAIN}\${env:USERNAME}:(F)" | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "icacls failed to grant current user: $PrivatePath" }
-}
+Set-PhantomLinkPrivateAcl -LiteralPath @($env:PHANTOMLINK_MANAGED_DB,$env:PHANTOMLINK_CA_KEY,$env:PHANTOMLINK_TLS_KEY)
+'DATABASE_ACL_PRIVATE=PASS'
 $Integrity = & $Python -c "import sqlite3; c=sqlite3.connect(r'$env:PHANTOMLINK_MANAGED_DB'); print(c.execute('PRAGMA integrity_check').fetchone()[0]); c.close()"
 if ($LASTEXITCODE -ne 0 -or $Integrity -ne 'ok') { throw "database integrity failed: $Integrity" }
 'DATABASE_INTEGRITY=ok'
@@ -404,6 +454,7 @@ Expected literal output includes:
 
 ```text
 CONTROLLER_STOPPED=PASS
+DATABASE_ACL_PRIVATE=PASS
 DATABASE_INTEGRITY=ok
 RECOVERY_RESTART=PASS
 ```
