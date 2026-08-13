@@ -1257,4 +1257,3 @@ def test_controller_rolls_back_after_enrollment_thread_started(tls_material, tmp
     ]
     assert len(managed_threads) == 2
     assert all(thread.joined for thread in managed_threads)
-
