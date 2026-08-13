@@ -153,10 +153,13 @@ class TestDashboardApp:
             app = build_app(DashboardData(snapshot_fn=sample_snapshot), refresh_interval=0.05)
             async with app.run_test(size=(100, 30)) as pilot:
                 await pilot.pause()
-                from textual.widgets import DataTable, Static
+                from textual.widgets import DataTable, Static, TabbedContent
                 table = app.query_one("#clients", DataTable)
                 n_rows = len(table.rows)
                 status = str(app.query_one("#status", Static).render())
+                tabs = app.query_one("#dashboard-tabs", TabbedContent)
+                assert tabs.active == "legacy"
+                assert [tab.id for tab in tabs.query("TabPane")] == ["legacy", "managed"]
                 await pilot.pause()
                 return n_rows, status
 

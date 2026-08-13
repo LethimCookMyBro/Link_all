@@ -19,7 +19,10 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional
+
+if TYPE_CHECKING:
+    from C2.managed_dashboard import ManagedDashboardData
 
 # --- Data layer (pure, synchronous, fully testable) -------------------------
 
@@ -136,12 +139,14 @@ def build_app(
     data: DashboardData,
     title: str = "PhantomLink C2 - Live Dashboard",
     refresh_interval: float = 2.0,
+    managed_data: ManagedDashboardData | None = None,
 ):
     """Factory so the Textual import stays lazy and testable."""
     from textual.app import App, ComposeResult
     from textual.containers import Vertical
     from textual.css.query import NoMatches
-    from textual.widgets import DataTable, Footer, Header, Static
+    from textual.widgets import DataTable, Footer, Header, Input, Static, TabbedContent, TabPane
+    from rich.text import Text
 
     class C2DashboardApp(App):
         """Live client dashboard.
@@ -152,28 +157,74 @@ def build_app(
         """
 
         BINDINGS = [
-            ("r", "refresh", "Refresh"),
+            ("ctrl+r", "refresh", "Refresh"),
+            ("m", "managed", "Managed Agents"),
+            ("d", "disconnect", "Disconnect"),
+            ("r", "revoke", "Revoke"),
+            ("f", "filter", "Filter"),
             ("q", "quit", "Quit"),
+            ("y", "confirm_yes", "Yes"),
+            ("n", "confirm_no", "No"),
         ]
+
+        CSS = """
+        #managed-banner { color: red; text-style: bold; }
+        #managed-message { min-height: 1; }
+        #managed-detail { min-height: 5; }
+        #managed-devices { height: 12; }
+        #managed-audit { height: 10; }
+        .hidden { display: none; }
+        """
 
         def __init__(self, dashboard_data: DashboardData, interval: float = 2.0, **kw):
             super().__init__(**kw)
             self._data = dashboard_data
+            self._managed_data = managed_data
             self._interval = interval
             self._started = time.time()
+            self._managed_snapshot = managed_data.snapshot() if managed_data is not None else None
+            self._confirming_disconnect = False
+            self._closing = False
 
         def compose(self) -> ComposeResult:
             yield Header(show_clock=True)
-            with Vertical():
-                yield Static("", id="status", classes="status")
-                yield DataTable(id="clients")
+            with TabbedContent(id="dashboard-tabs"):
+                with TabPane("Legacy", id="legacy"):
+                    with Vertical():
+                        yield Static("", id="status", classes="status")
+                        yield DataTable(id="clients")
+                with TabPane("Managed Agents", id="managed"):
+                    with Vertical():
+                        yield Static("", id="managed-banner")
+                        yield Input(placeholder="Filter by device, agent ID, or status", id="managed-filter")
+                        yield DataTable(id="managed-devices")
+                        yield Static("", id="managed-detail")
+                        yield DataTable(id="managed-audit")
+                        yield Static("", id="managed-confirm", classes="hidden")
+                        with Vertical(id="revoke-form", classes="hidden"):
+                            yield Input(placeholder="First 8 characters of agent ID", id="revoke-id", max_length=8)
+                            yield Input(placeholder="Revocation reason", id="revoke-reason", max_length=512)
+                        yield Static("", id="managed-message")
             yield Footer()
 
         def on_mount(self) -> None:
             table = self.query_one("#clients", DataTable)
             table.add_columns("ID", "User", "IP", "Port", "Latency", "Quality", "Cmds", "State")
+            managed_table = self.query_one("#managed-devices", DataTable)
+            managed_table.cursor_type = "row"
+            managed_table.add_columns("Status", "Device", "Agent ID", "VPN IP", "Last Seen", "Certificate Expiry")
+            audit = self.query_one("#managed-audit", DataTable)
+            audit.add_columns("Timestamp", "Action", "Result", "Actor", "Target", "Reason")
             self.set_interval(self._interval, self._refresh)
+            self.set_interval(self._interval, self._start_managed_refresh)
             self._refresh()
+            if self._managed_snapshot is not None:
+                self._apply_managed_snapshot(self._managed_snapshot)
+                self._start_managed_refresh(force=True)
+
+        def on_unmount(self) -> None:
+            self._closing = True
+            self.workers.cancel_all()
 
         def _refresh(self) -> None:
             try:
@@ -206,6 +257,182 @@ def build_app(
 
         def action_refresh(self) -> None:
             self._refresh()
+            self._start_managed_refresh(force=True)
+
+        def action_managed(self) -> None:
+            self.query_one("#dashboard-tabs", TabbedContent).active = "managed"
+            if self._managed_data is None:
+                self._message("Managed registry is not configured.")
+
+        def action_filter(self) -> None:
+            if self.query_one("#dashboard-tabs", TabbedContent).active == "managed":
+                self.query_one("#managed-filter", Input).focus()
+
+        def action_disconnect(self) -> None:
+            if not self._managed_actions_available():
+                return
+            self._confirming_disconnect = True
+            prompt = self.query_one("#managed-confirm", Static)
+            prompt.remove_class("hidden")
+            prompt.update(Text("Disconnect selected device? Press Y or N."))
+
+        def action_confirm_no(self) -> None:
+            self._confirming_disconnect = False
+            self.query_one("#managed-confirm", Static).add_class("hidden")
+
+        def action_confirm_yes(self) -> None:
+            if not self._confirming_disconnect:
+                return
+            self.action_confirm_no()
+            selected = self._managed_snapshot.selected
+            self._start_managed_action("disconnect", selected.agent_id, "dashboard disconnect")
+
+        def action_revoke(self) -> None:
+            if self.query_one("#dashboard-tabs", TabbedContent).active != "managed":
+                self.action_refresh()
+                return
+            if not self._managed_actions_available():
+                return
+            form = self.query_one("#revoke-form", Vertical)
+            form.remove_class("hidden")
+            agent_input = self.query_one("#revoke-id", Input)
+            self.query_one("#revoke-reason", Input).value = ""
+            agent_input.value = ""
+            agent_input.focus()
+
+        def on_input_changed(self, event: Input.Changed) -> None:
+            if event.input.id == "managed-filter" and self._managed_snapshot is not None:
+                self._render_managed_devices()
+
+        def on_input_submitted(self, event: Input.Submitted) -> None:
+            if event.input.id != "revoke-reason":
+                return
+            short_id = self.query_one("#revoke-id", Input).value.strip()
+            reason = event.value.strip()
+            selected = self._managed_snapshot.selected
+            if short_id.casefold() != selected.agent_id[:8].casefold():
+                self._close_revoke_form()
+                self._message("agent ID does not match selected device")
+                return
+            if not reason:
+                self._close_revoke_form()
+                self._message("revocation reason is required")
+                return
+            self._close_revoke_form()
+            self._start_managed_action("revoke", selected.agent_id, reason)
+
+        def _close_revoke_form(self) -> None:
+            self.query_one("#revoke-form", Vertical).add_class("hidden")
+            self.query_one("#managed-devices", DataTable).focus()
+
+        def _managed_actions_available(self) -> bool:
+            if self.query_one("#dashboard-tabs", TabbedContent).active != "managed":
+                return False
+            if self._managed_snapshot is None or self._managed_snapshot.selected is None:
+                self._message("No managed device selected.")
+                return False
+            if not self._managed_snapshot.registry_available:
+                self._message("Managed actions are disabled while registry is unavailable.")
+                return False
+            return True
+
+        def _start_managed_refresh(self, force: bool = False) -> None:
+            if self._managed_data is None or self._closing:
+                return
+
+            def task():
+                snapshot = self._managed_data.refresh() if force else self._managed_data.refresh_if_stale()
+                if not self._closing:
+                    try:
+                        self.call_from_thread(self._apply_managed_snapshot, snapshot)
+                    except RuntimeError:
+                        pass
+
+            self.run_worker(task, group="managed-refresh", exclusive=True, thread=True, exit_on_error=False)
+
+        def _start_managed_action(self, action: str, agent_id: str, reason: str) -> None:
+            def task():
+                operation = getattr(self._managed_data, action)
+                result = operation(agent_id, "operator", reason)
+                snapshot = self._managed_data.refresh()
+                if not self._closing:
+                    try:
+                        self.call_from_thread(self._apply_action_result, result, snapshot)
+                    except RuntimeError:
+                        pass
+
+            self.run_worker(task, group="managed-action", exclusive=True, thread=True, exit_on_error=False)
+
+        def _apply_action_result(self, result, snapshot) -> None:
+            self._message(f"{result.code}: {result.message}")
+            self._apply_managed_snapshot(snapshot)
+
+        def _apply_managed_snapshot(self, snapshot) -> None:
+            if self._closing:
+                return
+            try:
+                self.query_one("#managed-banner", Static).update(
+                    Text("" if snapshot.registry_available else "REGISTRY UNAVAILABLE - showing last-good snapshot", style="red bold")
+                )
+            except NoMatches:
+                return
+            self._managed_snapshot = snapshot
+            self._render_managed_devices()
+            self._render_managed_detail()
+            self._render_managed_audit()
+
+        def _render_managed_devices(self) -> None:
+            table = self.query_one("#managed-devices", DataTable)
+            table.clear()
+            query = self.query_one("#managed-filter", Input).value.strip().casefold()
+            colors = {"ONLINE": "green", "OFFLINE": "yellow", "REVOKED": "red"}
+            for row in self._managed_snapshot.devices:
+                searchable = f"{row.display_name} {row.agent_id} {row.state}".casefold()
+                if query and query not in searchable:
+                    continue
+                table.add_row(
+                    Text(row.state, style=colors.get(row.state, "white")),
+                    row.display_name,
+                    row.agent_id,
+                    row.last_vpn_ip or "-",
+                    row.last_seen_at or "-",
+                    row.certificate_not_after,
+                    key=row.agent_id,
+                )
+
+        def _render_managed_detail(self) -> None:
+            detail = self._managed_snapshot.selected
+            if detail is None:
+                text = "No managed device selected."
+            else:
+                revocation = detail.revoked_at or "not revoked"
+                if detail.revocation_reason:
+                    revocation += f" ({detail.revocation_reason})"
+                text = (
+                    f"Version: {detail.agent_version}\nFingerprint: {detail.certificate_fingerprint}\n"
+                    f"Enrollment: {detail.enrolled_at}\nLast heartbeat: {detail.last_seen_at or '-'}\n"
+                    f"Revocation: {revocation}"
+                )
+            self.query_one("#managed-detail", Static).update(Text(text))
+
+        def _render_managed_audit(self) -> None:
+            table = self.query_one("#managed-audit", DataTable)
+            table.clear()
+            for event in self._managed_snapshot.audit_events:
+                table.add_row(
+                    event.occurred_at,
+                    event.action,
+                    event.result,
+                    event.actor,
+                    event.target_agent_id or "-",
+                    event.reason or "-",
+                )
+
+        def _message(self, message: str) -> None:
+            try:
+                self.query_one("#managed-message", Static).update(Text(message))
+            except NoMatches:
+                pass
 
     app = C2DashboardApp(data, refresh_interval)
     app.title = title
