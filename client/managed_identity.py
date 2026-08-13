@@ -6,7 +6,7 @@ import shutil
 import ssl
 import tempfile
 from dataclasses import dataclass
-from datetime import timezone
+from datetime import timedelta, timezone
 from pathlib import Path
 from uuid import UUID
 
@@ -14,7 +14,7 @@ from cryptography import x509
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+from cryptography.x509.oid import ExtendedKeyUsageOID, ExtensionOID, NameOID
 
 from client.agent_config import (
     AclApplier,
@@ -28,6 +28,7 @@ from client.agent_config import (
 
 
 DEVICE_URI_PREFIX = "urn:phantomlink:agent:"
+_CERTIFICATE_LIFETIME = timedelta(days=90)
 
 
 @dataclass(frozen=True)
@@ -217,9 +218,7 @@ def _validated_identity(identity: AgentCertificateIdentity) -> AgentCertificateI
         raise ValueError("certificate CA signature is invalid")
     if ca_certificate.public_bytes(serialization.Encoding.PEM) != identity.chain_pem:
         raise ValueError("chain_pem must contain exactly one canonical CA certificate")
-    ca_key = ca_certificate.public_key()
-    if not isinstance(ca_key, ec.EllipticCurvePublicKey):
-        raise ValueError("certificate CA signature is invalid")
+    ca_key = _validate_ca_profile(ca_certificate)
     try:
         ca_key.verify(
             certificate.signature,
@@ -228,33 +227,159 @@ def _validated_identity(identity: AgentCertificateIdentity) -> AgentCertificateI
         )
     except InvalidSignature as exc:
         raise ValueError("certificate CA signature is invalid") from exc
-    try:
-        ca_constraints = ca_certificate.extensions.get_extension_for_class(
-            x509.BasicConstraints
-        ).value
-        ca_usage = ca_certificate.extensions.get_extension_for_class(x509.KeyUsage).value
-        uris = certificate.extensions.get_extension_for_class(
-            x509.SubjectAlternativeName
-        ).value.get_values_for_type(x509.UniformResourceIdentifier)
-        basic_constraints = certificate.extensions.get_extension_for_class(
-            x509.BasicConstraints
-        ).value
-        extended_usage = certificate.extensions.get_extension_for_class(
-            x509.ExtendedKeyUsage
-        ).value
-    except x509.ExtensionNotFound as exc:
-        raise ValueError("certificate profile is invalid") from exc
-    if not ca_constraints.ca or not ca_usage.key_cert_sign:
-        raise ValueError("certificate CA profile is invalid")
-    if uris != [f"{DEVICE_URI_PREFIX}{agent_id}"]:
-        raise ValueError("certificate agent URI does not match agent_id")
-    if basic_constraints.ca or ExtendedKeyUsageOID.CLIENT_AUTH not in extended_usage:
-        raise ValueError("certificate profile is invalid")
+    _validate_leaf_profile(certificate, ca_certificate, agent_id)
     if identity.certificate_serial != str(certificate.serial_number):
         raise ValueError("certificate_serial does not match certificate")
     if identity.certificate_not_after != _certificate_not_after(certificate):
         raise ValueError("certificate_not_after does not match certificate")
     return identity
+
+
+def _validate_ca_profile(certificate: x509.Certificate) -> ec.EllipticCurvePublicKey:
+    public_key = certificate.public_key()
+    if not isinstance(public_key, ec.EllipticCurvePublicKey) or not isinstance(
+        public_key.curve, ec.SECP256R1
+    ):
+        raise ValueError("certificate CA profile is invalid")
+    if (
+        certificate.subject != certificate.issuer
+        or not _single_common_name(certificate.subject)
+        or not isinstance(certificate.signature_hash_algorithm, hashes.SHA256)
+    ):
+        raise ValueError("certificate CA profile is invalid")
+    _require_exact_extensions(
+        certificate,
+        {
+            ExtensionOID.BASIC_CONSTRAINTS: (
+                True,
+                x509.BasicConstraints(ca=True, path_length=0),
+            ),
+            ExtensionOID.KEY_USAGE: (True, _ca_key_usage()),
+            ExtensionOID.SUBJECT_KEY_IDENTIFIER: (
+                False,
+                x509.SubjectKeyIdentifier.from_public_key(public_key),
+            ),
+            ExtensionOID.AUTHORITY_KEY_IDENTIFIER: (
+                False,
+                x509.AuthorityKeyIdentifier.from_issuer_public_key(public_key),
+            ),
+        },
+        "certificate CA profile is invalid",
+    )
+    try:
+        public_key.verify(
+            certificate.signature,
+            certificate.tbs_certificate_bytes,
+            ec.ECDSA(certificate.signature_hash_algorithm),
+        )
+    except InvalidSignature as exc:
+        raise ValueError("certificate CA profile is invalid") from exc
+    return public_key
+
+
+def _validate_leaf_profile(
+    certificate: x509.Certificate,
+    ca_certificate: x509.Certificate,
+    agent_id: str,
+) -> None:
+    if (
+        not _single_common_name(certificate.subject)
+        or not isinstance(certificate.signature_hash_algorithm, hashes.SHA256)
+        or certificate.not_valid_after - certificate.not_valid_before
+        != _CERTIFICATE_LIFETIME
+    ):
+        raise ValueError("certificate profile is invalid")
+    try:
+        uris = certificate.extensions.get_extension_for_oid(
+            ExtensionOID.SUBJECT_ALTERNATIVE_NAME
+        ).value.get_values_for_type(x509.UniformResourceIdentifier)
+    except x509.ExtensionNotFound:
+        uris = []
+    if uris and uris != [f"{DEVICE_URI_PREFIX}{agent_id}"]:
+        raise ValueError("certificate agent URI does not match agent_id")
+    _require_exact_extensions(
+        certificate,
+        {
+            ExtensionOID.BASIC_CONSTRAINTS: (
+                True,
+                x509.BasicConstraints(ca=False, path_length=None),
+            ),
+            ExtensionOID.KEY_USAGE: (True, _leaf_key_usage()),
+            ExtensionOID.EXTENDED_KEY_USAGE: (
+                False,
+                x509.ExtendedKeyUsage([ExtendedKeyUsageOID.CLIENT_AUTH]),
+            ),
+            ExtensionOID.SUBJECT_KEY_IDENTIFIER: (
+                False,
+                x509.SubjectKeyIdentifier.from_public_key(certificate.public_key()),
+            ),
+            ExtensionOID.AUTHORITY_KEY_IDENTIFIER: (
+                False,
+                x509.AuthorityKeyIdentifier.from_issuer_public_key(
+                    ca_certificate.public_key()
+                ),
+            ),
+            ExtensionOID.SUBJECT_ALTERNATIVE_NAME: (
+                False,
+                x509.SubjectAlternativeName(
+                    [
+                        x509.UniformResourceIdentifier(
+                            f"{DEVICE_URI_PREFIX}{agent_id}"
+                        )
+                    ]
+                ),
+            ),
+        },
+        "certificate profile is invalid",
+    )
+
+
+def _require_exact_extensions(certificate, expected, message: str) -> None:
+    actual = {extension.oid: extension for extension in certificate.extensions}
+    if set(actual) != set(expected):
+        raise ValueError(message)
+    for oid, (critical, value) in expected.items():
+        extension = actual[oid]
+        if extension.critical is not critical or extension.value != value:
+            raise ValueError(message)
+
+
+def _single_common_name(subject: x509.Name) -> bool:
+    attributes = list(subject)
+    return (
+        len(attributes) == 1
+        and attributes[0].oid == NameOID.COMMON_NAME
+        and 1 <= len(attributes[0].value) <= 128
+        and attributes[0].value.isprintable()
+    )
+
+
+def _leaf_key_usage() -> x509.KeyUsage:
+    return x509.KeyUsage(
+        digital_signature=True,
+        content_commitment=False,
+        key_encipherment=False,
+        data_encipherment=False,
+        key_agreement=False,
+        key_cert_sign=False,
+        crl_sign=False,
+        encipher_only=False,
+        decipher_only=False,
+    )
+
+
+def _ca_key_usage() -> x509.KeyUsage:
+    return x509.KeyUsage(
+        digital_signature=False,
+        content_commitment=False,
+        key_encipherment=False,
+        data_encipherment=False,
+        key_agreement=False,
+        key_cert_sign=True,
+        crl_sign=True,
+        encipher_only=False,
+        decipher_only=False,
+    )
 
 
 def _agent_id(value: str) -> str:

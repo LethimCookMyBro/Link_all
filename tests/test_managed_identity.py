@@ -2,12 +2,13 @@ import json
 import ssl
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 from C2.managed_pki import ControllerCertificateAuthority
 from client.managed_identity import (
@@ -18,6 +19,98 @@ from client.managed_identity import (
 
 
 AGENT_ID = "11111111-1111-4111-8111-111111111111"
+
+
+def _key_usage(*, digital_signature=True, key_encipherment=False, key_cert_sign=False, crl_sign=False):
+    return x509.KeyUsage(
+        digital_signature=digital_signature,
+        content_commitment=False,
+        key_encipherment=key_encipherment,
+        data_encipherment=False,
+        key_agreement=False,
+        key_cert_sign=key_cert_sign,
+        crl_sign=crl_sign,
+        encipher_only=False,
+        decipher_only=False,
+    )
+
+
+def _identity_with_profile(*, mutation):
+    now = datetime(2026, 8, 13, 12, 0, tzinfo=timezone.utc)
+    ca_key = ec.generate_private_key(ec.SECP256R1())
+    leaf_key = ec.generate_private_key(ec.SECP256R1())
+    ca_subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Test CA")])
+    ca_builder = (
+        x509.CertificateBuilder()
+        .subject_name(ca_subject)
+        .issuer_name(ca_subject)
+        .public_key(ca_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now)
+        .not_valid_after(now + timedelta(days=3650))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+        .add_extension(
+            _key_usage(digital_signature=False, key_cert_sign=True, crl_sign=True),
+            critical=True,
+        )
+    )
+    if mutation != "malformed_ca_profile":
+        ca_builder = ca_builder.add_extension(
+            x509.SubjectKeyIdentifier.from_public_key(ca_key.public_key()), critical=False
+        ).add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_key.public_key()),
+            critical=False,
+        )
+    ca_certificate = ca_builder.sign(ca_key, hashes.SHA256())
+
+    lifetime = timedelta(days=1) if mutation == "wrong_lifetime" else timedelta(days=90)
+    leaf_builder = (
+        x509.CertificateBuilder()
+        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "pc-01")]))
+        .issuer_name(ca_subject)
+        .public_key(leaf_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now)
+        .not_valid_after(now + lifetime)
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+    )
+    if mutation != "missing_key_usage":
+        leaf_builder = leaf_builder.add_extension(
+            _key_usage(key_encipherment=mutation == "wrong_key_usage"), critical=True
+        )
+    eku = [ExtendedKeyUsageOID.CLIENT_AUTH]
+    if mutation == "extra_eku":
+        eku.append(ExtendedKeyUsageOID.SERVER_AUTH)
+    san = [x509.UniformResourceIdentifier(f"urn:phantomlink:agent:{AGENT_ID}")]
+    if mutation == "extra_san":
+        san.append(x509.DNSName("extra.example"))
+    leaf_builder = (
+        leaf_builder.add_extension(x509.ExtendedKeyUsage(eku), critical=False)
+        .add_extension(
+            x509.SubjectKeyIdentifier.from_public_key(leaf_key.public_key()), critical=False
+        )
+        .add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_key.public_key()),
+            critical=False,
+        )
+        .add_extension(x509.SubjectAlternativeName(san), critical=False)
+    )
+    signature_hash = hashes.SHA384() if mutation == "wrong_signature_hash" else hashes.SHA256()
+    certificate = leaf_builder.sign(ca_key, signature_hash)
+    return AgentCertificateIdentity(
+        agent_id=AGENT_ID,
+        certificate_pem=certificate.public_bytes(serialization.Encoding.PEM),
+        chain_pem=ca_certificate.public_bytes(serialization.Encoding.PEM),
+        private_key_pem=leaf_key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        ),
+        certificate_serial=str(certificate.serial_number),
+        certificate_not_after=certificate.not_valid_after.replace(tzinfo=timezone.utc)
+        .isoformat()
+        .replace("+00:00", "Z"),
+    )
 
 
 class FakeProtector:
@@ -155,6 +248,36 @@ def test_save_rejects_certificate_from_untrusted_chain(tmp_path, fake_protector)
             certificate_serial=issued.serial,
             certificate_not_after=issued.certificate_not_after,
         )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "wrong_signature_hash",
+        "wrong_lifetime",
+        "missing_key_usage",
+        "wrong_key_usage",
+        "extra_eku",
+        "extra_san",
+        "malformed_ca_profile",
+    ],
+)
+def test_save_rejects_non_exact_certificate_profile(tmp_path, fake_protector, mutation):
+    store = AgentCertificateStore(
+        tmp_path / "identity.dpapi", protector=fake_protector, acl_applier=lambda _: None
+    )
+    identity = _identity_with_profile(mutation=mutation)
+
+    with pytest.raises(ValueError, match="profile"):
+        store.save_enrollment(
+            identity.private_key_pem,
+            agent_id=identity.agent_id,
+            certificate_pem=identity.certificate_pem,
+            chain_pem=identity.chain_pem,
+            certificate_serial=identity.certificate_serial,
+            certificate_not_after=identity.certificate_not_after,
+        )
+    assert not store.path.exists()
 
 
 def test_client_context_loads_cert_chain_then_removes_temporary_files(
