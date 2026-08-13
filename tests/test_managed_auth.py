@@ -1102,6 +1102,8 @@ def test_enrollment_unauthenticated_workers_are_bounded(tls_material, tmp_path):
 def test_enrollment_stop_accepting_closes_listener_and_connections():
     server = object.__new__(EnrollmentServer)
     server._server = MagicMock()
+    server._close_lock = threading.Lock()
+    server._closed = False
 
     server.stop_accepting()
 
@@ -1369,6 +1371,35 @@ def test_phase2_runbook_records_resolved_operator_workflow():
     assert "RECOVERY_RESTART=PASS" in runbook
 
 
+def test_phase2_recovery_guards_copy_and_acl_before_restart_pass():
+    runbook = Path(
+        "docs/runbooks/managed-agent-phase2-private-network.md"
+    ).read_text(encoding="utf-8")
+    recovery = runbook.split("Recover a chosen Phase 2 SQLite backup", 1)[1].split(
+        "Then repeat Sections 3, 8, and 10.", 1
+    )[0]
+
+    assert "$ErrorActionPreference = 'Stop'" in recovery
+    assert (
+        "Copy-Item -LiteralPath $SelectedDatabaseBackup "
+        "-Destination $env:PHANTOMLINK_MANAGED_DB -Force -ErrorAction Stop"
+    ) in recovery
+    assert recovery.count("icacls $PrivatePath") == 2
+    assert recovery.count("if ($LASTEXITCODE -ne 0) { throw \"icacls failed") == 2
+    assert "$SelectedDatabaseHash = (Get-FileHash" in recovery
+    assert "$RestoredDatabaseHash = (Get-FileHash" in recovery
+    assert "if ($RestoredDatabaseHash -ne $SelectedDatabaseHash)" in recovery
+    assert recovery.index("if ($RestoredDatabaseHash -ne $SelectedDatabaseHash)") < recovery.index(
+        "PRAGMA integrity_check"
+    )
+    assert recovery.index("PRAGMA integrity_check") < recovery.index(
+        "Start-Process -FilePath $Python"
+    )
+    assert recovery.index("Start-Process -FilePath $Python") < recovery.index(
+        "'RECOVERY_RESTART=PASS'"
+    )
+
+
 def test_cross_process_token_issues_do_not_lose_updates(tmp_path):
     context = multiprocessing.get_context("spawn")
     start = context.Event()
@@ -1579,12 +1610,14 @@ def test_managed_runtime_shutdown_is_reverse_and_bounded():
     managed = MagicMock()
     managed.stop.side_effect = lambda timeout: calls.append(("managed.stop", timeout))
     enrollment = MagicMock()
+    enrollment.shutdown.side_effect = lambda: calls.append(("enrollment.shutdown",))
     enrollment.stop_accepting.side_effect = lambda: calls.append(
         ("enrollment.stop_accepting",)
     )
-    enrollment.shutdown.side_effect = lambda: calls.append(("enrollment.shutdown",))
     enrollment_thread = MagicMock(ident=1, name="enrollment-listener")
+    enrollment_thread.is_alive.side_effect = [True, False]
     managed_thread = MagicMock(ident=2, name="managed-listener")
+    managed_thread.is_alive.return_value = False
     enrollment_thread.join.side_effect = lambda timeout: calls.append(
         ("enrollment.join", timeout)
     )
@@ -1602,8 +1635,8 @@ def test_managed_runtime_shutdown_is_reverse_and_bounded():
     assert controller._stop_managed_runtime(runtime) == []
 
     assert calls == [
-        ("enrollment.stop_accepting",),
         ("enrollment.shutdown",),
+        ("enrollment.stop_accepting",),
         ("managed.stop", 5),
         ("enrollment.join", 5),
         ("managed.join", 5),
@@ -1625,16 +1658,74 @@ def test_managed_runtime_shutdown_continues_after_stuck_enrollment_shutdown():
         managed_thread=MagicMock(ident=2, name="managed-listener"),
         stop_event=threading.Event(),
     )
+    runtime.enrollment_thread.is_alive.return_value = True
     with patch.object(controller.threading, "Thread", return_value=worker) as thread_type:
         errors = controller._stop_managed_runtime(runtime)
 
     enrollment.stop_accepting.assert_called_once_with()
-    thread_type.assert_called_once_with(
-        target=enrollment.shutdown,
-        name="enrollment-shutdown",
-        daemon=True,
-    )
+    assert thread_type.call_args.kwargs["name"] == "enrollment-shutdown"
+    assert thread_type.call_args.kwargs["daemon"] is True
     worker.start.assert_called_once_with()
-    worker.join.assert_called_once_with(timeout=5)
+    assert worker.join.call_count == 2
+    worker.join.assert_any_call(timeout=5)
     managed.stop.assert_called_once_with(timeout=5)
     assert "enrollment shutdown timed out" in errors
+
+
+def test_real_enrollment_cleanup_is_bounded_idempotent_and_exception_free(
+    tls_material, tmp_path
+):
+    import C2.C2 as controller
+
+    cert, key = tls_material
+    service = EnrollmentService(
+        EnrollmentStore(tmp_path / "tokens.json", acl_applier=lambda _: None),
+        DeviceRegistry(tmp_path / "devices.bin", FakeProtector()),
+    )
+    enrollment = EnrollmentServer("127.0.0.1", 0, cert, key, service)
+    enrollment_thread = threading.Thread(
+        target=enrollment.serve_forever,
+        name="real-enrollment-listener",
+        daemon=False,
+    )
+    exceptions = []
+    shutdown_threads = []
+    original_excepthook = threading.excepthook
+    original_thread = threading.Thread
+
+    def record_thread(*args, **kwargs):
+        thread = original_thread(*args, **kwargs)
+        shutdown_threads.append(thread)
+        return thread
+
+    threading.excepthook = exceptions.append
+    enrollment_thread.start()
+    assert _wait_until(enrollment_thread.is_alive)
+    runtime = controller._ManagedRuntime(
+        registry=MagicMock(),
+        authority=MagicMock(),
+        sessions=MagicMock(),
+        query_service=MagicMock(),
+        action_service=MagicMock(),
+        dashboard_data=MagicMock(),
+        enrollment_server=enrollment,
+        managed_server=MagicMock(),
+        enrollment_thread=enrollment_thread,
+        managed_thread=None,
+        stop_event=threading.Event(),
+    )
+    try:
+        started = monotonic()
+        with patch.object(controller.threading, "Thread", side_effect=record_thread):
+            assert controller._stop_managed_runtime(runtime) == []
+            assert controller._stop_managed_runtime(runtime) == []
+        assert monotonic() - started < 2
+    finally:
+        threading.excepthook = original_excepthook
+        enrollment.server_close()
+        enrollment_thread.join(1)
+
+    assert not enrollment_thread.is_alive()
+    assert len(shutdown_threads) == 1
+    assert not shutdown_threads[0].is_alive()
+    assert exceptions == []

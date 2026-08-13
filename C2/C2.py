@@ -11,7 +11,7 @@ import requests
 from notifypy import Notify
 import http.server
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 import sys
@@ -927,6 +927,8 @@ class _ManagedRuntime:
     stop_event: threading.Event
     managed_thread: threading.Thread | None = None
     enrollment_thread: threading.Thread | None = None
+    _cleanup_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    _cleanup_complete: bool = False
 
 
 def _build_managed_runtime() -> _ManagedRuntime:
@@ -1001,18 +1003,32 @@ def _start_managed_runtime(runtime: _ManagedRuntime) -> None:
 
 
 def _stop_managed_runtime(runtime: _ManagedRuntime) -> list[str]:
+    cleanup_lock = runtime._cleanup_lock if isinstance(runtime, _ManagedRuntime) else None
+    if cleanup_lock is not None:
+        cleanup_lock.acquire()
+        if runtime._cleanup_complete:
+            cleanup_lock.release()
+            return []
     errors = []
-    if runtime.enrollment_server is not None:
-        try:
-            runtime.enrollment_server.stop_accepting()
-        except Exception as error:
-            errors.append(f"enrollment stop accepting: {error}")
-        if (
-            runtime.enrollment_thread is not None
+    shutdown_thread = None
+    try:
+        enrollment_running = (
+            runtime.enrollment_server is not None
+            and runtime.enrollment_thread is not None
             and runtime.enrollment_thread.ident is not None
-        ):
+            and runtime.enrollment_thread.is_alive()
+        )
+        if enrollment_running:
+            shutdown_errors = []
+
+            def shutdown_enrollment():
+                try:
+                    runtime.enrollment_server.shutdown()
+                except Exception as error:
+                    shutdown_errors.append(error)
+
             shutdown_thread = threading.Thread(
-                target=runtime.enrollment_server.shutdown,
+                target=shutdown_enrollment,
                 name="enrollment-shutdown",
                 daemon=True,
             )
@@ -1020,19 +1036,34 @@ def _stop_managed_runtime(runtime: _ManagedRuntime) -> list[str]:
             shutdown_thread.join(timeout=5)
             if shutdown_thread.is_alive():
                 errors.append("enrollment shutdown timed out")
-    runtime.stop_event.set()
-    try:
-        runtime.managed_server.stop(timeout=5)
-    except Exception as error:
-        errors.append(f"managed stop: {error}")
-    current_thread = threading.current_thread()
-    for thread in (runtime.enrollment_thread, runtime.managed_thread):
-        if thread is not None and thread.ident is not None and thread is not current_thread:
+            elif shutdown_errors:
+                errors.append(f"enrollment shutdown: {shutdown_errors[0]}")
+        if runtime.enrollment_server is not None:
             try:
-                thread.join(timeout=5)
+                runtime.enrollment_server.stop_accepting()
             except Exception as error:
-                errors.append(f"{thread.name} join: {error}")
-    return errors
+                errors.append(f"enrollment stop accepting: {error}")
+        if shutdown_thread is not None and shutdown_thread.is_alive():
+            shutdown_thread.join(timeout=5)
+        runtime.stop_event.set()
+        try:
+            runtime.managed_server.stop(timeout=5)
+        except Exception as error:
+            errors.append(f"managed stop: {error}")
+        current_thread = threading.current_thread()
+        for thread in (runtime.enrollment_thread, runtime.managed_thread):
+            if thread is not None and thread.ident is not None and thread is not current_thread:
+                try:
+                    thread.join(timeout=5)
+                    if thread.is_alive():
+                        errors.append(f"{thread.name} join timed out")
+                except Exception as error:
+                    errors.append(f"{thread.name} join: {error}")
+        return errors
+    finally:
+        if cleanup_lock is not None:
+            runtime._cleanup_complete = True
+            cleanup_lock.release()
 
 
 def main():

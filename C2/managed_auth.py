@@ -970,9 +970,15 @@ class EnrollmentServer:
             max_workers,
         )
         self.port = self._server.server_address[1]
+        self._close_lock = threading.Lock()
+        self._closed = False
 
     def serve_forever(self) -> None:
-        self._server.serve_forever()
+        try:
+            self._server.serve_forever()
+        except OSError:
+            if not self._server._closing.is_set():
+                raise
 
     def shutdown(self) -> None:
         self._server.begin_shutdown()
@@ -980,12 +986,16 @@ class EnrollmentServer:
         self._server.shutdown()
 
     def stop_accepting(self) -> None:
-        self._server.begin_shutdown()
-        self._server.close_connections()
-        self._server.server_close()
+        with self._close_lock:
+            if self._closed:
+                return
+            self._server.begin_shutdown()
+            self._server.close_connections()
+            self._server.server_close()
+            self._closed = True
 
     def server_close(self) -> None:
-        self._server.server_close()
+        self.stop_accepting()
 
 
 def _enrollment_server_context(certfile, keyfile, ca_pem):

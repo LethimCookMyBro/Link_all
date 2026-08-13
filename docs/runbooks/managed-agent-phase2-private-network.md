@@ -355,10 +355,12 @@ Expected integrity output: `ok`.
 Recover a chosen Phase 2 SQLite backup with this local controller block. It stops the one matching controller process, copies the current database to a timestamped side file, restores the explicitly selected Phase 2 database backup, reapplies private ACLs, runs integrity checking with the project Python, and restarts the controller. It never imports or copies Phase 1 `devices.bin` or `tokens.json` into SQLite.
 
 ```powershell
+$ErrorActionPreference = 'Stop'
 Set-Location 'G:\for_hack_all\Link_all - Copy'
 $Python = (Resolve-Path '.\.venv\Scripts\python.exe').Path
 $SelectedDatabaseBackup = 'C:\ProgramData\PhantomLink\backups\20260813-120000\managed.db'
 if (-not (Test-Path -LiteralPath $SelectedDatabaseBackup -PathType Leaf)) { throw 'chosen Phase 2 database backup is missing' }
+$SelectedDatabaseHash = (Get-FileHash -LiteralPath $SelectedDatabaseBackup -Algorithm SHA256 -ErrorAction Stop).Hash
 $ControllerProcesses = @(Get-CimInstance Win32_Process | Where-Object {
     $_.CommandLine -match '(?i)-m\s+C2\.C2' -and $_.ProcessId -ne $PID
 })
@@ -371,12 +373,17 @@ if ($ControllerProcesses.Count -eq 1) {
 $RecoveryStamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $CurrentAside = "$env:PHANTOMLINK_MANAGED_DB.pre-recovery-$RecoveryStamp"
 if (Test-Path -LiteralPath $env:PHANTOMLINK_MANAGED_DB) {
-    Copy-Item -LiteralPath $env:PHANTOMLINK_MANAGED_DB -Destination $CurrentAside -Force
+    Copy-Item -LiteralPath $env:PHANTOMLINK_MANAGED_DB -Destination $CurrentAside -Force -ErrorAction Stop
 }
-Copy-Item -LiteralPath $SelectedDatabaseBackup -Destination $env:PHANTOMLINK_MANAGED_DB -Force
+Copy-Item -LiteralPath $SelectedDatabaseBackup -Destination $env:PHANTOMLINK_MANAGED_DB -Force -ErrorAction Stop
+$RestoredDatabaseHash = (Get-FileHash -LiteralPath $env:PHANTOMLINK_MANAGED_DB -Algorithm SHA256 -ErrorAction Stop).Hash
+if ($RestoredDatabaseHash -ne $SelectedDatabaseHash) { throw 'restored database hash mismatch' }
 foreach ($PrivatePath in @($env:PHANTOMLINK_MANAGED_DB,$env:PHANTOMLINK_CA_KEY,$env:PHANTOMLINK_TLS_KEY)) {
+    if (-not (Test-Path -LiteralPath $PrivatePath -PathType Leaf)) { throw "private path missing: $PrivatePath" }
     icacls $PrivatePath /inheritance:r | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "icacls failed to remove inheritance: $PrivatePath" }
     icacls $PrivatePath /grant:r "${env:USERDOMAIN}\${env:USERNAME}:(F)" | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "icacls failed to grant current user: $PrivatePath" }
 }
 $Integrity = & $Python -c "import sqlite3; c=sqlite3.connect(r'$env:PHANTOMLINK_MANAGED_DB'); print(c.execute('PRAGMA integrity_check').fetchone()[0]); c.close()"
 if ($LASTEXITCODE -ne 0 -or $Integrity -ne 'ok') { throw "database integrity failed: $Integrity" }
