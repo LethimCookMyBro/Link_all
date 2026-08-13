@@ -16,7 +16,15 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes
 
 from C2.managed_pki import DEVICE_URI_PREFIX
-from C2.managed_registry import ManagedRegistry, utc_now
+from C2.managed_registry import (
+    ActionResult,
+    AuditEvent,
+    DeviceDetail,
+    DeviceSummary,
+    ManagedRegistry,
+    RegistryUnavailable,
+    utc_now,
+)
 from client.transport import FrameDecoder, encode_message
 
 _MAX_FRAME = 4
@@ -212,6 +220,159 @@ class SessionManager:
             self._sessions.clear()
         for session in sessions:
             _close_connection(session.connection)
+
+
+class DeviceQueryService:
+    def __init__(self, registry: ManagedRegistry, sessions: SessionManager) -> None:
+        if sessions.registry is not registry:
+            raise ValueError("sessions and queries must use the same registry")
+        self.registry = registry
+        self.sessions = sessions
+
+    def list_devices(self) -> tuple[DeviceSummary, ...]:
+        online = {session.agent_id for session in self.sessions.snapshot()}
+        try:
+            records = self.registry.list_device_records()
+        except Exception as exc:
+            raise RegistryUnavailable("registry unavailable") from exc
+        devices = tuple(
+            DeviceSummary(
+                record.agent_id,
+                record.display_name,
+                _merged_state(record, online),
+                record.last_vpn_ip,
+                record.last_seen_at,
+                record.certificate_not_after,
+                record.agent_version,
+            )
+            for record in records
+        )
+        return tuple(
+            sorted(devices, key=lambda item: (item.display_name.casefold(), item.agent_id))
+        )
+
+    def get_device(self, agent_id: str) -> DeviceDetail | None:
+        agent_id = _validated_uuid(agent_id)
+        online = {session.agent_id for session in self.sessions.snapshot()}
+        try:
+            record = self.registry.get_device(agent_id)
+        except Exception as exc:
+            raise RegistryUnavailable("registry unavailable") from exc
+        if record is None:
+            return None
+        return replace(record, state=_merged_state(record, online))
+
+    def list_audit_events(self, limit: int = 100) -> tuple[AuditEvent, ...]:
+        _validated_limit(limit)
+        try:
+            return self.registry.list_audit_events(limit)
+        except Exception as exc:
+            raise RegistryUnavailable("registry unavailable") from exc
+
+
+class DeviceActionService:
+    def __init__(self, registry: ManagedRegistry, sessions: SessionManager) -> None:
+        if sessions.registry is not registry:
+            raise ValueError("sessions and actions must use the same registry")
+        self.registry = registry
+        self.sessions = sessions
+
+    def disconnect(self, agent_id: str, actor: str, reason: str) -> ActionResult:
+        agent_id = _validated_uuid(agent_id)
+        actor = _validated_text("actor", actor, 128)
+        reason = _validated_text("reason", reason, 512, allow_empty=True)
+        correlation_id = str(uuid4())
+        try:
+            if self.registry.get_device(agent_id) is None:
+                return ActionResult("NOT_FOUND", "Device not found.", correlation_id)
+            self.registry.append_audit(
+                actor=actor,
+                action="DISCONNECT_REQUESTED",
+                target_agent_id=agent_id,
+                result="REQUESTED",
+                reason=reason,
+                correlation_id=correlation_id,
+                details={},
+            )
+        except Exception:
+            return ActionResult("FAILED", "Disconnect request failed.", correlation_id)
+
+        try:
+            disconnected = self.sessions.disconnect(agent_id)
+        except Exception:
+            return ActionResult("FAILED", "Disconnect failed.", correlation_id)
+        code = "DISCONNECTED" if disconnected else "ALREADY_OFFLINE"
+        action = "DISCONNECT_SUCCEEDED" if disconnected else "DISCONNECT_ALREADY_OFFLINE"
+        message = "Device disconnected." if disconnected else "Device is already offline."
+        try:
+            self.registry.append_audit(
+                actor=actor,
+                action=action,
+                target_agent_id=agent_id,
+                result=code,
+                reason=reason,
+                correlation_id=correlation_id,
+                details={},
+            )
+        except Exception:
+            return ActionResult("FAILED", "Disconnect result audit failed.", correlation_id)
+        return ActionResult(code, message, correlation_id)
+
+    def revoke(self, agent_id: str, actor: str, reason: str) -> ActionResult:
+        agent_id = _validated_uuid(agent_id)
+        actor = _validated_text("actor", actor, 128)
+        reason = _validated_text("reason", reason, 512)
+        correlation_id = str(uuid4())
+        try:
+            result = self.registry.revoke_device(
+                agent_id, actor, reason, correlation_id
+            )
+        except Exception:
+            return ActionResult("FAILED", "Revoke failed.", correlation_id)
+        if result.code in {"REVOKED", "ALREADY_REVOKED"}:
+            try:
+                self.sessions.disconnect(agent_id)
+            except Exception:
+                # SessionManager removes and closes the owned socket even when its
+                # lifecycle audit fails; durable revocation remains authoritative.
+                pass
+        return result
+
+
+def _merged_state(record: DeviceDetail, online: set[str]) -> str:
+    if record.state == "REVOKED":
+        return "REVOKED"
+    if record.agent_id in online:
+        return "ONLINE"
+    return record.state
+
+
+def _validated_uuid(value: str) -> str:
+    if type(value) is not str:
+        raise ValueError("agent_id must be a UUID")
+    try:
+        return str(UUID(value))
+    except ValueError as exc:
+        raise ValueError("agent_id must be a UUID") from exc
+
+
+def _validated_text(
+    name: str, value: str, limit: int, *, allow_empty: bool = False
+) -> str:
+    if (
+        type(value) is not str
+        or len(value) > limit
+        or (not allow_empty and not value)
+        or (value and not value.isprintable())
+    ):
+        raise ValueError(f"{name} must be printable text up to {limit} characters")
+    return value
+
+
+def _validated_limit(limit: int) -> int:
+    if type(limit) is not int or not 1 <= limit <= 1000:
+        raise ValueError("limit must be an integer from 1 through 1000")
+    return limit
 
 
 def _format_time(value: datetime) -> str:

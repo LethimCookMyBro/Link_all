@@ -43,6 +43,7 @@ __all__ = [
     "LegacyStoreBackup",
     "ManagedRegistry",
     "ManagedRegistryError",
+    "RegistryUnavailable",
     "SchemaVersionRejected",
     "backup_phase1_stores",
     "utc_now",
@@ -117,6 +118,10 @@ class IssuedDeviceCertificate:
 
 
 class ManagedRegistryError(Exception):
+    pass
+
+
+class RegistryUnavailable(ManagedRegistryError):
     pass
 
 

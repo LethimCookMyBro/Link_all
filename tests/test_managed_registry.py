@@ -431,11 +431,23 @@ def test_last_seen_and_revoke_are_durable_and_idempotent(registry, issued_certif
     assert touched.last_seen_at == "2026-08-13T06:01:00.000000Z"
 
     first = registry.revoke_device(device.agent_id, "operator", "retired", "corr-1")
-    second = registry.revoke_device(device.agent_id, "operator", "retired", "corr-2")
+    original = registry.get_device(device.agent_id)
+    registry.now = lambda: FIXED_NOW + timedelta(hours=1)
+    second = registry.revoke_device(device.agent_id, "operator", "different", "corr-2")
     assert first.code == "REVOKED"
     assert second.code == "ALREADY_REVOKED"
     assert not registry.is_connection_allowed(device.agent_id, "AA:BB:CC", "1001")
-    assert registry.get_device(device.agent_id).state == "REVOKED"
+    current = registry.get_device(device.agent_id)
+    assert current.state == "REVOKED"
+    assert (current.revoked_at, current.revocation_reason) == (
+        original.revoked_at,
+        original.revocation_reason,
+    )
+    events = registry.list_audit_events(2)
+    assert [(event.action, event.result) for event in events] == [
+        ("REVOKED", "ALREADY_REVOKED"),
+        ("REVOKED", "REVOKED"),
+    ]
 
 
 def test_missing_device_operations_are_stable(registry, issued_certificate):

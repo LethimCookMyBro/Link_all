@@ -11,8 +11,10 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
-from C2.managed_registry import IssuedDeviceCertificate, ManagedRegistry
+from C2.managed_registry import IssuedDeviceCertificate, ManagedRegistry, RegistryUnavailable
 from C2.managed_services import (
+    DeviceActionService,
+    DeviceQueryService,
     ManagedServer,
     SessionManager,
     _recv_frame,
@@ -36,6 +38,19 @@ class FakeConnection:
         self.closed = True
 
 
+class AuditCheckingConnection(FakeConnection):
+    def __init__(self, registry, required_action):
+        super().__init__()
+        self.registry = registry
+        self.required_action = required_action
+
+    def close(self):
+        assert self.required_action in {
+            event.action for event in self.registry.list_audit_events(100)
+        }
+        super().close()
+
+
 @pytest.fixture
 def registry(tmp_path):
     value = ManagedRegistry(tmp_path / "managed.db", now=lambda: NOW)
@@ -51,6 +66,298 @@ def enrolled_device(registry):
     return registry.consume_token_and_enroll(
         registry.issue_token(), certificate, "pc-01", "2.0", "enrollment", "corr"
     )
+
+
+def enroll_device(registry, agent_id, display_name, serial):
+    certificate = IssuedDeviceCertificate(
+        b"certificate",
+        f"{serial:064x}",
+        str(serial),
+        "2027-08-13T06:00:00Z",
+    )
+    return registry.consume_token_and_enroll(
+        registry.issue_token(),
+        certificate,
+        display_name,
+        "2.0",
+        "enrollment",
+        f"corr-{serial}",
+        agent_id=agent_id,
+    )
+
+
+def test_query_derives_all_four_states_and_sorts_deterministically(registry):
+    never_connected = enroll_device(
+        registry, "11111111-1111-4111-8111-111111111111", "zulu", 1001
+    )
+    online = enroll_device(
+        registry, "22222222-2222-4222-8222-222222222222", "Alpha", 1002
+    )
+    offline = enroll_device(
+        registry, "33333333-3333-4333-8333-333333333333", "alpha", 1003
+    )
+    revoked = enroll_device(
+        registry, "44444444-4444-4444-8444-444444444444", "bravo", 1004
+    )
+    sessions = SessionManager(registry)
+    registry.touch_last_seen(online.agent_id, "10.8.0.21")
+    sessions.register(
+        online.agent_id,
+        online.certificate_fingerprint,
+        online.certificate_serial,
+        "10.8.0.21",
+        FakeConnection(),
+    )
+    registry.touch_last_seen(offline.agent_id, "10.8.0.22")
+    registry.revoke_device(revoked.agent_id, "operator", "retired", "corr-r")
+
+    devices = DeviceQueryService(registry, sessions).list_devices()
+
+    assert [item.agent_id for item in devices] == [
+        online.agent_id,
+        offline.agent_id,
+        revoked.agent_id,
+        never_connected.agent_id,
+    ]
+    assert {item.agent_id: item.state for item in devices} == {
+        never_connected.agent_id: "ENROLLED",
+        online.agent_id: "ONLINE",
+        offline.agent_id: "OFFLINE",
+        revoked.agent_id: "REVOKED",
+    }
+
+
+def test_query_get_merges_online_state_without_exposing_session(registry, enrolled_device):
+    sessions = SessionManager(registry)
+    sessions.register(
+        enrolled_device.agent_id,
+        enrolled_device.certificate_fingerprint,
+        enrolled_device.certificate_serial,
+        "10.8.0.21",
+        FakeConnection(),
+    )
+
+    detail = DeviceQueryService(registry, sessions).get_device(enrolled_device.agent_id)
+
+    assert detail.state == "ONLINE"
+    assert not hasattr(detail, "connection")
+
+
+@pytest.mark.parametrize("method,args", [
+    ("list_devices", ()),
+    ("get_device", ("11111111-1111-4111-8111-111111111111",)),
+    ("list_audit_events", (1,)),
+])
+def test_query_labels_registry_read_failures(registry, monkeypatch, method, args):
+    sessions = SessionManager(registry)
+    target = {
+        "list_devices": "list_device_records",
+        "get_device": "get_device",
+        "list_audit_events": "list_audit_events",
+    }[method]
+    monkeypatch.setattr(
+        registry,
+        target,
+        lambda *_args: (_ for _ in ()).throw(OSError("registry unavailable")),
+    )
+
+    with pytest.raises(RegistryUnavailable, match="registry unavailable"):
+        getattr(DeviceQueryService(registry, sessions), method)(*args)
+
+
+@pytest.mark.parametrize("value", ["bad", "11111111-1111-4111-8111-11111111111", 1])
+def test_query_rejects_invalid_agent_ids(registry, value):
+    with pytest.raises((TypeError, ValueError), match="UUID"):
+        DeviceQueryService(registry, SessionManager(registry)).get_device(value)
+
+
+@pytest.mark.parametrize("limit", [True, 0, 1001, 1.0])
+def test_query_rejects_invalid_audit_limits(registry, limit):
+    with pytest.raises(ValueError, match="1 through 1000"):
+        DeviceQueryService(registry, SessionManager(registry)).list_audit_events(limit)
+
+
+def test_disconnect_commits_request_before_closing_socket(registry, enrolled_device):
+    connection = AuditCheckingConnection(registry, "DISCONNECT_REQUESTED")
+    sessions = SessionManager(registry)
+    sessions.register(
+        enrolled_device.agent_id,
+        enrolled_device.certificate_fingerprint,
+        enrolled_device.certificate_serial,
+        "10.8.0.21",
+        connection,
+    )
+
+    result = DeviceActionService(registry, sessions).disconnect(
+        enrolled_device.agent_id, "operator", "maintenance"
+    )
+
+    assert result.code == "DISCONNECTED"
+    assert connection.closed is True
+    assert [event.action for event in registry.list_audit_events(3)] == [
+        "DISCONNECT_SUCCEEDED",
+        "DISCONNECTED",
+        "DISCONNECT_REQUESTED",
+    ]
+    assert len({event.correlation_id for event in registry.list_audit_events(3)}) == 2
+    assert registry.list_audit_events(3)[0].correlation_id == result.correlation_id
+    assert registry.list_audit_events(3)[2].correlation_id == result.correlation_id
+
+
+def test_disconnect_audit_failure_leaves_socket_untouched(
+    registry, enrolled_device, monkeypatch
+):
+    connection = FakeConnection()
+    sessions = SessionManager(registry)
+    sessions.register(
+        enrolled_device.agent_id,
+        enrolled_device.certificate_fingerprint,
+        enrolled_device.certificate_serial,
+        "10.8.0.21",
+        connection,
+    )
+    original = registry.append_audit
+
+    def fail_request(**kwargs):
+        if kwargs["action"] == "DISCONNECT_REQUESTED":
+            raise OSError("audit unavailable")
+        return original(**kwargs)
+
+    monkeypatch.setattr(registry, "append_audit", fail_request)
+
+    result = DeviceActionService(registry, sessions).disconnect(
+        enrolled_device.agent_id, "operator", "maintenance"
+    )
+
+    assert result.code == "FAILED"
+    assert connection.closed is False
+    assert len(sessions.snapshot()) == 1
+
+
+def test_disconnect_stable_not_found_and_already_offline_codes(registry, enrolled_device):
+    actions = DeviceActionService(registry, SessionManager(registry))
+    missing = actions.disconnect(
+        "99999999-9999-4999-8999-999999999999", "operator", ""
+    )
+    offline = actions.disconnect(enrolled_device.agent_id, "operator", "")
+    missing_revoke = actions.revoke(
+        "99999999-9999-4999-8999-999999999999", "operator", "retired"
+    )
+
+    assert (missing.code, offline.code, missing_revoke.code) == (
+        "NOT_FOUND",
+        "ALREADY_OFFLINE",
+        "NOT_FOUND",
+    )
+
+
+def test_actions_reject_invalid_agent_ids(registry):
+    actions = DeviceActionService(registry, SessionManager(registry))
+    with pytest.raises(ValueError, match="UUID"):
+        actions.disconnect("bad", "operator", "")
+    with pytest.raises(ValueError, match="UUID"):
+        actions.revoke("bad", "operator", "retired")
+
+
+def test_revoke_is_durable_idempotent_and_closes_live_session(registry, enrolled_device):
+    connection = FakeConnection()
+    sessions = SessionManager(registry)
+    sessions.register(
+        enrolled_device.agent_id,
+        enrolled_device.certificate_fingerprint,
+        enrolled_device.certificate_serial,
+        "10.8.0.21",
+        connection,
+    )
+    actions = DeviceActionService(registry, sessions)
+
+    first = actions.revoke(enrolled_device.agent_id, "operator", "retired")
+    second = actions.revoke(enrolled_device.agent_id, "operator", "different")
+
+    assert (first.code, second.code) == ("REVOKED", "ALREADY_REVOKED")
+    assert connection.closed is True
+    detail = registry.get_device(enrolled_device.agent_id)
+    assert detail.revocation_reason == "retired"
+    assert registry.is_connection_allowed(
+        enrolled_device.agent_id,
+        enrolled_device.certificate_fingerprint,
+        enrolled_device.certificate_serial,
+    ) is False
+
+
+def test_revoke_wins_connect_race(registry, enrolled_device, monkeypatch):
+    sessions = SessionManager(registry)
+    connection = FakeConnection()
+    check_started = threading.Event()
+    release_check = threading.Event()
+    original = registry.is_connection_allowed
+
+    def paused_check(*args):
+        check_started.set()
+        assert release_check.wait(2)
+        return original(*args)
+
+    monkeypatch.setattr(registry, "is_connection_allowed", paused_check)
+    errors = []
+
+    def connect():
+        try:
+            sessions.register(
+                enrolled_device.agent_id,
+                enrolled_device.certificate_fingerprint,
+                enrolled_device.certificate_serial,
+                "10.8.0.21",
+                connection,
+            )
+        except Exception as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=connect)
+    thread.start()
+    assert check_started.wait(2)
+    results = []
+
+    def revoke():
+        results.append(
+            DeviceActionService(registry, sessions).revoke(
+                enrolled_device.agent_id, "operator", "retired"
+            )
+        )
+
+    revoke_thread = threading.Thread(target=revoke)
+    revoke_thread.start()
+    deadline = time.monotonic() + 2
+    while registry.get_device(enrolled_device.agent_id).revoked_at is None:
+        assert time.monotonic() < deadline
+        time.sleep(0.001)
+    release_check.set()
+    thread.join(2)
+    revoke_thread.join(2)
+
+    assert not thread.is_alive() and not revoke_thread.is_alive()
+    assert results[0].code == "REVOKED"
+    assert sessions.snapshot() == ()
+    assert connection.closed is True
+    assert len(errors) == 1 and isinstance(errors[0], PermissionError)
+
+
+@pytest.mark.parametrize(
+    "actor,reason",
+    [("", "reason"), ("operator\n", "reason"), ("x" * 129, "reason"), ("operator", "x" * 513)],
+)
+def test_actions_validate_actor_and_reason(registry, enrolled_device, actor, reason):
+    actions = DeviceActionService(registry, SessionManager(registry))
+    with pytest.raises(ValueError):
+        actions.disconnect(enrolled_device.agent_id, actor, reason)
+    with pytest.raises(ValueError):
+        actions.revoke(enrolled_device.agent_id, actor, reason)
+
+
+def test_revoke_requires_reason_and_has_no_unrevoke(registry, enrolled_device):
+    actions = DeviceActionService(registry, SessionManager(registry))
+    with pytest.raises(ValueError):
+        actions.revoke(enrolled_device.agent_id, "operator", "")
+    assert not hasattr(actions, "unrevoke")
 
 
 @pytest.mark.parametrize(
