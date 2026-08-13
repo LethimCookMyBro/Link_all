@@ -141,7 +141,7 @@ SHA-256: `c006aa9fb1b73da3443ccf2545b2403816742f9e84928514b23cfc386d39416f`
 
 ```powershell
 $base = (Get-Content debug-artifacts/managed-agent-preflight/feature-base.txt -Raw).Trim()
-cmd /d /c "git diff $base..HEAD -- client/transport.py client/agent_config.py client/agent_runtime.py client/agent_logging.py client/managed_agent.py C2/managed_auth.py C2/crypto.py C2/C2.py config.py .env.example tests/test_client_transport.py tests/test_agent_config.py tests/test_managed_auth.py tests/test_agent_runtime.py tests/test_agent_logging.py tests/test_encryption.py > debug-artifacts\managed-agent.patch"
+cmd /d /c "git diff $base..HEAD -- . :(exclude)debug-artifacts/managed-agent.patch :(exclude)debug-artifacts/managed-agent-verification.md :(exclude)docs/runbooks/managed-agent-phase1.md :(exclude)scripts/rollback-managed-agent.ps1 :(exclude)tests/test_agent_runtime_integration.py > debug-artifacts\managed-agent.patch"
 $patch = (Resolve-Path debug-artifacts/managed-agent.patch).Path
 $checkRoot = Join-Path 'G:\for_hack_all\Link_all - Copy\.worktrees' "managed-agent-patch-check-$PID"
 git worktree add --detach $checkRoot $base
@@ -155,6 +155,9 @@ Literal output and exit status:
 ```text
 PATCH_CHECK_EXIT=0
 PATCH_BYTES=225519
+PATCH_SHA256=c006aa9fb1b73da3443ccf2545b2403816742f9e84928514b23cfc386d39416f
+PHANTOMLINK_PATH_INCLUDED=True
+MANAGED_AUTH_TEST_PATH_INCLUDED=True
 ```
 
 The non-empty patch applied with `git apply --check` in a clean detached worktree at the baseline commit.
@@ -475,4 +478,20 @@ MANAGED_AUTH_EXISTS=False
 MANAGED_AGENT_EXISTS=False
 PHANTOMLINK_IMPORT=OK
 POST_IMPORT_EXIT=0
+```
+
+
+## Canonical patch command consistency check
+
+The canonical Patch section now uses the same whole-delta/exclusion command as the final mechanical refresh. Running that command with only its output destination changed to a temporary file produced:
+
+```text
+DOCUMENTED_COMMAND_EXIT=0
+BYTE_IDENTICAL=True
+TEMP_SHA256=c006aa9fb1b73da3443ccf2545b2403816742f9e84928514b23cfc386d39416f
+COMMITTED_SHA256=c006aa9fb1b73da3443ccf2545b2403816742f9e84928514b23cfc386d39416f
+TEMP_BYTES=225519
+COMMITTED_BYTES=225519
+REVERSE_CHECK_EXIT=0
+DIFF_CHECK_EXIT=0
 ```
