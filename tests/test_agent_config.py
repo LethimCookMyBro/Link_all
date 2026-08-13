@@ -4,14 +4,13 @@ import json
 import os
 import socket
 import sys
-
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-import client.agent_config as agent_config
+from client import agent_config
 from client.agent_config import (
     AgentConfig,
     DeviceCredential,
@@ -392,7 +391,7 @@ def test_run_without_credential_is_not_retried(tmp_path, monkeypatch, caplog):
             return None
 
     monkeypatch.setattr(managed_agent, "load_config", lambda _: config)
-    monkeypatch.setattr(managed_agent, "DpapiCredentialStore", lambda _: EmptyStore())
+    monkeypatch.setattr(managed_agent, "AgentCertificateStore", lambda _: EmptyStore())
     assert managed_agent.main(["run", "--config", str(config_path)]) == 3
     assert "ENROLLMENT_REQUIRED" in caplog.text
 
@@ -490,14 +489,14 @@ def test_run_returns_five_after_observed_auth_rejection(tmp_path, monkeypatch):
             return DeviceCredential("agent", "key", b"s" * 32)
 
     class RejectedRuntime:
-        def __init__(self, _config, _credential, event_sink):
+        def __init__(self, _config, _credential, *, event_sink, **_kwargs):
             self.event_sink = event_sink
 
         def run(self):
             self.event_sink({"event": "AUTH_REJECTED", "state": "CONNECTING", "attempt": 1})
 
     monkeypatch.setattr(managed_agent, "load_config", lambda _: config)
-    monkeypatch.setattr(managed_agent, "DpapiCredentialStore", lambda _: Store())
+    monkeypatch.setattr(managed_agent, "AgentCertificateStore", lambda _: Store())
     monkeypatch.setattr(managed_agent, "AgentRuntime", RejectedRuntime)
 
     assert managed_agent.main(["run", "--config", str(tmp_path / "agent.json")]) == 5
@@ -533,7 +532,7 @@ def test_ctrl_c_stops_runtime_and_flushes_logging(tmp_path, monkeypatch):
             flushed.append(timeout)
 
     monkeypatch.setattr(managed_agent, "load_config", lambda _: config)
-    monkeypatch.setattr(managed_agent, "DpapiCredentialStore", lambda _: Store())
+    monkeypatch.setattr(managed_agent, "AgentCertificateStore", lambda _: Store())
     monkeypatch.setattr(managed_agent, "AgentRuntime", InterruptedRuntime)
     monkeypatch.setattr(managed_agent, "start_agent_logging", lambda _: Logging())
 
@@ -568,7 +567,7 @@ def test_storage_platform_failure_returns_five(tmp_path, monkeypatch, error):
     monkeypatch.setattr(managed_agent, "load_config", lambda _: config)
     monkeypatch.setattr(
         managed_agent,
-        "DpapiCredentialStore",
+        "AgentCertificateStore",
         lambda _: (_ for _ in ()).throw(error),
     )
 
@@ -604,7 +603,7 @@ def test_enroll_pywin_storage_failure_returns_five(tmp_path, monkeypatch):
     monkeypatch.setattr(managed_agent, "load_config", lambda _: config)
     monkeypatch.setattr(
         managed_agent,
-        "DpapiCredentialStore",
+        "AgentCertificateStore",
         lambda _: (_ for _ in ()).throw(Error("dpapi unavailable")),
     )
 
