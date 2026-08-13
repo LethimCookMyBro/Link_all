@@ -59,14 +59,14 @@ class _AgentHandle:
     def __init__(self, runtime: AgentRuntime):
         self.runtime = runtime
         self.events: list[dict] = []
-        self.error: BaseException | None = None
+        self.error: RuntimeError | TypeError | ValueError | None = None
         runtime._event_sink = self.events.append
         self.thread = threading.Thread(target=self._run, name="phase2-agent")
 
     def _run(self) -> None:
         try:
             self.runtime.run()
-        except BaseException as error:  # surfaced by close() instead of pytest thread warnings
+        except (RuntimeError, TypeError, ValueError) as error:
             self.error = error
 
     def start(self):
@@ -397,6 +397,23 @@ def phase2_system():
             system.close()
 
 
+def _assert_peer_closed(connection: ssl.SSLSocket, timeout: float) -> None:
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            pytest.fail("replaced peer socket remained open")
+        connection.settimeout(remaining)
+        try:
+            received = connection.recv(4096)
+        except (ConnectionResetError, ssl.SSLEOFError, ssl.SSLZeroReturnError):
+            return
+        except TimeoutError:
+            pytest.fail("replaced peer socket remained open")
+        if not received:
+            return
+
+
 def test_loopback_requires_explicit_phase2_test_flag(tmp_path):
     with pytest.raises(ValueError, match="exact managed IP"):
         Phase2System(tmp_path, allow_loopback=False)
@@ -485,6 +502,7 @@ def test_duplicate_session_replaces_and_closes_the_previous_socket(
     try:
         _send_frame(second, b"PONG")
         assert system.wait_for_new_session(identity.agent_id, first_id, 2)
+        _assert_peer_closed(first, 1)
         assert len(system.sessions.snapshot()) == 1
         assert any(
             event.action == "SESSION_REPLACED"
