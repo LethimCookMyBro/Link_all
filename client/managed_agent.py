@@ -19,8 +19,8 @@ if __package__ in (None, ""):
 from client.agent_config import (
     DeviceCredential,
     DpapiCredentialStore,
+    _read_private_file,
     load_config,
-    validate_private_file,
     write_identity,
 )
 from client.agent_logging import start_agent_logging
@@ -135,14 +135,20 @@ def _read_token_file(value: str) -> str:
     path = Path(value)
     if not path.is_absolute():
         raise ValueError("token file path must be absolute")
-    validate_private_file(path)
     try:
-        token = path.read_text("utf-8").strip()
+        token = _read_private_file(path, None).decode("utf-8").strip()
     finally:
         path.unlink(missing_ok=True)
     if not token:
         raise ValueError("enrollment token is required")
     return token
+
+
+def _is_platform_failure(error: Exception) -> bool:
+    return (
+        isinstance(error, (OSError, RuntimeError))
+        or error.__class__.__module__ == "pywintypes"
+    )
 
 
 def _is_pythonw() -> bool:
@@ -175,15 +181,28 @@ def main(argv=None) -> int:
                 if args.token_file
                 else getpass.getpass("Enrollment token: ")
             )
-        except (EOFError, OSError, ValueError):
+        except (EOFError, ValueError):
             return 2
+        except Exception as error:
+            if _is_platform_failure(error):
+                return 5
+            raise
         if not token:
             return 2
         try:
             config = load_config(args.config)
-        except (OSError, RuntimeError, ValueError):
+        except ValueError:
             return 4
-        logging_runtime = start_agent_logging(config)
+        except Exception as error:
+            if _is_platform_failure(error):
+                return 5
+            raise
+        try:
+            logging_runtime = start_agent_logging(config)
+        except Exception as error:
+            if _is_platform_failure(error):
+                return 5
+            raise
         try:
             store = DpapiCredentialStore(_credential_path(args.config))
             enroll(config, token, store)
@@ -196,14 +215,34 @@ def main(argv=None) -> int:
                 {"event": "ENROLLMENT_REJECTED", "state": "STOPPED", "attempt": 0}
             )
             return 5
+        except Exception as error:
+            if not _is_platform_failure(error):
+                raise
+            logging_runtime.emit(
+                {
+                    "event": "ENROLLMENT_STORAGE_FAILURE",
+                    "state": "STOPPED",
+                    "attempt": 0,
+                }
+            )
+            return 5
         finally:
             logging_runtime.stop(1.0)
 
     try:
         config = load_config(args.config)
-    except (OSError, RuntimeError, ValueError):
+    except ValueError:
         return 4
-    logging_runtime = start_agent_logging(config)
+    except Exception as error:
+        if _is_platform_failure(error):
+            return 5
+        raise
+    try:
+        logging_runtime = start_agent_logging(config)
+    except Exception as error:
+        if _is_platform_failure(error):
+            return 5
+        raise
     try:
         store = DpapiCredentialStore(_credential_path(args.config))
         credential = store.load()
@@ -212,11 +251,25 @@ def main(argv=None) -> int:
                 {"event": "ENROLLMENT_REQUIRED", "state": "STOPPED", "attempt": 0}
             )
             return 3
-        AgentRuntime(config, credential, event_sink=logging_runtime.emit).run()
-        return 0
+        auth_rejected = False
+
+        def observe(event):
+            nonlocal auth_rejected
+            auth_rejected = auth_rejected or event.get("event") == "AUTH_REJECTED"
+            logging_runtime.emit(event)
+
+        AgentRuntime(config, credential, event_sink=observe).run()
+        return 5 if auth_rejected else 0
     except (AuthRejected, ValueError):
         logging_runtime.emit(
             {"event": "CREDENTIAL_INVALID", "state": "STOPPED", "attempt": 0}
+        )
+        return 5
+    except Exception as error:
+        if not _is_platform_failure(error):
+            raise
+        logging_runtime.emit(
+            {"event": "CREDENTIAL_STORE_FAILURE", "state": "STOPPED", "attempt": 0}
         )
         return 5
     finally:

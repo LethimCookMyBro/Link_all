@@ -132,10 +132,15 @@ class LoggingRuntime:
         name = safe.get("event", "LOG_EVENT")
         self.logger.info(name if isinstance(name, str) else "LOG_EVENT", extra=safe)
 
+    def _flush_timeout(self) -> bool:
+        self.flush_timed_out = True
+        logging.getLogger(__name__).warning("LOG_FLUSH_TIMEOUT")
+        return False
+
     def stop(self, timeout: float) -> bool:
         with self._stop_lock:
-            if self._stopped:
-                return not self.flush_timed_out
+            if self._stopped and not self.flush_timed_out:
+                return True
             self._stopped = True
             self.logger.removeHandler(self.handler)
             deadline = monotonic() + max(0.0, timeout)
@@ -144,17 +149,17 @@ class LoggingRuntime:
                     self.listener.enqueue_sentinel()
                     break
                 except queue.Full:
-                    try:
-                        self.listener.queue.get_nowait()
-                    except queue.Empty:
-                        break
+                    remaining = deadline - monotonic()
+                    if remaining <= 0:
+                        return self._flush_timeout()
+                    threading.Event().wait(min(0.01, remaining))
             thread = self.listener._thread
-            if thread is not None:
-                thread.join(max(0.0, deadline - monotonic()))
-                self.flush_timed_out = thread.is_alive()
-            if self.flush_timed_out:
-                logging.getLogger(__name__).warning("LOG_FLUSH_TIMEOUT")
-                return False
+            if thread is None:
+                return self._flush_timeout()
+            thread.join(max(0.0, deadline - monotonic()))
+            if thread.is_alive():
+                return self._flush_timeout()
+            self.flush_timed_out = False
             self.handler.close()
             return True
 

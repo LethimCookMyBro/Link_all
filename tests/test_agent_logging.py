@@ -5,6 +5,7 @@ from unittest.mock import Mock
 
 from client.agent_logging import (
     JsonEventFormatter,
+    LoggingRuntime,
     ResilientQueueHandler,
     ResilientRotatingFileHandler,
     start_agent_logging,
@@ -67,3 +68,17 @@ def test_stop_is_bounded_when_listener_cannot_flush(tmp_path, monkeypatch):
     finally:
         if runtime.listener._thread and runtime.listener._thread.is_alive():
             runtime.listener._thread.join(1)
+
+
+def test_stop_full_queue_preserves_accepted_event_and_reports_timeout(caplog):
+    events = queue.Queue(maxsize=1)
+    accepted = logging.makeLogRecord({"msg": "accepted"})
+    events.put_nowait(accepted)
+    logger = logging.getLogger("managed-agent-stop-test")
+    handler = ResilientQueueHandler(events)
+    listener = logging.handlers.QueueListener(events, logging.NullHandler())
+    runtime = LoggingRuntime(logger, handler, listener)
+
+    assert runtime.stop(0) is False
+    assert events.get_nowait() is accepted
+    assert "LOG_FLUSH_TIMEOUT" in caplog.text

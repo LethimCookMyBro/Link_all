@@ -401,7 +401,7 @@ def test_token_file_is_consumed_and_deleted_before_enrollment(tmp_path, monkeypa
 
     token_path = tmp_path / "token.txt"
     token_path.write_text("token-value\n", "utf-8")
-    monkeypatch.setattr(managed_agent, "validate_private_file", lambda _: None)
+    monkeypatch.setattr(managed_agent, "_read_private_file", lambda *_: b"token-value\n")
 
     assert managed_agent._read_token_file(str(token_path)) == "token-value"
     assert not token_path.exists()
@@ -476,3 +476,108 @@ def test_enroll_saves_credential_before_identity(tmp_path, monkeypatch):
         "identity",
         "close",
     ]
+
+
+def test_run_returns_five_after_observed_auth_rejection(tmp_path, monkeypatch):
+    from client import managed_agent
+    from client.agent_config import AgentConfig, DeviceCredential
+
+    config = AgentConfig.from_mapping(valid_config(tmp_path))
+
+    class Store:
+        def load(self):
+            return DeviceCredential("agent", "key", b"s" * 32)
+
+    class RejectedRuntime:
+        def __init__(self, _config, _credential, event_sink):
+            self.event_sink = event_sink
+
+        def run(self):
+            self.event_sink({"event": "AUTH_REJECTED", "state": "CONNECTING", "attempt": 1})
+
+    monkeypatch.setattr(managed_agent, "load_config", lambda _: config)
+    monkeypatch.setattr(managed_agent, "DpapiCredentialStore", lambda _: Store())
+    monkeypatch.setattr(managed_agent, "AgentRuntime", RejectedRuntime)
+
+    assert managed_agent.main(["run", "--config", str(tmp_path / "agent.json")]) == 5
+
+
+def test_token_file_uses_same_handle_reader_and_deletes_file(tmp_path, monkeypatch):
+    from client import managed_agent
+
+    token_path = tmp_path / "token.txt"
+    token_path.write_text("stale", "utf-8")
+    calls = []
+
+    def read_validated(path, acl_inspector):
+        calls.append((path, acl_inspector))
+        return b"fresh-token\n"
+
+    monkeypatch.setattr(managed_agent, "_read_private_file", read_validated)
+    assert managed_agent._read_token_file(str(token_path)) == "fresh-token"
+    assert calls == [(token_path, None)]
+    assert not token_path.exists()
+
+
+@pytest.mark.parametrize("error", [RuntimeError("dpapi unavailable"), OSError("acl unavailable")])
+def test_storage_platform_failure_returns_five(tmp_path, monkeypatch, error):
+    from client import managed_agent
+    from client.agent_config import AgentConfig
+
+    config = AgentConfig.from_mapping(valid_config(tmp_path))
+    monkeypatch.setattr(managed_agent, "load_config", lambda _: config)
+    monkeypatch.setattr(
+        managed_agent,
+        "DpapiCredentialStore",
+        lambda _: (_ for _ in ()).throw(error),
+    )
+
+    assert managed_agent.main(["run", "--config", str(tmp_path / "agent.json")]) == 5
+
+
+def test_acl_platform_failure_during_token_read_returns_five(tmp_path, monkeypatch):
+    from client import managed_agent
+
+    token_path = tmp_path / "token.txt"
+    token_path.write_text("token", "utf-8")
+    monkeypatch.setattr(
+        managed_agent,
+        "_read_private_file",
+        lambda *_: (_ for _ in ()).throw(RuntimeError("acl unavailable")),
+    )
+
+    assert managed_agent.main(["enroll", "--token-file", str(token_path)]) == 5
+    assert not token_path.exists()
+
+
+def test_enroll_pywin_storage_failure_returns_five(tmp_path, monkeypatch):
+    from client import managed_agent
+    from client.agent_config import AgentConfig
+
+    class Error(Exception):
+        pass
+
+    Error.__module__ = "pywintypes"
+    config = AgentConfig.from_mapping(valid_config(tmp_path))
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(managed_agent.getpass, "getpass", lambda _: "token")
+    monkeypatch.setattr(managed_agent, "load_config", lambda _: config)
+    monkeypatch.setattr(
+        managed_agent,
+        "DpapiCredentialStore",
+        lambda _: (_ for _ in ()).throw(Error("dpapi unavailable")),
+    )
+
+    assert managed_agent.main(["enroll", "--config", str(tmp_path / "agent.json")]) == 5
+
+
+def test_config_platform_failure_returns_five(monkeypatch):
+    from client import managed_agent
+
+    monkeypatch.setattr(
+        managed_agent,
+        "load_config",
+        lambda _: (_ for _ in ()).throw(RuntimeError("ACL API unavailable")),
+    )
+
+    assert managed_agent.main(["run", "--config", "agent.json"]) == 5
