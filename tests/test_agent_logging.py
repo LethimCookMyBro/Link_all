@@ -63,8 +63,10 @@ def test_stop_is_bounded_when_listener_cannot_flush(tmp_path, monkeypatch):
     runtime = start_agent_logging(config)
     try:
         listener_thread = runtime.listener._thread
-        monkeypatch.setattr(listener_thread, "join", Mock())
-        assert runtime.stop(0) is False
+        with monkeypatch.context() as blocked:
+            blocked.setattr(listener_thread, "join", Mock())
+            blocked.setattr(listener_thread, "is_alive", Mock(return_value=True))
+            assert runtime.stop(0) is False
     finally:
         if runtime.listener._thread and runtime.listener._thread.is_alive():
             runtime.listener._thread.join(1)
