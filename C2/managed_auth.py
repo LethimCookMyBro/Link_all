@@ -11,15 +11,28 @@ import os
 import secrets
 import select
 import socket
+import sqlite3
 import ssl
 import threading
 from collections.abc import Callable, Mapping
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from time import monotonic, time
-from uuid import uuid4
+from uuid import UUID, uuid4
 
-from C2.managed_registry import ManagedRegistry
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509.oid import NameOID
+
+from C2.managed_pki import ControllerCertificateAuthority
+from C2.managed_registry import (
+    CertificateRejected,
+    EnrollmentTokenRejected,
+    ManagedRegistry,
+    ManagedRegistryError,
+    utc_now,
+)
 from client import transport
 from client.agent_config import (
     DeviceCredential,
@@ -32,6 +45,7 @@ from client.transport import build_proof, canonical_auth_input, verify_proof
 
 __all__ = [
     "DeviceRegistry",
+    "EnrollmentResponse",
     "EnrollmentServer",
     "EnrollmentService",
     "EnrollmentStore",
@@ -77,7 +91,10 @@ class _ProcessFileLock:
                     self._lock_byte()
                     return self
                 except OSError as exc:
-                    if exc.errno not in (errno.EACCES, errno.EAGAIN, 13, 36) or monotonic() >= deadline:
+                    if (
+                        exc.errno not in (errno.EACCES, errno.EAGAIN, 13, 36)
+                        or monotonic() >= deadline
+                    ):
                         raise TimeoutError("store lock timed out") from exc
                     threading.Event().wait(min(0.01, deadline - monotonic()))
         except Exception:
@@ -496,12 +513,38 @@ class DeviceRegistry:
         self._needs_migration = False
 
 
+@dataclass(frozen=True)
+class EnrollmentResponse:
+    agent_id: str
+    certificate_pem: bytes
+    chain_pem: bytes
+    certificate_serial: str
+    certificate_not_after: str
+
+
+class SigningUnavailable(Exception):
+    pass
+
+
 class EnrollmentService:
-    def __init__(self, tokens: EnrollmentStore, registry: DeviceRegistry) -> None:
-        self._tokens = tokens
-        self._registry = registry
+    def __init__(
+        self,
+        registry: ManagedRegistry | EnrollmentStore,
+        certificate_authority: ControllerCertificateAuthority | DeviceRegistry,
+        *,
+        now=utc_now,
+    ) -> None:
+        self._legacy = isinstance(registry, EnrollmentStore)
+        self._registry = certificate_authority if self._legacy else registry
+        self._tokens = registry if self._legacy else None
+        self._certificate_authority = None if self._legacy else certificate_authority
+        self._now = now
         self._lock = threading.Lock()
-        self.reconcile()
+        if self._legacy:
+            self.reconcile()
+
+    def ca_pem(self) -> bytes | None:
+        return None if self._legacy else self._certificate_authority.ca_pem()
 
     def reconcile(self) -> None:
         with self._lock, self._tokens._lock:
@@ -517,7 +560,82 @@ class EnrollmentService:
         self._registry._discard_unfinished()
         return records
 
-    def exchange(self, token: str) -> DeviceCredential:
+    def exchange(
+        self,
+        token: str,
+        csr_pem: bytes | None = None,
+        display_name: str | None = None,
+        agent_version: str | None = None,
+    ) -> EnrollmentResponse | DeviceCredential:
+        if not self._legacy:
+            csr_pem = _validated_device_csr(csr_pem)
+            display_name = _bounded_text("display_name", display_name, 128)
+            agent_version = _bounded_text(
+                "agent_version", agent_version, 32, visible_ascii=True
+            )
+            agent_id = str(uuid4())
+            try:
+                certificate = self._certificate_authority.sign_device_csr(
+                    csr_pem, agent_id
+                )
+                chain_pem = self._certificate_authority.ca_pem()
+            except (OSError, ValueError) as exc:
+                raise SigningUnavailable("signer unavailable") from exc
+            detail = self._registry.consume_token_and_enroll(
+                token,
+                certificate,
+                display_name,
+                agent_version,
+                "enrollment-service",
+                str(uuid4()),
+                agent_id=agent_id,
+            )
+            return EnrollmentResponse(
+                detail.agent_id,
+                certificate.certificate_pem,
+                chain_pem,
+                certificate.serial,
+                certificate.certificate_not_after,
+            )
+
+        return self._legacy_exchange(token)
+
+    def renew(
+        self, agent_id: str, fingerprint: str, csr_pem: bytes
+    ) -> EnrollmentResponse:
+        if self._legacy:
+            raise CertificateRejected("certificate renewal is unavailable")
+        csr_pem = _validated_device_csr(csr_pem)
+        current = self._registry.get_device(agent_id)
+        if current is None:
+            raise CertificateRejected("device not found")
+        if current.revoked_at is not None:
+            raise CertificateRejected("device is revoked")
+        if current.certificate_fingerprint != fingerprint:
+            raise CertificateRejected("current certificate does not match")
+        try:
+            certificate = self._certificate_authority.renew_device_csr(
+                csr_pem, agent_id
+            )
+            chain_pem = self._certificate_authority.ca_pem()
+        except (OSError, ValueError) as exc:
+            raise SigningUnavailable("signer unavailable") from exc
+        detail = self._registry.renew_certificate(
+            agent_id,
+            fingerprint,
+            certificate,
+            "certificate-renewal",
+            str(uuid4()),
+        )
+        return EnrollmentResponse(
+            detail.agent_id,
+            certificate.certificate_pem,
+            chain_pem,
+            certificate.serial,
+            certificate.certificate_not_after,
+        )
+
+    def _legacy_exchange(self, token: str) -> DeviceCredential:
         digest = self._tokens._token_hash(token, invalid=None)
         if digest is None:
             raise ValueError("invalid enrollment token")
@@ -562,6 +680,39 @@ class EnrollmentService:
     def _note_cleanup_error(error: Exception, cleanup_error: Exception | None) -> None:
         if cleanup_error is not None and hasattr(error, "add_note"):
             error.add_note(f"enrollment cleanup also failed: {cleanup_error}")
+
+
+def _bounded_text(name, value, limit, *, visible_ascii=False):
+    valid = type(value) is str and 0 < len(value) <= limit
+    if visible_ascii:
+        valid = valid and all(0x21 <= ord(character) <= 0x7E for character in value)
+    else:
+        valid = valid and value.isprintable()
+    if not valid:
+        raise ValueError(f"invalid {name}")
+    return value
+
+
+def _validated_device_csr(csr_pem):
+    if type(csr_pem) is not bytes or len(csr_pem) > _MAX_JSON_SIZE:
+        raise ValueError("invalid CSR")
+    try:
+        csr = x509.load_pem_x509_csr(csr_pem)
+    except ValueError as exc:
+        raise ValueError("invalid CSR") from exc
+    key = csr.public_key()
+    attributes = list(csr.subject)
+    if (
+        not csr.is_signature_valid
+        or not isinstance(key, ec.EllipticCurvePublicKey)
+        or not isinstance(key.curve, ec.SECP256R1)
+        or len(attributes) != 1
+        or attributes[0].oid != NameOID.COMMON_NAME
+        or not 1 <= len(attributes[0].value) <= 128
+        or not attributes[0].value.isprintable()
+    ):
+        raise ValueError("invalid CSR")
+    return csr.public_bytes(serialization.Encoding.PEM)
 
 
 def _server_context(certfile: os.PathLike[str] | str, keyfile: os.PathLike[str] | str):
@@ -832,7 +983,13 @@ class _EnrollmentHTTPServer(http.server.ThreadingHTTPServer):
     block_on_close = False
 
     def __init__(
-        self, address, handler, context, enrollment_service, handshake_timeout, max_workers
+        self,
+        address,
+        handler,
+        context,
+        enrollment_service,
+        handshake_timeout,
+        max_workers,
     ):
         self._context = context
         self.enrollment_service = enrollment_service
@@ -932,33 +1089,90 @@ class _EnrollmentHandler(http.server.BaseHTTPRequestHandler):
         self._reply(405, {"error": "method not allowed"})
 
     def do_POST(self):
-        if self.path != "/v1/enroll":
+        if self.path not in {"/v1/enroll", "/v1/renew"}:
             self._reply(404, {"error": "not found"})
             return
+        legacy = self.server.enrollment_service._legacy
+        peer = None
+        if self.path == "/v1/renew":
+            try:
+                peer = _peer_device_identity(self.connection)
+            except ValueError:
+                self._reply(403, {"error": "certificate rejected"})
+                return
         try:
+            if (
+                self.headers.get("Content-Type", "").partition(";")[0].strip().lower()
+                != "application/json"
+            ):
+                raise ValueError
             content_length = int(self.headers.get("Content-Length", ""))
             if not 0 < content_length <= _MAX_JSON_SIZE:
                 raise ValueError
             payload = transport.decode_json_payload(
                 self.rfile.read(content_length), max_size=_MAX_JSON_SIZE
             )
-            if set(payload) != {"token"} or not isinstance(payload["token"], str):
-                raise ValueError
+            if legacy:
+                if self.path != "/v1/enroll" or set(payload) != {"token"}:
+                    raise ValueError
+            else:
+                expected = (
+                    {"agent_version", "csr_pem", "display_name", "token"}
+                    if self.path == "/v1/enroll"
+                    else {"csr_pem"}
+                )
+                if set(payload) != expected:
+                    raise ValueError
+                csr_pem = _decode_csr(payload["csr_pem"])
         except (TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
             self._reply(400, {"error": "invalid request"})
             return
         try:
-            credential = self.server.enrollment_service.exchange(payload["token"])
-        except ValueError:
-            self._reply(401, {"error": "invalid enrollment token"})
+            if legacy:
+                response = self.server.enrollment_service.exchange(payload["token"])
+            elif self.path == "/v1/enroll":
+                response = self.server.enrollment_service.exchange(
+                    payload["token"],
+                    csr_pem,
+                    payload["display_name"],
+                    payload["agent_version"],
+                )
+            else:
+                response = self.server.enrollment_service.renew(*peer, csr_pem)
+        except EnrollmentTokenRejected:
+            self._reply(403, {"error": "invalid enrollment token"})
             return
+        except CertificateRejected:
+            self._reply(403, {"error": "certificate rejected"})
+            return
+        except ValueError:
+            self._reply(
+                401 if legacy else 400,
+                {"error": "invalid enrollment token" if legacy else "invalid request"},
+            )
+            return
+        except (SigningUnavailable, ManagedRegistryError, OSError, sqlite3.Error):
+            self._reply(503, {"error": "service unavailable"})
+            return
+        if legacy:
+            message = {
+                "agent_id": response.agent_id,
+                "key_id": response.key_id,
+                "secret": base64.b64encode(response.secret).decode("ascii"),
+            }
+        else:
+            message = {
+                "agent_id": response.agent_id,
+                "certificate_pem": base64.b64encode(response.certificate_pem).decode(
+                    "ascii"
+                ),
+                "chain_pem": base64.b64encode(response.chain_pem).decode("ascii"),
+                "certificate_serial": response.certificate_serial,
+                "certificate_not_after": response.certificate_not_after,
+            }
         self._reply(
             201,
-            {
-                "agent_id": credential.agent_id,
-                "key_id": credential.key_id,
-                "secret": base64.b64encode(credential.secret).decode("ascii"),
-            },
+            message,
         )
 
     def _reply(self, status: int, message: Mapping) -> None:
@@ -998,7 +1212,7 @@ class EnrollmentServer:
         self._server = _EnrollmentHTTPServer(
             (host, port),
             _EnrollmentHandler,
-            _server_context(certfile, keyfile),
+            _enrollment_server_context(certfile, keyfile, service.ca_pem()),
             service,
             handshake_timeout,
             max_workers,
@@ -1015,6 +1229,50 @@ class EnrollmentServer:
 
     def server_close(self) -> None:
         self._server.server_close()
+
+
+def _enrollment_server_context(certfile, keyfile, ca_pem):
+    context = _server_context(certfile, keyfile)
+    if ca_pem is not None:
+        context.load_verify_locations(cadata=ca_pem.decode("ascii"))
+        context.verify_mode = ssl.CERT_OPTIONAL
+    return context
+
+
+def _decode_csr(value):
+    if type(value) is not str or len(value) > _MAX_JSON_SIZE:
+        raise ValueError("invalid CSR")
+    try:
+        der = base64.b64decode(value.encode("ascii"), validate=True)
+        if not der or len(der) > _MAX_JSON_SIZE:
+            raise ValueError
+        csr = x509.load_der_x509_csr(der)
+    except (UnicodeEncodeError, ValueError) as exc:
+        raise ValueError("invalid CSR") from exc
+    return csr.public_bytes(serialization.Encoding.PEM)
+
+
+def _peer_device_identity(connection):
+    der = connection.getpeercert(binary_form=True)
+    if not der:
+        raise ValueError("client certificate required")
+    try:
+        certificate = x509.load_der_x509_certificate(der)
+        uris = certificate.extensions.get_extension_for_class(
+            x509.SubjectAlternativeName
+        ).value.get_values_for_type(x509.UniformResourceIdentifier)
+    except (ValueError, x509.ExtensionNotFound) as exc:
+        raise ValueError("invalid client certificate") from exc
+    prefix = "urn:phantomlink:agent:"
+    if len(uris) != 1 or not uris[0].startswith(prefix):
+        raise ValueError("invalid client certificate")
+    agent_id = uris[0][len(prefix) :]
+    try:
+        if str(UUID(agent_id)) != agent_id:
+            raise ValueError
+    except (AttributeError, ValueError) as exc:
+        raise ValueError("invalid client certificate") from exc
+    return agent_id, certificate.fingerprint(hashes.SHA256()).hex()
 
 
 def _store_services(path: os.PathLike[str] | str):

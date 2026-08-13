@@ -13,18 +13,23 @@ import ssl
 import sys
 from pathlib import Path
 
+from cryptography import x509
+from cryptography.hazmat.primitives import serialization
+
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from client.agent_config import (
     DeviceCredential,
-    DpapiCredentialStore,
+    _apply_private_acl,
+    _atomic_private_write,
     _read_private_file,
     load_config,
     write_identity,
 )
 from client.agent_logging import start_agent_logging
 from client.agent_runtime import AgentRuntime, AuthRejected
+from client.managed_identity import AgentCertificateIdentity, AgentCertificateStore
 from client.transport import decode_json_payload, encode_json_payload
 
 
@@ -84,9 +89,116 @@ def _credential_from_response(payload) -> DeviceCredential:
     return DeviceCredential(agent_id, key_id, secret)
 
 
-def enroll(config, token: str, store) -> DeviceCredential:
+def _certificate_from_response(payload):
+    fields = {
+        "agent_id",
+        "certificate_pem",
+        "chain_pem",
+        "certificate_serial",
+        "certificate_not_after",
+    }
+    if not isinstance(payload, dict) or set(payload) != fields:
+        raise EnrollmentRejected("invalid enrollment response")
+    if any(type(payload[name]) is not str or not payload[name] for name in fields):
+        raise EnrollmentRejected("invalid enrollment response")
+    try:
+        certificate_pem = base64.b64decode(payload["certificate_pem"], validate=True)
+        chain_pem = base64.b64decode(payload["chain_pem"], validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise EnrollmentRejected("invalid enrollment response") from exc
+    if len(certificate_pem) > 65536 or len(chain_pem) > 65536:
+        raise EnrollmentRejected("invalid enrollment response")
+    return {
+        "agent_id": payload["agent_id"],
+        "certificate_pem": certificate_pem,
+        "chain_pem": chain_pem,
+        "certificate_serial": payload["certificate_serial"],
+        "certificate_not_after": payload["certificate_not_after"],
+    }
+
+
+def _encoded_csr(csr_pem):
+    try:
+        csr = x509.load_pem_x509_csr(csr_pem)
+    except (TypeError, ValueError) as exc:
+        raise EnrollmentRejected("invalid local CSR") from exc
+    return base64.b64encode(csr.public_bytes(serialization.Encoding.DER)).decode(
+        "ascii"
+    )
+
+
+def _certificate_request(config, path, body, context):
+    connection = http.client.HTTPSConnection(
+        config.controller_host,
+        config.enrollment_port,
+        timeout=config.connect_timeout,
+        context=context,
+    )
+    try:
+        connection.connect()
+        certificate = connection.sock.getpeercert(binary_form=True)
+        if not certificate or not hmac.compare_digest(
+            hashlib.sha256(certificate).hexdigest(), config.tls_cert_sha256
+        ):
+            raise EnrollmentRejected("certificate pin mismatch")
+        connection.request(
+            "POST",
+            path,
+            body=encode_json_payload(body),
+            headers={"Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        payload_bytes = response.read(65537)
+        if response.status != 201 or len(payload_bytes) > 65536:
+            raise EnrollmentRejected("enrollment rejected")
+        return _certificate_from_response(
+            decode_json_payload(payload_bytes, max_size=65536)
+        )
+    except EnrollmentRejected:
+        raise
+    except (
+        OSError,
+        ssl.SSLError,
+        ValueError,
+        json.JSONDecodeError,
+        http.client.HTTPException,
+    ) as exc:
+        raise EnrollmentRejected("enrollment failed") from exc
+    finally:
+        connection.close()
+
+
+def enroll(config, token: str, store):
     if not isinstance(token, str) or not token:
         raise ValueError("enrollment token is required")
+    if hasattr(store, "create_csr"):
+        private_key_pem, csr_pem = store.create_csr(config.display_name)
+        response = _certificate_request(
+            config,
+            "/v1/enroll",
+            {
+                "agent_version": config.agent_version,
+                "csr_pem": _encoded_csr(csr_pem),
+                "display_name": config.display_name,
+                "token": token,
+            },
+            _tls_context(),
+        )
+        identity = store.save_enrollment(private_key_pem, **response)
+        identity_path = _identity_path(store)
+        if identity_path is not None:
+            _atomic_private_write(
+                identity_path,
+                json.dumps(
+                    {"agent_id": identity.agent_id},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8"),
+                _apply_private_acl,
+            )
+        return identity
+
+    # Retained until the Phase 1 integration fixture moves to certificate identity.
     connection = http.client.HTTPSConnection(
         config.controller_host,
         config.enrollment_port,
@@ -131,6 +243,21 @@ def enroll(config, token: str, store) -> DeviceCredential:
         connection.close()
 
 
+def renew(
+    config, identity: AgentCertificateIdentity, store: AgentCertificateStore
+) -> AgentCertificateIdentity:
+    private_key_pem, csr_pem = store.create_csr(config.display_name)
+    response = _certificate_request(
+        config,
+        "/v1/renew",
+        {"csr_pem": _encoded_csr(csr_pem)},
+        store.client_context(identity),
+    )
+    if response["agent_id"] != identity.agent_id:
+        raise EnrollmentRejected("renewal identity changed")
+    return store.save_enrollment(private_key_pem, **response)
+
+
 def _read_token_file(value: str) -> str:
     path = Path(value)
     if not path.is_absolute():
@@ -164,6 +291,11 @@ def parser():
     run_cmd = commands.add_parser("run")
     run_cmd.add_argument("--config", default=str(default_config_path()))
     return root
+
+
+def _certificate_store_path(config_path, configured_path):
+    path = Path(configured_path)
+    return path if path.is_absolute() else Path(config_path).resolve().parent / path
 
 
 def main(argv=None) -> int:
@@ -204,13 +336,15 @@ def main(argv=None) -> int:
                 return 5
             raise
         try:
-            store = DpapiCredentialStore(_credential_path(args.config))
+            store = AgentCertificateStore(
+                _certificate_store_path(args.config, config.certificate_store_path)
+            )
             enroll(config, token, store)
             logging_runtime.emit(
                 {"event": "ENROLLMENT_SUCCESS", "state": "STOPPED", "attempt": 0}
             )
             return 0
-        except EnrollmentRejected:
+        except (EnrollmentRejected, ValueError):
             logging_runtime.emit(
                 {"event": "ENROLLMENT_REJECTED", "state": "STOPPED", "attempt": 0}
             )
@@ -244,7 +378,9 @@ def main(argv=None) -> int:
             return 5
         raise
     try:
-        store = DpapiCredentialStore(_credential_path(args.config))
+        store = AgentCertificateStore(
+            _certificate_store_path(args.config, config.certificate_store_path)
+        )
         credential = store.load()
         if credential is None:
             logging_runtime.emit(
@@ -258,7 +394,13 @@ def main(argv=None) -> int:
             auth_rejected = auth_rejected or event.get("event") == "AUTH_REJECTED"
             logging_runtime.emit(event)
 
-        runtime = AgentRuntime(config, credential, event_sink=observe)
+        runtime = AgentRuntime(
+            config,
+            credential,
+            identity_store=store,
+            renewer=renew,
+            event_sink=observe,
+        )
         try:
             runtime.run()
         except KeyboardInterrupt:

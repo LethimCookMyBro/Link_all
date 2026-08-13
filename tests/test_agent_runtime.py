@@ -4,6 +4,7 @@ import json
 import socket
 import ssl
 import threading
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -17,6 +18,7 @@ from client.agent_runtime import (
     RetryPolicy,
     send_frame,
 )
+from client.managed_identity import AgentCertificateIdentity
 from client.transport import build_proof
 
 
@@ -55,6 +57,73 @@ def config():
 @pytest.fixture
 def credential():
     return DeviceCredential("agent-1", "key-1", b"s" * 32)
+
+
+@pytest.fixture
+def valid_identity():
+    return AgentCertificateIdentity(
+        agent_id="11111111-1111-4111-8111-111111111111",
+        certificate_pem=b"certificate",
+        chain_pem=b"chain",
+        private_key_pem=b"private-key",
+        certificate_serial="1",
+        certificate_not_after="2026-11-11T00:00:00Z",
+    )
+
+
+class RecordingRenewer:
+    def __init__(self, replacement=None, error=None):
+        self.replacement = replacement
+        self.error = error
+        self.calls = []
+
+    def __call__(self, _config, identity, _store):
+        self.calls.append(identity.agent_id)
+        if self.error is not None:
+            raise self.error
+        return self.replacement or identity
+
+
+def test_runtime_renews_only_at_30_days_or_less(valid_identity, config):
+    renewer = RecordingRenewer()
+    runtime = AgentRuntime(
+        config,
+        valid_identity,
+        identity_store=object(),
+        connector=ScriptedConnector(),
+        renewer=renewer,
+    )
+    expiry = datetime.fromisoformat(
+        valid_identity.certificate_not_after.replace("Z", "+00:00")
+    )
+
+    assert runtime.prepare_identity(now=expiry - timedelta(days=31)) is True
+    assert renewer.calls == []
+    assert runtime.prepare_identity(now=expiry - timedelta(days=30)) is True
+    assert renewer.calls == [valid_identity.agent_id]
+
+
+def test_runtime_continues_on_failed_renewal_until_current_certificate_expires(
+    valid_identity, config
+):
+    events = []
+    renewer = RecordingRenewer(error=OSError("offline"))
+    runtime = AgentRuntime(
+        config,
+        valid_identity,
+        identity_store=object(),
+        connector=ScriptedConnector(),
+        renewer=renewer,
+        event_sink=events.append,
+    )
+    expiry = datetime.fromisoformat(
+        valid_identity.certificate_not_after.replace("Z", "+00:00")
+    )
+
+    assert runtime.prepare_identity(now=expiry - timedelta(days=1)) is True
+    assert [event["event"] for event in events] == ["CERTIFICATE_RENEWAL_FAILED"]
+    assert runtime.prepare_identity(now=expiry) is False
+    assert [event["event"] for event in events][-1] == "CERTIFICATE_EXPIRED"
 
 
 class FakeSocket:

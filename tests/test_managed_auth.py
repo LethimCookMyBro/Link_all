@@ -18,7 +18,7 @@ import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
-from cryptography.x509.oid import NameOID
+from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 from C2.managed_auth import (
     DeviceRegistry,
@@ -32,17 +32,28 @@ from C2.managed_auth import (
     send_json_frame,
     verify_proof,
 )
+from C2.managed_pki import ControllerCertificateAuthority
+from C2.managed_registry import (
+    CertificateRejected,
+    EnrollmentTokenRejected,
+    ManagedRegistry,
+)
+from client.managed_identity import AgentCertificateStore
 
 
 def _issue_tokens_in_process(path, start, count):
-    store = EnrollmentStore(path, acl_inspector=lambda _: {"owner": True}, acl_applier=lambda _: None)
+    store = EnrollmentStore(
+        path, acl_inspector=lambda _: {"owner": True}, acl_applier=lambda _: None
+    )
     start.wait(5)
     for _ in range(count):
         store.issue(60)
 
 
 def _consume_token_in_process(path, start, token):
-    store = EnrollmentStore(path, acl_inspector=lambda _: {"owner": True}, acl_applier=lambda _: None)
+    store = EnrollmentStore(
+        path, acl_inspector=lambda _: {"owner": True}, acl_applier=lambda _: None
+    )
     start.wait(5)
     if not store.consume(token):
         raise AssertionError("token was not consumed")
@@ -55,6 +66,255 @@ class FakeProtector:
     def unprotect(self, data):
         assert data.startswith(b"protected:")
         return data[len(b"protected:") :][::-1]
+
+
+@pytest.fixture
+def managed_registry(tmp_path):
+    registry = ManagedRegistry(tmp_path / "managed.db")
+    registry.initialize()
+    return registry
+
+
+@pytest.fixture
+def certificate_authority(tmp_path):
+    authority = ControllerCertificateAuthority(
+        tmp_path / "ca-key.dpapi",
+        tmp_path / "ca.pem",
+        protector=FakeProtector(),
+    )
+    authority.initialize("PhantomLink Test CA")
+    return authority
+
+
+@pytest.fixture
+def csr_pem(tmp_path):
+    return AgentCertificateStore(tmp_path / "identity.dpapi").create_csr("pc-01")[1]
+
+
+@pytest.fixture
+def controller_tls_material(tmp_path, certificate_authority):
+    ca_key = serialization.load_pem_private_key(
+        FakeProtector().unprotect(certificate_authority.key_path.read_bytes()),
+        password=None,
+    )
+    ca_certificate = x509.load_pem_x509_certificate(certificate_authority.ca_pem())
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    now = datetime.now(timezone.utc)
+    certificate = (
+        x509.CertificateBuilder()
+        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")]))
+        .issuer_name(ca_certificate.subject)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(minutes=1))
+        .not_valid_after(now + timedelta(days=1))
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(
+            x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False
+        )
+        .sign(ca_key, hashes.SHA256())
+    )
+    cert_path = tmp_path / "controller.crt"
+    key_path = tmp_path / "controller.key"
+    cert_path.write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
+    key_path.write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+    return cert_path, key_path, certificate
+
+
+def test_enrollment_consumes_token_and_returns_only_public_certificate_material(
+    managed_registry, certificate_authority, csr_pem
+):
+    token = managed_registry.issue_token(600)
+    service = EnrollmentService(managed_registry, certificate_authority)
+
+    response = service.exchange(token, csr_pem, "pc-01", "2.0")
+
+    assert response.agent_id
+    assert response.certificate_pem.startswith(b"-----BEGIN CERTIFICATE-----")
+    assert response.chain_pem.startswith(b"-----BEGIN CERTIFICATE-----")
+    certificate = x509.load_pem_x509_certificate(response.certificate_pem)
+    uri = certificate.extensions.get_extension_for_class(
+        x509.SubjectAlternativeName
+    ).value.get_values_for_type(x509.UniformResourceIdentifier)
+    assert uri == [f"urn:phantomlink:agent:{response.agent_id}"]
+    assert not hasattr(response, "secret")
+    with pytest.raises(EnrollmentTokenRejected):
+        service.exchange(token, csr_pem, "pc-01", "2.0")
+
+
+def test_signing_failure_does_not_consume_token(managed_registry, csr_pem):
+    class FailingAuthority:
+        def sign_device_csr(self, _csr_pem, _agent_id):
+            raise OSError("signer unavailable")
+
+        def ca_pem(self):
+            return b"unused"
+
+    token = managed_registry.issue_token(600)
+    service = EnrollmentService(managed_registry, FailingAuthority())
+    with pytest.raises(Exception, match="signer unavailable") as caught:
+        service.exchange(token, csr_pem, "pc-01", "2.0")
+    assert caught.type.__name__ == "SigningUnavailable"
+    digest = hashlib.sha256(token.encode("ascii")).hexdigest()
+    with managed_registry._connection() as connection:
+        row = connection.execute(
+            "SELECT consumed_at FROM enrollment_tokens WHERE token_digest = ?",
+            (digest,),
+        ).fetchone()
+    assert row["consumed_at"] is None
+
+
+def test_renewal_rejects_revoked_device(
+    managed_registry, certificate_authority, csr_pem, tmp_path
+):
+    service = EnrollmentService(managed_registry, certificate_authority)
+    enrolled = service.exchange(
+        managed_registry.issue_token(600), csr_pem, "pc-01", "2.0"
+    )
+    current = managed_registry.get_device(enrolled.agent_id)
+    managed_registry.revoke_device(enrolled.agent_id, "operator", "retired", "corr-r")
+    renewal_csr = AgentCertificateStore(tmp_path / "renewal.dpapi").create_csr("pc-01")[
+        1
+    ]
+
+    with pytest.raises(CertificateRejected):
+        service.renew(enrolled.agent_id, current.certificate_fingerprint, renewal_csr)
+
+
+def test_certificate_https_uses_public_response_and_requires_peer_for_renewal(
+    managed_registry, certificate_authority, csr_pem, controller_tls_material
+):
+    cert, key, _ = controller_tls_material
+    token = managed_registry.issue_token(600)
+    server = EnrollmentServer(
+        "127.0.0.1",
+        0,
+        cert,
+        key,
+        EnrollmentService(managed_registry, certificate_authority),
+    )
+    thread = threading.Thread(target=server.serve_forever)
+    thread.start()
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    csr_der = x509.load_pem_x509_csr(csr_pem).public_bytes(serialization.Encoding.DER)
+    body = json.dumps(
+        {
+            "agent_version": "2.0",
+            "csr_pem": base64.b64encode(csr_der).decode("ascii"),
+            "display_name": "pc-01",
+            "token": token,
+        }
+    )
+    try:
+        connection = http.client.HTTPSConnection(
+            "127.0.0.1", server.port, context=context, timeout=2
+        )
+        connection.request(
+            "POST",
+            "/v1/enroll",
+            body=body,
+            headers={"Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        payload = json.loads(response.read())
+        assert response.status == 201
+        assert set(payload) == {
+            "agent_id",
+            "certificate_pem",
+            "chain_pem",
+            "certificate_serial",
+            "certificate_not_after",
+        }
+        connection.close()
+
+        connection = http.client.HTTPSConnection(
+            "127.0.0.1", server.port, context=context, timeout=2
+        )
+        connection.request(
+            "POST",
+            "/v1/enroll",
+            body=body,
+            headers={"Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        assert response.status == 403
+        response.read()
+        connection.close()
+
+        connection = http.client.HTTPSConnection(
+            "127.0.0.1", server.port, context=context, timeout=2
+        )
+        connection.request("POST", "/v1/renew", body=json.dumps({"csr_pem": "x"}))
+        response = connection.getresponse()
+        assert response.status == 403
+        response.read()
+        connection.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(2)
+
+
+def test_agent_enrolls_and_renews_with_local_keys_and_pinned_server(
+    managed_registry,
+    certificate_authority,
+    controller_tls_material,
+    tmp_path,
+    monkeypatch,
+):
+    from client import managed_agent
+    from client.agent_config import AgentConfig
+
+    cert, key, server_certificate = controller_tls_material
+    server = EnrollmentServer(
+        "127.0.0.1",
+        0,
+        cert,
+        key,
+        EnrollmentService(managed_registry, certificate_authority),
+    )
+    thread = threading.Thread(target=server.serve_forever)
+    thread.start()
+    config = AgentConfig(
+        controller_host="127.0.0.1",
+        managed_port=1,
+        enrollment_port=server.port,
+        tls_cert_sha256=server_certificate.fingerprint(hashes.SHA256()).hex(),
+        display_name="pc-01",
+    )
+    store = AgentCertificateStore(
+        tmp_path / "identity.dpapi",
+        protector=FakeProtector(),
+        acl_applier=lambda _: None,
+    )
+    monkeypatch.setattr(managed_agent, "_apply_private_acl", lambda _: None)
+    try:
+        identity = managed_agent.enroll(
+            config, managed_registry.issue_token(600), store
+        )
+        previous_key = identity.private_key_pem
+        renewed = managed_agent.renew(config, identity, store)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(2)
+
+    assert renewed.agent_id == identity.agent_id
+    assert renewed.certificate_serial != identity.certificate_serial
+    assert renewed.private_key_pem != previous_key
+    assert store.load() == renewed
+    assert (
+        managed_registry.get_device(renewed.agent_id).certificate_serial
+        == renewed.certificate_serial
+    )
 
 
 @pytest.fixture
@@ -1002,7 +1262,10 @@ def test_managed_unauthenticated_workers_are_bounded(tls_material, tmp_path):
     )
     stop = threading.Event()
     thread = server.start(stop)
-    stalled = [socket.create_connection(("127.0.0.1", server.port), timeout=0.5) for _ in range(8)]
+    stalled = [
+        socket.create_connection(("127.0.0.1", server.port), timeout=0.5)
+        for _ in range(8)
+    ]
     try:
         assert _wait_until(lambda: len(server._threads) == 2)
         assert len(server._threads) <= 2
@@ -1029,7 +1292,10 @@ def test_enrollment_unauthenticated_workers_are_bounded(tls_material, tmp_path):
     )
     thread = threading.Thread(target=server.serve_forever)
     thread.start()
-    stalled = [socket.create_connection(("127.0.0.1", server.port), timeout=0.5) for _ in range(8)]
+    stalled = [
+        socket.create_connection(("127.0.0.1", server.port), timeout=0.5)
+        for _ in range(8)
+    ]
     try:
         assert _wait_until(lambda: len(server._server._connections) == 2)
         assert len(server._server._connections) <= 2
@@ -1097,10 +1363,14 @@ def test_cross_process_token_issues_do_not_lose_updates(tmp_path):
 def test_cross_process_issue_cannot_resurrect_consumed_token(tmp_path):
     context = multiprocessing.get_context("spawn")
     path = tmp_path / "tokens.json"
-    store = EnrollmentStore(path, acl_inspector=lambda _: {"owner": True}, acl_applier=lambda _: None)
+    store = EnrollmentStore(
+        path, acl_inspector=lambda _: {"owner": True}, acl_applier=lambda _: None
+    )
     token_a = store.issue(60)
     start = context.Event()
-    consume = context.Process(target=_consume_token_in_process, args=(path, start, token_a))
+    consume = context.Process(
+        target=_consume_token_in_process, args=(path, start, token_a)
+    )
     issue = context.Process(target=_issue_tokens_in_process, args=(path, start, 10))
     consume.start()
     issue.start()
@@ -1166,8 +1436,16 @@ def test_controller_starts_and_cleans_up_managed_services(tls_material, tmp_path
         patch.object(controller, "MANAGED_TLS_CERT", str(cert)),
         patch.object(controller, "MANAGED_TLS_KEY", str(key)),
         patch.object(controller, "MANAGED_STORE", str(tmp_path / "store")),
-        patch.object(controller, "ManagedServer", side_effect=lambda host, *_a: (bind_hosts.append(host), managed)[1]),
-        patch.object(controller, "EnrollmentServer", side_effect=lambda host, *_a: (bind_hosts.append(host), enrollment)[1]),
+        patch.object(
+            controller,
+            "ManagedServer",
+            side_effect=lambda host, *_a: (bind_hosts.append(host), managed)[1],
+        ),
+        patch.object(
+            controller,
+            "EnrollmentServer",
+            side_effect=lambda host, *_a: (bind_hosts.append(host), enrollment)[1],
+        ),
         patch.object(controller, "EnrollmentStore"),
         patch.object(controller, "DeviceRegistry"),
         patch.object(controller, "EnrollmentService"),

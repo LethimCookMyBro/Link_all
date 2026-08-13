@@ -8,10 +8,12 @@ import socket
 import ssl
 import threading
 from collections import deque
+from datetime import datetime, timedelta, timezone
 from enum import Enum, auto
 from time import monotonic
 
 from client.agent_config import AgentConfig, DeviceCredential
+from client.managed_identity import AgentCertificateIdentity
 from client.transport import (
     FrameDecoder,
     build_proof,
@@ -256,6 +258,8 @@ class AgentRuntime:
         stop_event=None,
         clock=monotonic,
         event_sink=None,
+        identity_store=None,
+        renewer=None,
     ) -> None:
         self.config = config
         self.credential = credential
@@ -268,6 +272,9 @@ class AgentRuntime:
         self._connection = None
         self._pending_close_category = None
         self._event_sink = event_sink if event_sink is not None else _discard_event
+        self.identity_store = identity_store
+        self.renewer = renewer
+        self._renewal_attempted_for_serial = None
         self.connector = connector or ManagedConnector()
         bind = getattr(self.connector, "set_socket_hooks", None)
         if bind is not None:
@@ -277,6 +284,39 @@ class AgentRuntime:
             config.retry_max,
             config.retry_jitter,
         )
+
+    def prepare_identity(self, *, now=None) -> bool:
+        if not isinstance(self.credential, AgentCertificateIdentity):
+            return True
+        now = datetime.now(timezone.utc) if now is None else now
+        if not isinstance(now, datetime) or now.tzinfo is None:
+            raise ValueError("now must be timezone-aware")
+        expiry = _parse_certificate_time(self.credential.certificate_not_after)
+        if expiry <= now.astimezone(timezone.utc):
+            self._emit("CERTIFICATE_EXPIRED")
+            return False
+        if expiry - now.astimezone(timezone.utc) > timedelta(days=30):
+            return True
+        serial = self.credential.certificate_serial
+        if self._renewal_attempted_for_serial == serial:
+            return True
+        self._renewal_attempted_for_serial = serial
+        try:
+            if self.renewer is None or self.identity_store is None:
+                raise RuntimeError("certificate renewer unavailable")
+            renewed = self.renewer(self.config, self.credential, self.identity_store)
+            if not isinstance(renewed, AgentCertificateIdentity):
+                raise TypeError("renewer returned invalid identity")
+            if renewed.agent_id != self.credential.agent_id:
+                raise ValueError("renewer changed agent identity")
+            self.credential = renewed
+            self._renewal_attempted_for_serial = (
+                serial if renewed.certificate_serial == serial else None
+            )
+            self._emit("CERTIFICATE_RENEWED")
+        except Exception:  # noqa: BLE001 - valid current identity remains usable
+            self._emit("CERTIFICATE_RENEWAL_FAILED")
+        return True
 
     @property
     def state(self):
@@ -389,11 +429,16 @@ class AgentRuntime:
         try:
             self._emit("PROCESS_START")
             try:
-                _validate_credential(self.credential)
+                if isinstance(self.credential, DeviceCredential):
+                    _validate_credential(self.credential)
+                elif not isinstance(self.credential, AgentCertificateIdentity):
+                    raise TypeError("credential must be a DeviceCredential")
             except (TypeError, ValueError):
                 self._emit("CONNECTION_FAILURE", category="credential")
                 raise
             while not self.stop_event.is_set():
+                if not self.prepare_identity():
+                    break
                 self._attempt += 1
                 self._set_state(AgentState.CONNECTING)
                 if self.stop_event.is_set():
@@ -443,3 +488,12 @@ class AgentRuntime:
                 self._emit("PROCESS_STOP")
             finally:
                 self._run_lock.release()
+
+
+def _parse_certificate_time(value):
+    if type(value) is not str or not value.endswith("Z"):
+        raise ValueError("certificate expiry must be UTC RFC3339")
+    parsed = datetime.fromisoformat(f"{value[:-1]}+00:00")
+    if parsed.utcoffset() != timedelta(0):
+        raise ValueError("certificate expiry must be UTC RFC3339")
+    return parsed
