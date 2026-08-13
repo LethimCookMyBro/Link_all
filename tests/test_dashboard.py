@@ -4,15 +4,12 @@ The data layer is pure and synchronous — tested directly. The Textual app is
 exercised headlessly through App.run_test() inside asyncio.run, so no real
 terminal, no sockets, and no hanging.
 """
-import sys
 import threading
 import time
 
 import pytest
 
-sys.path.insert(0, "C2")
-
-from dashboard import DashboardData, build_app  # noqa: E402
+from C2.dashboard import DashboardData, build_app
 
 
 def make_health(latency=0.0, quality="good", total=0):

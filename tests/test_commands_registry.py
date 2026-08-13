@@ -5,14 +5,11 @@ handler return contracts, and — critically — byte-exact regression guards
 that pin the CMD payloads to the values the legacy elif blocks sent, so a
 future refactor can never silently change what is transmitted to clients.
 """
-import sys
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-sys.path.insert(0, "C2")
-
-from commands import (  # noqa: E402
+from C2.commands import (
     CATEGORY_MEDIA,
     CATEGORY_NETWORK,
     CATEGORY_SYSTEM_CONTROL,
