@@ -13,6 +13,7 @@ import select
 import socket
 import sqlite3
 import ssl
+import sys
 import threading
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
@@ -34,7 +35,7 @@ from C2.managed_registry import (
     _token_digest,
     utc_now,
 )
-from C2.managed_services import ManagedServer
+from C2.managed_services import DeviceActionService, ManagedServer, SessionManager
 from client import transport
 from client.agent_config import (
     DeviceCredential,
@@ -1027,47 +1028,149 @@ def _peer_device_identity(connection):
 
 
 def _store_services(path: os.PathLike[str] | str):
-    root = Path(path)
-    registry = ManagedRegistry(root / "managed.db")
+    return _database_services(Path(path) / "managed.db")
+
+
+def _database_services(path: os.PathLike[str] | str):
+    registry = ManagedRegistry(Path(path))
     registry.initialize()
     return registry
+
+
+def _add_database_arguments(command) -> None:
+    paths = command.add_mutually_exclusive_group()
+    paths.add_argument("--db")
+    paths.add_argument("--store", help=argparse.SUPPRESS)
+
+
+def _database_path(args) -> Path:
+    if args.db:
+        return Path(args.db)
+    if args.store:
+        return Path(args.store) / "managed.db"
+    configured = os.getenv("PHANTOMLINK_MANAGED_DB", "")
+    if configured:
+        return Path(configured)
+    store = Path(os.getenv("PHANTOMLINK_MANAGED_STORE", "managed-store"))
+    return store / "managed.db"
+
+
+def _registry_from_args(args):
+    return _store_services(args.store) if args.store else _database_services(
+        _database_path(args)
+    )
+
+
+def _print_json(records) -> None:
+    print(json.dumps([asdict(record) for record in records], separators=(",", ":")))
+
+
+def _action_exit(result, success_codes) -> int:
+    if result.code in success_codes:
+        print(result.message)
+        return 0
+    if result.code == "NOT_FOUND":
+        print("not found")
+        return 1
+    print("failed", file=sys.stderr)
+    return 5
 
 
 def _main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="python -m C2.managed_auth")
     commands = parser.add_subparsers(dest="command", required=True)
+    initialize = commands.add_parser("init-ca")
+    initialize.add_argument("--ca-key", required=True)
+    initialize.add_argument("--ca-cert", required=True)
+    initialize.add_argument("--common-name", default="PhantomLink Managed CA")
     issue = commands.add_parser("issue-token")
-    issue.add_argument("--store", default="managed-store")
+    _add_database_arguments(issue)
     issue.add_argument("--ttl", type=float, default=600)
     listing = commands.add_parser("list-devices")
-    listing.add_argument("--store", default="managed-store")
+    _add_database_arguments(listing)
+    audit = commands.add_parser("list-audit")
+    _add_database_arguments(audit)
+    audit.add_argument("--limit", type=int, default=100)
+    disconnect = commands.add_parser("disconnect")
+    _add_database_arguments(disconnect)
+    disconnect.add_argument("--agent-id", required=True)
+    disconnect.add_argument("--actor", required=True)
+    disconnect.add_argument("--reason", default="")
     revoke = commands.add_parser("revoke")
-    revoke.add_argument("--store", default="managed-store")
+    _add_database_arguments(revoke)
     revoke.add_argument("--agent-id", required=True)
-    revoke.add_argument("--key-id", help="retained Phase 1 argument; ignored")
-    revoke.add_argument("--reason", default="operator CLI request")
-    args = parser.parse_args(argv)
+    revoke.add_argument("--actor", required=True)
+    revoke.add_argument("--reason", required=True)
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as exc:
+        return int(exc.code) if isinstance(exc.code, int) else 2
 
-    registry = _store_services(args.store)
+    if args.command == "init-ca":
+        if any(
+            type(value) is not str or not value.strip()
+            for value in (args.ca_key, args.ca_cert)
+        ) or (
+            type(args.common_name) is not str
+            or not 1 <= len(args.common_name) <= 128
+            or not args.common_name.isprintable()
+        ):
+            return 2
+        try:
+            ControllerCertificateAuthority(
+                Path(args.ca_key), Path(args.ca_cert)
+            ).initialize(args.common_name)
+        except Exception:
+            print("CA initialization failed", file=sys.stderr)
+            return 5
+        print("CA initialized")
+        return 0
+
+    if args.command == "issue-token" and (
+        not math.isfinite(args.ttl) or args.ttl <= 0
+    ):
+        return 2
+    if args.command == "list-audit" and not 1 <= args.limit <= 1000:
+        return 2
+    try:
+        registry = _registry_from_args(args)
+    except Exception:
+        print("registry unavailable", file=sys.stderr)
+        return 5
     if args.command == "issue-token":
-        print(registry.issue_token(args.ttl))
+        try:
+            print(registry.issue_token(args.ttl))
+        except ValueError:
+            return 2
+        except Exception:
+            print("registry unavailable", file=sys.stderr)
+            return 5
         return 0
     if args.command == "list-devices":
-        print(
-            json.dumps(
-                [asdict(device) for device in registry.list_device_records()],
-                separators=(",", ":"),
-            )
-        )
+        try:
+            _print_json(registry.list_device_records())
+        except Exception:
+            print("registry unavailable", file=sys.stderr)
+            return 5
         return 0
-    result = registry.revoke_device(
-        args.agent_id, "operator-cli", args.reason, str(uuid4())
-    )
-    if result.code in {"REVOKED", "ALREADY_REVOKED"}:
-        print("revoked")
+    if args.command == "list-audit":
+        try:
+            _print_json(registry.list_audit_events(args.limit))
+        except ValueError:
+            return 2
+        except Exception:
+            print("registry unavailable", file=sys.stderr)
+            return 5
         return 0
-    print("not found")
-    return 1
+    actions = DeviceActionService(registry, SessionManager(registry))
+    try:
+        if args.command == "disconnect":
+            result = actions.disconnect(args.agent_id, args.actor, args.reason)
+            return _action_exit(result, {"DISCONNECTED", "ALREADY_OFFLINE"})
+        result = actions.revoke(args.agent_id, args.actor, args.reason)
+        return _action_exit(result, {"REVOKED", "ALREADY_REVOKED"})
+    except ValueError:
+        return 2
 
 
 if __name__ == "__main__":

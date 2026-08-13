@@ -263,7 +263,10 @@ def _read_token_file(value: str) -> str:
     if not path.is_absolute():
         raise ValueError("token file path must be absolute")
     try:
-        token = _read_private_file(path, None).decode("utf-8").strip()
+        raw = _read_private_file(path, None)
+        if raw.startswith(b"\xef\xbb\xbf"):
+            raise ValueError("token file must be UTF-8 without BOM")
+        token = raw.decode("utf-8").strip()
     finally:
         path.unlink(missing_ok=True)
     if not token:
@@ -283,7 +286,7 @@ def _is_pythonw() -> bool:
 
 
 def parser():
-    root = argparse.ArgumentParser()
+    root = argparse.ArgumentParser(prog="python -m client.managed_agent")
     commands = root.add_subparsers(dest="command", required=True)
     enroll_cmd = commands.add_parser("enroll")
     enroll_cmd.add_argument("--config", default=str(default_config_path()))

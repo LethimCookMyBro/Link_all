@@ -140,6 +140,7 @@ def build_app(
     title: str = "PhantomLink C2 - Live Dashboard",
     refresh_interval: float = 2.0,
     managed_data: ManagedDashboardData | None = None,
+    stop_event: threading.Event | None = None,
 ):
     """Factory so the Textual import stays lazy and testable."""
     from textual.app import App, ComposeResult
@@ -219,10 +220,16 @@ def build_app(
             audit.add_columns("Timestamp", "Action", "Result", "Actor", "Target", "Reason")
             self.set_interval(self._interval, self._refresh)
             self.set_interval(self._interval, self._start_managed_refresh)
+            if stop_event is not None:
+                self.set_interval(0.1, self._stop_if_requested)
             self._refresh()
             if self._managed_snapshot is not None:
                 self._apply_managed_snapshot(self._managed_snapshot)
                 self._start_managed_refresh(force=True)
+
+        def _stop_if_requested(self) -> None:
+            if stop_event is not None and stop_event.is_set():
+                self.exit()
 
         def on_unmount(self) -> None:
             self._closing = True
@@ -488,6 +495,8 @@ def start_dashboard(
     port: int = 7000,
     refresh_interval: float = 2.0,
     title: str = "PhantomLink C2 - Live Dashboard",
+    managed_data: ManagedDashboardData | None = None,
+    stop_event: threading.Event | None = None,
 ) -> None:
     """Run the Textual dashboard. Intended to be started in a daemon thread
     from ``C2.main()`` (which already does so on port 7000).
@@ -509,7 +518,13 @@ def start_dashboard(
 
     data = DashboardData(client_manager, refresh_interval=refresh_interval)
     try:
-        app = build_app(data, title=title, refresh_interval=refresh_interval)
+        app = build_app(
+            data,
+            title=title,
+            refresh_interval=refresh_interval,
+            managed_data=managed_data,
+            stop_event=stop_event,
+        )
         app.run()
     except Exception:
         # TUI is best-effort; a dashboard crash must never kill the C2 shell.

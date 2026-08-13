@@ -1115,14 +1115,200 @@ def test_operator_cli_prints_token_once_and_not_found_is_nonzero(tmp_path, capsy
                 "--store",
                 str(store),
                 "--agent-id",
-                "agent-test",
-                "--key-id",
-                "key-test",
+                "00000000-0000-4000-8000-000000000001",
+                "--actor",
+                "operator-test",
+                "--reason",
+                "test request",
             ]
         )
         == 1
     )
     assert capsys.readouterr().out.strip() == "not found"
+
+
+def test_phase2_cli_exit_codes_and_required_operator_fields(tmp_path, capsys):
+    database = tmp_path / "managed.db"
+
+    assert _main(["issue-token", "--db", str(database), "--ttl", "0"]) == 2
+    assert _main(["list-audit", "--db", str(database)]) == 0
+    assert json.loads(capsys.readouterr().out.strip()) == []
+    assert _main(["disconnect", "--db", str(database), "--agent-id", "missing"]) == 2
+    assert _main(["revoke", "--db", str(database), "--agent-id", "missing"]) == 2
+
+
+def test_phase2_cli_initializes_ca_without_printing_credentials(tmp_path, capsys):
+    authority = MagicMock()
+    with patch("C2.managed_auth.ControllerCertificateAuthority", return_value=authority):
+        assert (
+            _main(
+                [
+                    "init-ca",
+                    "--ca-key",
+                    str(tmp_path / "ca.key.dpapi"),
+                    "--ca-cert",
+                    str(tmp_path / "ca.crt"),
+                ]
+            )
+            == 0
+        )
+    authority.initialize.assert_called_once_with("PhantomLink Managed CA")
+    output = capsys.readouterr().out
+    assert "BEGIN CERTIFICATE" not in output
+    assert "PRIVATE KEY" not in output
+
+
+def test_phase2_cli_maps_argument_and_storage_failures(tmp_path, capsys):
+    assert (
+        _main(
+            [
+                "init-ca",
+                "--ca-key",
+                str(tmp_path / "key"),
+                "--ca-cert",
+                str(tmp_path / "cert"),
+                "--common-name",
+                "",
+            ]
+        )
+        == 2
+    )
+    authority = MagicMock()
+    authority.initialize.side_effect = OSError("disk")
+    with patch("C2.managed_auth.ControllerCertificateAuthority", return_value=authority):
+        assert (
+            _main(
+                [
+                    "init-ca",
+                    "--ca-key",
+                    str(tmp_path / "key"),
+                    "--ca-cert",
+                    str(tmp_path / "cert"),
+                ]
+            )
+            == 5
+        )
+    assert capsys.readouterr().err.strip() == "CA initialization failed"
+    with patch("C2.managed_auth._registry_from_args", side_effect=OSError("disk")):
+        assert _main(["list-devices", "--db", str(tmp_path / "managed.db")]) == 5
+    assert capsys.readouterr().err.strip() == "registry unavailable"
+
+
+def test_phase2_cli_disconnects_and_revokes_existing_device(
+    managed_registry, certificate_authority, csr_pem, capsys
+):
+    agent_id = "00000000-0000-4000-8000-000000000001"
+    token = managed_registry.issue_token(60)
+    certificate = certificate_authority.sign_device_csr(csr_pem, agent_id)
+    managed_registry.consume_token_and_enroll(
+        token,
+        certificate,
+        "operator-device",
+        "2.0",
+        "test",
+        "cli-fixture",
+        agent_id=agent_id,
+    )
+    database = str(managed_registry.path)
+
+    assert (
+        _main(
+            [
+                "disconnect",
+                "--db",
+                database,
+                "--agent-id",
+                agent_id,
+                "--actor",
+                "operator-test",
+            ]
+        )
+        == 0
+    )
+    assert "already offline" in capsys.readouterr().out.lower()
+    assert (
+        _main(
+            [
+                "revoke",
+                "--db",
+                database,
+                "--agent-id",
+                agent_id,
+                "--actor",
+                "operator-test",
+                "--reason",
+                "retired",
+            ]
+        )
+        == 0
+    )
+    assert "revoked" in capsys.readouterr().out.lower()
+    assert _main(["list-audit", "--db", database]) == 0
+    output = capsys.readouterr().out
+    assert json.loads(output)
+    assert "BEGIN CERTIFICATE" not in output
+    assert "token_digest" not in output
+
+
+def test_startup_backs_up_phase1_files_before_database_creation(tmp_path):
+    import C2.C2 as controller
+
+    store = tmp_path / "managed-store"
+    store.mkdir()
+    (store / "devices.bin").write_bytes(b"legacy")
+    calls = []
+    registry = MagicMock()
+    registry.initialize.side_effect = lambda: calls.append("registry.initialize")
+    authority = MagicMock()
+    authority._load_ca.side_effect = lambda: calls.append("authority.load")
+    sessions = MagicMock()
+    queries = MagicMock()
+    actions = MagicMock()
+
+    with (
+        patch.object(controller, "MANAGED_HOST", "10.8.0.1"),
+        patch.object(controller, "MANAGED_DB", str(tmp_path / "managed.db"), create=True),
+        patch.object(controller, "MANAGED_STORE", str(store)),
+        patch.object(controller, "MANAGED_CA_CERT", str(tmp_path / "ca.crt"), create=True),
+        patch.object(controller, "MANAGED_CA_KEY", str(tmp_path / "ca.key"), create=True),
+        patch.object(controller, "MANAGED_TLS_CERT", str(tmp_path / "server.crt")),
+        patch.object(controller, "MANAGED_TLS_KEY", str(tmp_path / "server.key")),
+        patch.object(controller, "validate_managed_bind", side_effect=lambda host: calls.append("validate_managed_bind") or host, create=True),
+        patch.object(controller, "backup_phase1_stores", side_effect=lambda *_: calls.append("backup_phase1_stores"), create=True),
+        patch.object(controller, "ManagedRegistry", return_value=registry, create=True),
+        patch.object(controller, "ControllerCertificateAuthority", return_value=authority, create=True),
+        patch.object(controller, "SessionManager", side_effect=lambda *_: calls.append("sessions") or sessions, create=True),
+        patch.object(controller, "DeviceQueryService", side_effect=lambda *_: calls.append("queries") or queries, create=True),
+        patch.object(controller, "DeviceActionService", side_effect=lambda *_: calls.append("actions") or actions, create=True),
+        patch.object(controller, "ManagedDashboardData", side_effect=lambda *_: calls.append("dashboard_data") or MagicMock(), create=True),
+        patch.object(controller, "ManagedServer", side_effect=lambda *_: calls.append("managed_server") or MagicMock()),
+        patch.object(controller, "EnrollmentServer", side_effect=lambda *_: calls.append("enrollment_server") or MagicMock()),
+        patch.object(controller, "EnrollmentService", side_effect=lambda *_: calls.append("enrollment_service") or MagicMock()),
+    ):
+        controller._build_managed_runtime()
+
+    assert calls == [
+        "validate_managed_bind",
+        "backup_phase1_stores",
+        "registry.initialize",
+        "authority.load",
+        "sessions",
+        "queries",
+        "actions",
+        "managed_server",
+        "enrollment_service",
+        "enrollment_server",
+        "dashboard_data",
+    ]
+
+
+def test_token_file_rejects_utf8_bom():
+    from client.managed_agent import _read_token_file
+
+    with patch("client.managed_agent._read_private_file", return_value=b"\xef\xbb\xbftoken"):
+        with patch("pathlib.Path.unlink"):
+            with pytest.raises(ValueError, match="without BOM"):
+                _read_token_file("C:/private/token.txt")
 
 
 def test_cross_process_token_issues_do_not_lose_updates(tmp_path):
@@ -1171,8 +1357,9 @@ def test_controller_keeps_managed_services_disabled_without_certificates(capsys)
 
     legacy_socket = MagicMock()
     with (
-        patch.object(controller, "MANAGED_TLS_CERT", ""),
-        patch.object(controller, "MANAGED_TLS_KEY", ""),
+        patch.object(controller, "managed_phase2_enabled", return_value=False),
+        patch.object(controller, "managed_phase2_configured", return_value=False),
+        patch.object(controller, "_build_managed_runtime") as build,
         patch.object(controller.socket, "socket", return_value=legacy_socket),
         patch.object(controller.threading, "Thread") as thread_type,
         patch.object(controller.time, "sleep"),
@@ -1181,11 +1368,35 @@ def test_controller_keeps_managed_services_disabled_without_certificates(capsys)
         controller.main()
 
     assert capsys.readouterr().out.count("Managed services disabled") == 1
+    build.assert_not_called()
     legacy_socket.bind.assert_called_once_with((controller.HOST, controller.PORT))
     assert thread_type.called
 
 
-def test_managed_bind_host_defaults_to_loopback_and_rejects_non_loopback():
+def test_partial_phase2_configuration_starts_neither_listener(capsys):
+    import C2.C2 as controller
+
+    with (
+        patch.object(controller, "managed_phase2_enabled", return_value=False),
+        patch.object(controller, "managed_phase2_configured", return_value=True),
+        patch.object(controller, "_build_managed_runtime") as build,
+        patch.object(controller, "_start_managed_runtime") as start,
+        patch.object(controller.socket, "socket", return_value=MagicMock()),
+        patch.object(controller.threading, "Thread"),
+        patch.object(controller.time, "sleep"),
+        patch.object(controller._console, "prompt", return_value="quit"),
+    ):
+        controller.main()
+
+    output = capsys.readouterr().out
+    assert output.count(
+        "[!] Managed Phase 2 configuration incomplete; managed listeners not started"
+    ) == 1
+    build.assert_not_called()
+    start.assert_not_called()
+
+
+def test_managed_bind_is_deferred_to_exact_private_address_validation():
     environment = os.environ.copy()
     environment.pop("PHANTOMLINK_MANAGED_HOST", None)
     default = subprocess.run(
@@ -1196,127 +1407,84 @@ def test_managed_bind_host_defaults_to_loopback_and_rejects_non_loopback():
         check=False,
     )
     assert default.returncode == 0
-    assert default.stdout.strip() == "127.0.0.1"
-    environment["PHANTOMLINK_MANAGED_HOST"] = "0.0.0.0"
-    invalid = subprocess.run(
-        [sys.executable, "-c", "import config"],
+    assert default.stdout.strip() == ""
+    environment["PHANTOMLINK_MANAGED_HOST"] = "10.8.0.1"
+    private = subprocess.run(
+        [sys.executable, "-c", "import config; print(config.MANAGED_HOST)"],
         env=environment,
         capture_output=True,
         text=True,
         check=False,
     )
-    assert invalid.returncode != 0
-    assert "must be a loopback IP address" in invalid.stderr
+    assert private.returncode == 0
+    assert private.stdout.strip() == "10.8.0.1"
 
 
-def test_controller_starts_and_cleans_up_managed_services(tls_material, tmp_path):
+def test_controller_starts_dashboard_with_managed_data_and_cleans_up():
     import C2.C2 as controller
 
-    cert, key = tls_material
     legacy_socket = MagicMock()
-    managed = MagicMock()
-    enrollment = MagicMock()
-    bind_hosts = []
+    runtime = MagicMock()
+    runtime.dashboard_data = object()
+    order = []
     with (
-        patch.object(controller, "MANAGED_TLS_CERT", str(cert)),
-        patch.object(controller, "MANAGED_TLS_KEY", str(key)),
-        patch.object(controller, "MANAGED_STORE", str(tmp_path / "store")),
+        patch.object(controller, "managed_phase2_enabled", return_value=True),
+        patch.object(controller, "_build_managed_runtime", return_value=runtime),
         patch.object(
             controller,
-            "ManagedServer",
-            side_effect=lambda host, *_a: (bind_hosts.append(host), managed)[1],
-        ),
-        patch.object(
-            controller,
-            "EnrollmentServer",
-            side_effect=lambda host, *_a: (bind_hosts.append(host), enrollment)[1],
-        ),
-        patch.object(controller, "EnrollmentStore"),
-        patch.object(controller, "DeviceRegistry"),
-        patch.object(controller, "EnrollmentService"),
+            "_start_managed_runtime",
+            side_effect=lambda *_: order.append("listeners"),
+        ) as start,
+        patch.object(controller, "_stop_managed_runtime", return_value=[]) as stop,
         patch.object(controller.socket, "socket", return_value=legacy_socket),
-        patch.object(controller.threading, "Thread"),
+        patch.object(controller.threading, "Thread") as thread_type,
         patch.object(controller.time, "sleep"),
         patch.object(controller._console, "prompt", return_value="quit"),
     ):
+        thread_type.return_value.start.side_effect = lambda: order.append("thread")
         controller.main()
 
-    managed.stop.assert_called_once_with(timeout=5)
-    enrollment.shutdown.assert_called_once_with()
-    enrollment.server_close.assert_called_once_with()
-    assert bind_hosts == [controller.MANAGED_HOST, controller.MANAGED_HOST]
+    start.assert_called_once_with(runtime)
+    stop.assert_called_once_with(runtime)
+    dashboard_call = thread_type.call_args_list[0]
+    assert dashboard_call.kwargs["target"] is controller.start_dashboard
+    assert dashboard_call.kwargs["args"][4] is runtime.dashboard_data
+    assert order[:2] == ["thread", "listeners"]
     legacy_socket.close.assert_called_once_with()
 
 
-def test_controller_rolls_back_after_enrollment_thread_started(tls_material, tmp_path):
-    import builtins
-
+def test_managed_runtime_shutdown_is_reverse_and_bounded():
     import C2.C2 as controller
 
-    class TrackingThread:
-        def __init__(self, *, target=None, args=(), name=None, daemon=None):
-            self.target = target
-            self.args = args
-            self.name = name
-            self.daemon = daemon
-            self.ident = None
-            self.joined = False
-            tracked.append(self)
-
-        def start(self):
-            self.ident = id(self)
-
-        def is_alive(self):
-            return self.ident is not None and not self.joined
-
-        def join(self, timeout=None):
-            self.joined = True
-
-    cert, key = tls_material
-    tracked = []
+    calls = []
     managed = MagicMock()
+    managed.stop.side_effect = lambda timeout: calls.append(("managed.stop", timeout))
     enrollment = MagicMock()
-    managed_owned_thread = TrackingThread(name="managed-listener", daemon=False)
+    enrollment.shutdown.side_effect = lambda: calls.append(("enrollment.shutdown",))
+    enrollment.server_close.side_effect = lambda: calls.append(("enrollment.close",))
+    enrollment_thread = MagicMock(ident=1, name="enrollment-listener")
+    managed_thread = MagicMock(ident=2, name="managed-listener")
+    enrollment_thread.join.side_effect = lambda timeout: calls.append(
+        ("enrollment.join", timeout)
+    )
+    managed_thread.join.side_effect = lambda timeout: calls.append(
+        ("managed.join", timeout)
+    )
+    runtime = MagicMock(
+        enrollment_server=enrollment,
+        managed_server=managed,
+        enrollment_thread=enrollment_thread,
+        managed_thread=managed_thread,
+        stop_event=threading.Event(),
+    )
 
-    def managed_start(_stop_event):
-        managed_owned_thread.start()
-        return managed_owned_thread
+    assert controller._stop_managed_runtime(runtime) == []
 
-    managed.start.side_effect = managed_start
-    real_print = builtins.print
-    raised = False
-
-    def fail_after_start(*args, **kwargs):
-        nonlocal raised
-        if args and str(args[0]).startswith("[+] Managed TLS") and not raised:
-            raised = True
-            raise RuntimeError("post-start failure")
-        return real_print(*args, **kwargs)
-
-    with (
-        patch.object(controller, "MANAGED_TLS_CERT", str(cert)),
-        patch.object(controller, "MANAGED_TLS_KEY", str(key)),
-        patch.object(controller, "MANAGED_STORE", str(tmp_path / "store")),
-        patch.object(controller, "ManagedServer", return_value=managed),
-        patch.object(controller, "EnrollmentServer", return_value=enrollment),
-        patch.object(controller, "EnrollmentStore"),
-        patch.object(controller, "DeviceRegistry"),
-        patch.object(controller, "EnrollmentService"),
-        patch.object(controller.socket, "socket", return_value=MagicMock()),
-        patch.object(controller.threading, "Thread", TrackingThread),
-        patch.object(controller.time, "sleep"),
-        patch.object(controller._console, "prompt", return_value="quit"),
-        patch("builtins.print", side_effect=fail_after_start),
-    ):
-        controller.main()
-
-    enrollment.shutdown.assert_called_once_with()
-    enrollment.server_close.assert_called_once_with()
-    managed.stop.assert_called_once_with(timeout=5)
-    managed_threads = [
-        thread
-        for thread in tracked
-        if thread.name in {"managed-listener", "enrollment-listener"}
+    assert calls == [
+        ("enrollment.shutdown",),
+        ("enrollment.close",),
+        ("managed.stop", 5),
+        ("enrollment.join", 5),
+        ("managed.join", 5),
     ]
-    assert len(managed_threads) == 2
-    assert all(thread.joined for thread in managed_threads)
+    assert runtime.stop_event.is_set()

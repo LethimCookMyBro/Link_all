@@ -9,7 +9,7 @@ import time
 
 import pytest
 
-from C2.dashboard import DashboardData, build_app
+from C2.dashboard import DashboardData, build_app, start_dashboard
 
 
 def make_health(latency=0.0, quality="good", total=0):
@@ -135,6 +135,26 @@ class TestDashboardData:
 
 
 class TestDashboardApp:
+    def test_start_dashboard_receives_managed_data_and_stop_event(self):
+        from unittest.mock import MagicMock, patch
+
+        managed_data = object()
+        stop_event = threading.Event()
+        app = MagicMock()
+        with (
+            patch("sys.stdin.isatty", return_value=True),
+            patch("C2.dashboard.build_app", return_value=app) as build,
+        ):
+            start_dashboard(
+                MagicMock(),
+                managed_data=managed_data,
+                stop_event=stop_event,
+            )
+
+        assert build.call_args.kwargs["managed_data"] is managed_data
+        assert build.call_args.kwargs["stop_event"] is stop_event
+        app.run.assert_called_once_with()
+
     def test_late_refresh_after_teardown_is_contained(self):
         import asyncio
 
