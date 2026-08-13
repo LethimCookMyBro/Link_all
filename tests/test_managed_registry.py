@@ -2,6 +2,7 @@ import hashlib
 import json
 import sqlite3
 import threading
+from contextlib import contextmanager
 from dataclasses import FrozenInstanceError, fields
 from datetime import datetime, timedelta, timezone
 
@@ -19,6 +20,22 @@ from C2.managed_registry import (
 )
 
 FIXED_NOW = datetime(2026, 8, 13, 6, 0, tzinfo=timezone.utc)
+
+
+def trace_connections(registry, monkeypatch):
+    original = registry._connection
+    traces = []
+
+    @contextmanager
+    def traced():
+        with original() as connection:
+            statements = []
+            connection.set_trace_callback(statements.append)
+            traces.append(statements)
+            yield connection
+
+    monkeypatch.setattr(registry, "_connection", traced)
+    return traces
 
 
 @pytest.fixture
@@ -91,6 +108,11 @@ def test_initialize_rejects_a_newer_schema(tmp_path):
 
     with pytest.raises(SchemaVersionRejected, match="newer than supported"):
         ManagedRegistry(path, now=lambda: FIXED_NOW).initialize()
+
+
+def test_busy_timeout_is_bounded_to_five_seconds(tmp_path):
+    with pytest.raises(ValueError, match="5000"):
+        ManagedRegistry(tmp_path / "managed.db", busy_timeout_ms=5001)
 
 
 def test_token_is_atomic_single_use_across_registry_instances(
@@ -190,6 +212,37 @@ def test_enrollment_persists_public_metadata_and_audit(registry, issued_certific
     )
 
 
+def test_enrollment_and_renewal_each_use_one_connection(
+    registry, issued_certificate, monkeypatch
+):
+    token = registry.issue_token()
+    traces = trace_connections(registry, monkeypatch)
+
+    enrolled = registry.consume_token_and_enroll(
+        token, issued_certificate, "pc", "2.0", "enrollment", "corr-enroll"
+    )
+    assert len(traces) == 1
+    assert any(statement == "COMMIT" for statement in traces[0])
+
+    traces.clear()
+    renewed_certificate = IssuedDeviceCertificate(
+        b"renewed-public-certificate",
+        "DD:EE:FF",
+        "1002",
+        "2028-08-13T06:00:00Z",
+    )
+    renewed = registry.renew_certificate(
+        enrolled.agent_id,
+        enrolled.certificate_fingerprint,
+        renewed_certificate,
+        "renewal",
+        "corr-renew",
+    )
+    assert len(traces) == 1
+    assert any(statement == "COMMIT" for statement in traces[0])
+    assert renewed.certificate_fingerprint == "DD:EE:FF"
+
+
 @pytest.mark.parametrize(
     "forbidden", ["token", "private_key", "certificate_bundle", "dpapi_blob", "secret"]
 )
@@ -232,6 +285,96 @@ def test_audit_details_are_canonical_bounded_and_display_safe(registry):
             correlation_id="corr-3",
             details={"session_id": "x" * 4096},
         )
+
+
+def test_audit_detail_strings_reject_terminal_control_sequences(registry):
+    with pytest.raises(ValueError, match="display-safe"):
+        registry.append_audit(
+            actor="test",
+            action="AUTH",
+            target_agent_id=None,
+            result="FAILED",
+            reason=None,
+            correlation_id="corr-control",
+            details={"peer_ip": "\x1b[31mred"},
+        )
+
+
+def test_audit_decode_rejects_persisted_terminal_control_sequences(registry):
+    with registry._connection() as connection:
+        connection.execute(
+            """
+            INSERT INTO audit_events(
+                occurred_at, actor, action, target_agent_id, result, reason,
+                correlation_id, details_json
+            ) VALUES (?, ?, ?, NULL, ?, NULL, ?, ?)
+            """,
+            (
+                "2026-08-13T06:00:00.000000Z",
+                "test",
+                "AUTH",
+                "FAILED",
+                "corr-control",
+                '{"peer_ip":"\\u001b[31mred"}',
+            ),
+        )
+
+    with pytest.raises(ValueError, match="display-safe"):
+        registry.list_audit_events()
+
+
+def test_simple_writes_use_explicit_transactions(registry, issued_certificate, monkeypatch):
+    device = registry.consume_token_and_enroll(
+        registry.issue_token(),
+        issued_certificate,
+        "pc",
+        "2.0",
+        "enrollment",
+        "corr-enroll",
+    )
+    traces = trace_connections(registry, monkeypatch)
+
+    registry.issue_token()
+    registry.append_audit(
+        actor="test",
+        action="AUTH",
+        target_agent_id=device.agent_id,
+        result="SUCCEEDED",
+        reason=None,
+        correlation_id="corr-audit",
+        details={},
+    )
+    registry.touch_last_seen(device.agent_id, "10.0.0.8")
+
+    assert len(traces) == 3
+    assert all("BEGIN IMMEDIATE" in statements for statements in traces)
+    assert all("COMMIT" in statements for statements in traces)
+
+
+def test_simple_write_rolls_back_on_failure(registry, monkeypatch):
+    with registry._connection() as connection:
+        connection.execute(
+            """
+            CREATE TRIGGER reject_audit BEFORE INSERT ON audit_events
+            BEGIN SELECT RAISE(ABORT, 'reject audit'); END
+            """
+        )
+    traces = trace_connections(registry, monkeypatch)
+
+    with pytest.raises(sqlite3.IntegrityError, match="reject audit"):
+        registry.append_audit(
+            actor="test",
+            action="AUTH",
+            target_agent_id=None,
+            result="FAILED",
+            reason=None,
+            correlation_id="corr-rollback",
+            details={},
+        )
+
+    assert len(traces) == 1
+    assert "BEGIN IMMEDIATE" in traces[0]
+    assert "ROLLBACK" in traces[0]
 
 
 def test_certificate_renewal_replaces_identity_and_preserves_agent(

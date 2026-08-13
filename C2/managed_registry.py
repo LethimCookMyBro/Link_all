@@ -140,8 +140,12 @@ class ManagedRegistry:
         now: Callable[[], datetime] = utc_now,
         busy_timeout_ms: int = 5000,
     ) -> None:
-        if type(busy_timeout_ms) is not int or busy_timeout_ms <= 0:
-            raise ValueError("busy_timeout_ms must be positive")
+        if (
+            type(busy_timeout_ms) is not int
+            or busy_timeout_ms <= 0
+            or busy_timeout_ms > 5000
+        ):
+            raise ValueError("busy_timeout_ms must be from 1 through 5000")
         self.path = Path(path)
         self.now = now
         self.busy_timeout_ms = busy_timeout_ms
@@ -260,7 +264,7 @@ class ManagedRegistry:
         while True:
             token = secrets.token_urlsafe(32)
             try:
-                with self._connection() as connection:
+                with self._connection() as connection, _write_transaction(connection):
                     connection.execute(
                         "INSERT INTO enrollment_tokens VALUES (?, ?, ?, NULL)",
                         (_token_digest(token), created_at, expires_at),
@@ -344,6 +348,11 @@ class ManagedRegistry:
                     "UPDATE enrollment_tokens SET consumed_at = ? WHERE token_digest = ?",
                     (occurred_at, digest),
                 )
+                detail = _device_from_row(
+                    connection.execute(
+                        "SELECT * FROM devices WHERE agent_id = ?", (agent_id,)
+                    ).fetchone()
+                )
                 connection.execute("COMMIT")
             except sqlite3.IntegrityError as exc:
                 connection.execute("ROLLBACK")
@@ -353,7 +362,7 @@ class ManagedRegistry:
             except Exception:
                 connection.execute("ROLLBACK")
                 raise
-        return self.get_device(agent_id)  # type: ignore[return-value]
+        return detail
 
     def renew_certificate(
         self,
@@ -414,6 +423,11 @@ class ManagedRegistry:
                     """,
                     (occurred_at, actor, agent_id, correlation_id, details_json),
                 )
+                detail = _device_from_row(
+                    connection.execute(
+                        "SELECT * FROM devices WHERE agent_id = ?", (agent_id,)
+                    ).fetchone()
+                )
                 connection.execute("COMMIT")
             except sqlite3.IntegrityError as exc:
                 connection.execute("ROLLBACK")
@@ -423,7 +437,7 @@ class ManagedRegistry:
             except Exception:
                 connection.execute("ROLLBACK")
                 raise
-        return self.get_device(agent_id)  # type: ignore[return-value]
+        return detail
 
     def get_device(self, agent_id: str) -> DeviceDetail | None:
         with self._connection() as connection:
@@ -469,7 +483,7 @@ class ManagedRegistry:
         correlation_id = _require_text("correlation_id", correlation_id, 128)
         occurred_at = _format_time(self.now())
         details_json = _audit_json(details)
-        with self._connection() as connection:
+        with self._connection() as connection, _write_transaction(connection):
             cursor = connection.execute(
                 """
                 INSERT INTO audit_events(
@@ -549,7 +563,7 @@ class ManagedRegistry:
         agent_id = _require_text("agent_id", agent_id, 128)
         vpn_ip = _require_text("vpn_ip", vpn_ip, 128)
         timestamp = _format_time(self.now() if occurred_at is None else occurred_at)
-        with self._connection() as connection:
+        with self._connection() as connection, _write_transaction(connection):
             connection.execute(
                 """
                 UPDATE devices SET last_vpn_ip = ?, last_seen_at = ?
@@ -630,7 +644,21 @@ def _validate_certificate(certificate: IssuedDeviceCertificate) -> None:
     _parse_time(certificate.certificate_not_after)
 
 
-def _audit_json(details: Mapping[str, str | int | float | bool | None]) -> str:
+@contextmanager
+def _write_transaction(connection: sqlite3.Connection) -> Iterator[None]:
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        yield
+        connection.execute("COMMIT")
+    except Exception:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+
+
+def _validated_audit_details(
+    details: Mapping[str, str | int | float | bool | None],
+) -> dict[str, str | int | float | bool | None]:
     if not isinstance(details, Mapping):
         raise TypeError("audit details must be a mapping")
     if any(type(key) is not str or key not in AUDIT_DETAIL_KEYS for key in details):
@@ -640,8 +668,17 @@ def _audit_json(details: Mapping[str, str | int | float | bool | None]) -> str:
             isinstance(value, float) and not math.isfinite(value)
         ):
             raise ValueError("audit detail values must be scalar")
+        if isinstance(value, str) and not value.isprintable():
+            raise ValueError("audit detail strings must be display-safe")
+    return dict(details)
+
+
+def _audit_json(details: Mapping[str, str | int | float | bool | None]) -> str:
     payload = json.dumps(
-        dict(details), sort_keys=True, separators=(",", ":"), allow_nan=False
+        _validated_audit_details(details),
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
     )
     if len(payload.encode("utf-8")) > AUDIT_DETAIL_LIMIT:
         raise ValueError("audit details too large")
@@ -658,7 +695,8 @@ def _display_details(payload: str) -> tuple[tuple[str, str], ...]:
             return "false"
         return str(value)
 
-    return tuple((key, display(value)) for key, value in json.loads(payload).items())
+    details = _validated_audit_details(json.loads(payload))
+    return tuple((key, display(value)) for key, value in details.items())
 
 
 def _device_from_row(row: sqlite3.Row) -> DeviceDetail:
