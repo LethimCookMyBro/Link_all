@@ -137,7 +137,7 @@ No token or credential value is present in this record, config, or log. The smok
 
 Path: `debug-artifacts/managed-agent.patch`
 
-SHA-256: `52fb0202daffb458dcedeb937e40cd5104042a781600ee30acbfc1ecc2693ed5`
+SHA-256: `6feb2bd7af0afbf86d8fe7d1cee968d0be4d361de74d5e6f4a2cee6cb02596da`
 
 ```powershell
 $base = (Get-Content debug-artifacts/managed-agent-preflight/feature-base.txt -Raw).Trim()
@@ -154,7 +154,7 @@ Literal output and exit status:
 
 ```text
 PATCH_CHECK_EXIT=0
-PATCH_BYTES=206205
+PATCH_BYTES=225521
 ```
 
 The non-empty patch applied with `git apply --check` in a clean detached worktree at the baseline commit.
@@ -339,3 +339,101 @@ No unhandled thread exception warning appeared.
 - `scripts/rollback-managed-agent.ps1`
 - `debug-artifacts/managed-agent.patch`
 - `debug-artifacts/managed-agent-verification.md`
+
+## Final whole-branch fix wave
+
+Implementation commits before artifact finalization: `1b32aa3e785907e6a6806f407d11451aed1ef92c` and `ebc0708d424cbce3ce00f2fd1cdd9e0f45f1c6a2`.
+
+### Deterministic RED evidence
+
+The independent review reproduced five failures before this wave:
+
+- managed/enrollment constructors received legacy `HOST` (`0.0.0.0`) even when the runbook set `PHANTOMLINK_HOST`;
+- independent store instances/processes could perform stale read-modify-write and lose token updates or resurrect TOKEN_A;
+- unauthenticated connections created one non-daemon worker each without admission limit;
+- reverse rollback removed `client/transport.py` but the patch omitted dependent `client/PhantomLink.py`, breaking its import;
+- `KeyboardInterrupt` propagated from `AgentRuntime.run()` rather than requesting stop and returning exit 0.
+
+New deterministic regressions exercise loopback-only managed host validation and constructor arguments, six spawned processes issuing 30 tokens without loss, concurrent TOKEN_A consume/issue without replay, managed and enrollment caps with eight stalled unauthenticated sockets, bounded shutdown/no live owners, and Ctrl+C stop plus logging flush.
+
+### Targeted command and literal output
+
+`powershell
+1..3 | ForEach-Object {
+  G:\for_hack_all\Link_all - Copy\.venv\Scripts\python.exe -m pytest tests/test_managed_auth.py tests/test_agent_config.py -q --maxfail=1
+  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+}
+`
+
+`	ext
+TARGET_RUN=1: 108 passed in 10.31s; exit 0
+TARGET_RUN=2: 108 passed in 9.82s; exit 0
+TARGET_RUN=3: 108 passed in 10.45s; exit 0
+`
+
+### Repeated integration, compile, focused and full gates
+
+`powershell
+1..3 | ForEach-Object {
+  G:\for_hack_all\Link_all - Copy\.venv\Scripts\python.exe -m pytest tests/test_agent_runtime_integration.py -q --maxfail=1
+  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+}
+G:\for_hack_all\Link_all - Copy\.venv\Scripts\python.exe -m compileall -q client C2
+G:\for_hack_all\Link_all - Copy\.venv\Scripts\python.exe -m pytest tests/test_client_transport.py tests/test_agent_config.py tests/test_managed_auth.py tests/test_agent_runtime.py tests/test_agent_logging.py tests/test_agent_runtime_integration.py -q
+G:\for_hack_all\Link_all - Copy\.venv\Scripts\python.exe -m pytest -q
+`
+
+`	ext
+INTEGRATION_RUN=1: 15 passed in 12.74s; exit 0
+INTEGRATION_RUN=2: 15 passed in 11.50s; exit 0
+INTEGRATION_RUN=3: 15 passed in 13.02s; exit 0
+COMPILE_EXIT=0
+210 passed in 24.16s
+FOCUSED_EXIT=0
+409 passed, 2 warnings in 105.22s (0:01:45)
+FULL_EXIT=0
+`
+
+No unhandled thread exception warning appeared.
+
+### Dependency-complete patch and rollback
+
+Patch command includes the complete branch delta needed by the managed feature, including `client/PhantomLink.py`, while excluding the patch/verification/runbook/rollback/integration artifacts themselves.
+
+`powershell
+$base=(Get-Content debug-artifacts\managed-agent-preflight\feature-base.txt -Raw).Trim()
+cmd /d /c "git diff $base..HEAD -- . :(exclude)debug-artifacts/managed-agent.patch :(exclude)debug-artifacts/managed-agent-verification.md :(exclude)docs/runbooks/managed-agent-phase1.md :(exclude)scripts/rollback-managed-agent.ps1 :(exclude)tests/test_agent_runtime_integration.py > debug-artifacts\managed-agent.patch"
+`
+
+`	ext
+PATCH_CHECK_EXIT=0
+PATCH_BYTES=225521
+PATCH_SHA256=6feb2bd7af0afbf86d8fe7d1cee968d0be4d361de74d5e6f4a2cee6cb02596da
+PHANTOMLINK_PATH_INCLUDED=True
+`
+
+Exact rollback script execution in a detached disposable worktree:
+
+`	ext
+23 passed in 0.08s
+6 passed in 0.77s
+ROLLBACK_EXIT=0
+TRANSPORT_EXISTS=False
+PHANTOM_IMPORT_PATCH_REVERSED=True
+`
+
+The script successfully imported `client.PhantomLink` after reverse application before running the legacy protocol and listener suites separately.
+
+### Defender and dependency validation
+
+`	ext
+client/transport.py DEFENDER_EXIT=0
+client/agent_config.py DEFENDER_EXIT=0
+client/agent_runtime.py DEFENDER_EXIT=0
+client/agent_logging.py DEFENDER_EXIT=0
+client/managed_agent.py DEFENDER_EXIT=0
+C2/managed_auth.py DEFENDER_EXIT=0
+PIP_CHECK_EXIT=0
+`
+
+Every managed source reported no threats; all 51 installed packages were compatible. No token or credential values were logged or added to artifacts.
