@@ -35,7 +35,7 @@ from C2.managed_registry import (
     _token_digest,
     utc_now,
 )
-from C2.managed_services import DeviceActionService, ManagedServer, SessionManager
+from C2.managed_services import ManagedServer
 from client import transport
 from client.agent_config import (
     DeviceCredential,
@@ -979,6 +979,11 @@ class EnrollmentServer:
         self._server.close_connections()
         self._server.shutdown()
 
+    def stop_accepting(self) -> None:
+        self._server.begin_shutdown()
+        self._server.close_connections()
+        self._server.server_close()
+
     def server_close(self) -> None:
         self._server.server_close()
 
@@ -1076,6 +1081,22 @@ def _action_exit(result, success_codes) -> int:
     return 5
 
 
+def _valid_revoke_arguments(args) -> bool:
+    try:
+        valid_agent_id = str(UUID(args.agent_id)) == args.agent_id
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return (
+        valid_agent_id
+        and type(args.actor) is str
+        and 1 <= len(args.actor) <= 128
+        and args.actor.isprintable()
+        and type(args.reason) is str
+        and 1 <= len(args.reason) <= 512
+        and args.reason.isprintable()
+    )
+
+
 def _main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="python -m C2.managed_auth")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -1091,11 +1112,6 @@ def _main(argv=None) -> int:
     audit = commands.add_parser("list-audit")
     _add_database_arguments(audit)
     audit.add_argument("--limit", type=int, default=100)
-    disconnect = commands.add_parser("disconnect")
-    _add_database_arguments(disconnect)
-    disconnect.add_argument("--agent-id", required=True)
-    disconnect.add_argument("--actor", required=True)
-    disconnect.add_argument("--reason", default="")
     revoke = commands.add_parser("revoke")
     _add_database_arguments(revoke)
     revoke.add_argument("--agent-id", required=True)
@@ -1132,6 +1148,8 @@ def _main(argv=None) -> int:
         return 2
     if args.command == "list-audit" and not 1 <= args.limit <= 1000:
         return 2
+    if args.command == "revoke" and not _valid_revoke_arguments(args):
+        return 2
     try:
         registry = _registry_from_args(args)
     except Exception:
@@ -1162,15 +1180,16 @@ def _main(argv=None) -> int:
             print("registry unavailable", file=sys.stderr)
             return 5
         return 0
-    actions = DeviceActionService(registry, SessionManager(registry))
     try:
-        if args.command == "disconnect":
-            result = actions.disconnect(args.agent_id, args.actor, args.reason)
-            return _action_exit(result, {"DISCONNECTED", "ALREADY_OFFLINE"})
-        result = actions.revoke(args.agent_id, args.actor, args.reason)
+        result = registry.revoke_device(
+            args.agent_id, args.actor, args.reason, str(uuid4())
+        )
         return _action_exit(result, {"REVOKED", "ALREADY_REVOKED"})
     except ValueError:
         return 2
+    except Exception:
+        print("failed", file=sys.stderr)
+        return 5
 
 
 if __name__ == "__main__":

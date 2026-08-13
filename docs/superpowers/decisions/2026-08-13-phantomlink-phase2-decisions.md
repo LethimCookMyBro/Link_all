@@ -15,6 +15,7 @@
 8. Decisions that change scope, trust boundaries, schemas, contracts, or operational limits are appended here with the date and affected design section. Routine implementation progress belongs in commits and verification records rather than this decision log.
 9. Direct Empire code reuse requires a provenance note and preservation of BSD-3-Clause notices. Phase 2 has no runtime dependency on Empire.
 10. The Phase 2 SQLite registry starts with public device metadata only. Existing Phase 1 `tokens.json` and `devices.bin` stores are preserved by verified byte-for-byte backup and are neither imported nor deleted; their legacy readers remain retained until the Task 8 production-import proof.
+11. On 2026-08-13, the operator disconnect surface was resolved to Dashboard `D` backed by the controller's in-process `DeviceActionService`. There is no separate-process `managed_auth disconnect` command, IPC channel, or control API because a separate CLI process cannot own or close controller session sockets. `managed_auth revoke` remains a durable administrative operation: an already-connected session is rejected and closed on its next durable heartbeat authorization check, while Dashboard `R` performs the durable revoke and immediately closes the in-process live session.
 
 ## Known ceilings accepted for Phase 2
 

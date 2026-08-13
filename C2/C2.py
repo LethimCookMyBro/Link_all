@@ -1004,18 +1004,22 @@ def _stop_managed_runtime(runtime: _ManagedRuntime) -> list[str]:
     errors = []
     if runtime.enrollment_server is not None:
         try:
-            if (
-                runtime.enrollment_thread is not None
-                and runtime.enrollment_thread.ident is not None
-            ):
-                runtime.enrollment_server.shutdown()
+            runtime.enrollment_server.stop_accepting()
         except Exception as error:
-            errors.append(f"enrollment shutdown: {error}")
-        finally:
-            try:
-                runtime.enrollment_server.server_close()
-            except Exception as error:
-                errors.append(f"enrollment close: {error}")
+            errors.append(f"enrollment stop accepting: {error}")
+        if (
+            runtime.enrollment_thread is not None
+            and runtime.enrollment_thread.ident is not None
+        ):
+            shutdown_thread = threading.Thread(
+                target=runtime.enrollment_server.shutdown,
+                name="enrollment-shutdown",
+                daemon=True,
+            )
+            shutdown_thread.start()
+            shutdown_thread.join(timeout=5)
+            if shutdown_thread.is_alive():
+                errors.append("enrollment shutdown timed out")
     runtime.stop_event.set()
     try:
         runtime.managed_server.stop(timeout=5)
@@ -1068,25 +1072,7 @@ def main():
     else:
         print("Managed services disabled")
 
-    try:
-        dashboard_thread = threading.Thread(
-            target=start_dashboard,
-            args=(
-                client_manager,
-                7000,
-                2.0,
-                "PhantomLink C2 - Live Dashboard",
-                managed_runtime.dashboard_data if managed_runtime is not None else None,
-                dashboard_stop_event,
-            ),
-            daemon=True
-        )
-        dashboard_thread.start()
-        time.sleep(2)
-    except Exception as e:
-        print(f"[!] Dashboard error: {e}")
-        print("[*] Continuing without dashboard...")
-
+    managed_start_failed = False
     if managed_runtime is not None:
         try:
             _start_managed_runtime(managed_runtime)
@@ -1095,9 +1081,29 @@ def main():
                 f"enrollment HTTPS on {MANAGED_HOST}:{ENROLLMENT_PORT}"
             )
         except Exception:
+            managed_start_failed = True
             for cleanup_error in cleanup_managed_services():
                 print(f"[!] Managed services cleanup error: {cleanup_error}")
             print("[!] Managed Phase 2 startup failed; managed listeners not started")
+
+    if not managed_start_failed:
+        try:
+            dashboard_thread = threading.Thread(
+                target=start_dashboard,
+                args=(
+                    client_manager,
+                    7000,
+                    2.0,
+                    "PhantomLink C2 - Live Dashboard",
+                    managed_runtime.dashboard_data if managed_runtime is not None else None,
+                    dashboard_stop_event,
+                ),
+                daemon=True,
+            )
+            dashboard_thread.start()
+            time.sleep(2)
+        except Exception:
+            print("[!] Dashboard failed to start; managed services remain active")
 
     # Start API server
     try:

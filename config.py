@@ -35,8 +35,23 @@ DISCORD_BOT_TOKEN = os.getenv("PHANTOMLINK_BOT_TOKEN", "")
 SERVER_IP = os.getenv("PHANTOMLINK_SERVER_IP", "202.28.78.213")
 SERVER_HOST = os.getenv("PHANTOMLINK_HOST", "0.0.0.0")
 SERVER_PORT = int(os.getenv("PHANTOMLINK_PORT", "5000"))
-MANAGED_PORT = int(os.getenv("PHANTOMLINK_MANAGED_PORT", "5443"))
-ENROLLMENT_PORT = int(os.getenv("PHANTOMLINK_ENROLLMENT_PORT", "5444"))
+
+
+def _managed_port(name, default):
+    raw = os.getenv(name)
+    if raw is None:
+        return default, False
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default, False
+    return (value, True) if 1 <= value <= 65535 else (default, False)
+
+
+MANAGED_PORT, _MANAGED_PORT_VALID = _managed_port("PHANTOMLINK_MANAGED_PORT", 5443)
+ENROLLMENT_PORT, _ENROLLMENT_PORT_VALID = _managed_port(
+    "PHANTOMLINK_ENROLLMENT_PORT", 5444
+)
 MANAGED_HOST = os.getenv("PHANTOMLINK_MANAGED_HOST", "")
 MANAGED_DB = os.getenv("PHANTOMLINK_MANAGED_DB", "")
 MANAGED_CA_CERT = os.getenv("PHANTOMLINK_CA_CERT", "")
@@ -75,7 +90,7 @@ def managed_phase2_enabled():
     files = (MANAGED_CA_CERT, MANAGED_CA_KEY, MANAGED_TLS_CERT, MANAGED_TLS_KEY)
     return all(isinstance(value, str) and value.strip() for value in values) and all(
         Path(path).is_file() for path in files
-    )
+    ) and _MANAGED_PORT_VALID and _ENROLLMENT_PORT_VALID
 
 # API Configuration
 API_KEY = os.getenv("PHANTOMLINK_API_KEY", "PhantomLink-API-2026")

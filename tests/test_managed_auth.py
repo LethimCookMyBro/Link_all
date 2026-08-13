@@ -11,6 +11,7 @@ import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from time import monotonic
 from unittest.mock import MagicMock, patch
 
@@ -1098,6 +1099,17 @@ def test_enrollment_unauthenticated_workers_are_bounded(tls_material, tmp_path):
         thread.join(1)
 
 
+def test_enrollment_stop_accepting_closes_listener_and_connections():
+    server = object.__new__(EnrollmentServer)
+    server._server = MagicMock()
+
+    server.stop_accepting()
+
+    server._server.begin_shutdown.assert_called_once_with()
+    server._server.close_connections.assert_called_once_with()
+    server._server.server_close.assert_called_once_with()
+
+
 def test_operator_cli_prints_token_once_and_not_found_is_nonzero(tmp_path, capsys):
     store = tmp_path / "store"
 
@@ -1133,8 +1145,51 @@ def test_phase2_cli_exit_codes_and_required_operator_fields(tmp_path, capsys):
     assert _main(["issue-token", "--db", str(database), "--ttl", "0"]) == 2
     assert _main(["list-audit", "--db", str(database)]) == 0
     assert json.loads(capsys.readouterr().out.strip()) == []
-    assert _main(["disconnect", "--db", str(database), "--agent-id", "missing"]) == 2
     assert _main(["revoke", "--db", str(database), "--agent-id", "missing"]) == 2
+
+
+def test_phase2_cli_has_no_separate_process_disconnect(capsys):
+    assert _main(["--help"]) == 0
+    help_text = capsys.readouterr().out
+    assert "{init-ca,issue-token,list-devices,list-audit,revoke}" in help_text
+    assert "disconnect" not in help_text
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["--agent-id", "not-a-uuid", "--actor", "operator", "--reason", "retired"],
+        ["--agent-id", "00000000-0000-4000-8000-000000000001", "--actor", "", "--reason", "retired"],
+        ["--agent-id", "00000000-0000-4000-8000-000000000001", "--actor", "operator", "--reason", ""],
+    ],
+)
+def test_phase2_cli_rejects_invalid_revoke_arguments_before_storage(arguments):
+    with patch("C2.managed_auth._registry_from_args") as registry:
+        assert _main(["revoke", "--db", "ignored.db", *arguments]) == 2
+    registry.assert_not_called()
+
+
+def test_phase2_cli_maps_revoke_storage_failure_to_exit_five(capsys):
+    registry = MagicMock()
+    registry.revoke_device.side_effect = RuntimeError("private detail")
+    with patch("C2.managed_auth._registry_from_args", return_value=registry):
+        assert (
+            _main(
+                [
+                    "revoke",
+                    "--db",
+                    "ignored.db",
+                    "--agent-id",
+                    "00000000-0000-4000-8000-000000000001",
+                    "--actor",
+                    "operator",
+                    "--reason",
+                    "retired",
+                ]
+            )
+            == 5
+        )
+    assert capsys.readouterr().err.strip() == "failed"
 
 
 def test_phase2_cli_initializes_ca_without_printing_credentials(tmp_path, capsys):
@@ -1194,7 +1249,7 @@ def test_phase2_cli_maps_argument_and_storage_failures(tmp_path, capsys):
     assert capsys.readouterr().err.strip() == "registry unavailable"
 
 
-def test_phase2_cli_disconnects_and_revokes_existing_device(
+def test_phase2_cli_revokes_existing_device(
     managed_registry, certificate_authority, csr_pem, capsys
 ):
     agent_id = "00000000-0000-4000-8000-000000000001"
@@ -1211,21 +1266,6 @@ def test_phase2_cli_disconnects_and_revokes_existing_device(
     )
     database = str(managed_registry.path)
 
-    assert (
-        _main(
-            [
-                "disconnect",
-                "--db",
-                database,
-                "--agent-id",
-                agent_id,
-                "--actor",
-                "operator-test",
-            ]
-        )
-        == 0
-    )
-    assert "already offline" in capsys.readouterr().out.lower()
     assert (
         _main(
             [
@@ -1309,6 +1349,24 @@ def test_token_file_rejects_utf8_bom():
         with patch("pathlib.Path.unlink"):
             with pytest.raises(ValueError, match="without BOM"):
                 _read_token_file("C:/private/token.txt")
+
+
+def test_phase2_runbook_records_resolved_operator_workflow():
+    runbook = (
+        Path("docs/runbooks/managed-agent-phase2-private-network.md")
+        .read_text(encoding="utf-8")
+    )
+
+    assert "managed_auth disconnect" not in runbook
+    assert "first 8 characters (short ID)" in runbook
+    assert "next durable heartbeat authorization check" in runbook
+    assert "$Devices = @($DeviceJson | ConvertFrom-Json)" in runbook
+    assert "if ($Devices.Count -ne 1)" in runbook
+    assert "[Text.Encoding]::UTF8.GetString" in runbook
+    assert "$CurrentAside = \"$env:PHANTOMLINK_MANAGED_DB.pre-recovery-$RecoveryStamp\"" in runbook
+    assert "Copy-Item -LiteralPath $SelectedDatabaseBackup" in runbook
+    assert "DATABASE_INTEGRITY=ok" in runbook
+    assert "RECOVERY_RESTART=PASS" in runbook
 
 
 def test_cross_process_token_issues_do_not_lose_updates(tmp_path):
@@ -1433,7 +1491,9 @@ def test_controller_starts_dashboard_with_managed_data_and_cleans_up():
         patch.object(
             controller,
             "_start_managed_runtime",
-            side_effect=lambda *_: order.append("listeners"),
+            side_effect=lambda *_: order.extend(
+                ["managed-listener", "enrollment-listener"]
+            ),
         ) as start,
         patch.object(controller, "_stop_managed_runtime", return_value=[]) as stop,
         patch.object(controller.socket, "socket", return_value=legacy_socket),
@@ -1441,7 +1501,9 @@ def test_controller_starts_dashboard_with_managed_data_and_cleans_up():
         patch.object(controller.time, "sleep"),
         patch.object(controller._console, "prompt", return_value="quit"),
     ):
-        thread_type.return_value.start.side_effect = lambda: order.append("thread")
+        thread_type.return_value.start.side_effect = lambda: order.append(
+            "dashboard-thread"
+        )
         controller.main()
 
     start.assert_called_once_with(runtime)
@@ -1449,8 +1511,65 @@ def test_controller_starts_dashboard_with_managed_data_and_cleans_up():
     dashboard_call = thread_type.call_args_list[0]
     assert dashboard_call.kwargs["target"] is controller.start_dashboard
     assert dashboard_call.kwargs["args"][4] is runtime.dashboard_data
-    assert order[:2] == ["thread", "listeners"]
+    assert order[:3] == [
+        "managed-listener",
+        "enrollment-listener",
+        "dashboard-thread",
+    ]
     legacy_socket.close.assert_called_once_with()
+
+
+def test_dashboard_start_failure_is_nonfatal_after_listeners_start(capsys):
+    import C2.C2 as controller
+
+    runtime = MagicMock(dashboard_data=object())
+    legacy_socket = MagicMock()
+    with (
+        patch.object(controller, "managed_phase2_enabled", return_value=True),
+        patch.object(controller, "_build_managed_runtime", return_value=runtime),
+        patch.object(controller, "_start_managed_runtime") as start,
+        patch.object(controller, "_stop_managed_runtime", return_value=[]) as stop,
+        patch.object(controller.socket, "socket", return_value=legacy_socket),
+        patch.object(controller.threading, "Thread") as thread_type,
+        patch.object(controller.time, "sleep"),
+        patch.object(controller._console, "prompt", return_value="quit"),
+    ):
+        starts = iter([RuntimeError("dashboard boom"), None, None])
+        def start_thread():
+            result = next(starts, None)
+            if isinstance(result, Exception):
+                raise result
+        thread_type.return_value.start.side_effect = start_thread
+        controller.main()
+
+    start.assert_called_once_with(runtime)
+    stop.assert_called_once_with(runtime)
+    assert "[!] Dashboard failed to start; managed services remain active" in capsys.readouterr().out
+
+
+def test_listener_start_failure_cleans_up_before_dashboard_start(capsys):
+    import C2.C2 as controller
+
+    runtime = MagicMock(dashboard_data=object())
+    with (
+        patch.object(controller, "managed_phase2_enabled", return_value=True),
+        patch.object(controller, "_build_managed_runtime", return_value=runtime),
+        patch.object(controller, "_start_managed_runtime", side_effect=RuntimeError("bind")),
+        patch.object(controller, "_stop_managed_runtime", return_value=[]) as stop,
+        patch.object(controller.socket, "socket", return_value=MagicMock()),
+        patch.object(controller.threading, "Thread") as thread_type,
+        patch.object(controller.time, "sleep"),
+        patch.object(controller._console, "prompt", return_value="quit"),
+    ):
+        controller.main()
+
+    stop.assert_called_once_with(runtime)
+    dashboard_threads = [
+        call for call in thread_type.call_args_list
+        if call.kwargs.get("target") is controller.start_dashboard
+    ]
+    assert dashboard_threads == []
+    assert "[!] Managed Phase 2 startup failed; managed listeners not started" in capsys.readouterr().out
 
 
 def test_managed_runtime_shutdown_is_reverse_and_bounded():
@@ -1460,8 +1579,10 @@ def test_managed_runtime_shutdown_is_reverse_and_bounded():
     managed = MagicMock()
     managed.stop.side_effect = lambda timeout: calls.append(("managed.stop", timeout))
     enrollment = MagicMock()
+    enrollment.stop_accepting.side_effect = lambda: calls.append(
+        ("enrollment.stop_accepting",)
+    )
     enrollment.shutdown.side_effect = lambda: calls.append(("enrollment.shutdown",))
-    enrollment.server_close.side_effect = lambda: calls.append(("enrollment.close",))
     enrollment_thread = MagicMock(ident=1, name="enrollment-listener")
     managed_thread = MagicMock(ident=2, name="managed-listener")
     enrollment_thread.join.side_effect = lambda timeout: calls.append(
@@ -1481,10 +1602,39 @@ def test_managed_runtime_shutdown_is_reverse_and_bounded():
     assert controller._stop_managed_runtime(runtime) == []
 
     assert calls == [
+        ("enrollment.stop_accepting",),
         ("enrollment.shutdown",),
-        ("enrollment.close",),
         ("managed.stop", 5),
         ("enrollment.join", 5),
         ("managed.join", 5),
     ]
     assert runtime.stop_event.is_set()
+
+
+def test_managed_runtime_shutdown_continues_after_stuck_enrollment_shutdown():
+    import C2.C2 as controller
+
+    enrollment = MagicMock()
+    managed = MagicMock()
+    worker = MagicMock()
+    worker.is_alive.return_value = True
+    runtime = MagicMock(
+        enrollment_server=enrollment,
+        managed_server=managed,
+        enrollment_thread=MagicMock(ident=1, name="enrollment-listener"),
+        managed_thread=MagicMock(ident=2, name="managed-listener"),
+        stop_event=threading.Event(),
+    )
+    with patch.object(controller.threading, "Thread", return_value=worker) as thread_type:
+        errors = controller._stop_managed_runtime(runtime)
+
+    enrollment.stop_accepting.assert_called_once_with()
+    thread_type.assert_called_once_with(
+        target=enrollment.shutdown,
+        name="enrollment-shutdown",
+        daemon=True,
+    )
+    worker.start.assert_called_once_with()
+    worker.join.assert_called_once_with(timeout=5)
+    managed.stop.assert_called_once_with(timeout=5)
+    assert "enrollment shutdown timed out" in errors

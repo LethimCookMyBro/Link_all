@@ -232,7 +232,7 @@ Expected behavior: the process remains active and the dashboard changes the devi
 1. Press `m` to open **Managed Agents**.
 2. Press `f`; filter by display name or agent ID. Only matching rows should remain.
 3. Select the online device, press `d`, then `y`. Expected: `ONLINE` -> `OFFLINE`; a running agent automatically reconnects to `ONLINE`.
-4. Press `r`; enter the exact selected agent ID and a non-empty reason. Expected: `ONLINE`/`OFFLINE` -> `REVOKED`, live session closed, later authentication rejected.
+4. Press `r`; enter the first 8 characters (short ID) of the selected agent ID and a non-empty reason. Expected: `ONLINE`/`OFFLINE` -> `REVOKED`, live session closed immediately by the in-process action, and later authentication rejected.
 5. Press `q` to stop the dashboard. Controller cleanup also bounded-joins its dashboard thread.
 
 Human observation is **PENDING MANUAL ACCEPTANCE**.
@@ -248,19 +248,19 @@ if ($LASTEXITCODE -ne 0) { throw 'list-audit failed' }
 
 Expected output: compact JSON arrays containing display-safe values and no certificate PEM, token digest, key content, or DPAPI data.
 
-## 7. Disconnect, revoke, renewal, and unavailable signer
+## 7. Revoke, renewal, and unavailable signer
 
 Replace the example with an agent UUID returned by `list-devices`:
 
 ```powershell
 $AgentId = '00000000-0000-4000-8000-000000000001'
-& $Python -m C2.managed_auth disconnect --db $env:PHANTOMLINK_MANAGED_DB --agent-id $AgentId --actor $env:USERNAME --reason 'acceptance disconnect'
-"DISCONNECT_EXIT=$LASTEXITCODE"
 & $Python -m C2.managed_auth revoke --db $env:PHANTOMLINK_MANAGED_DB --agent-id $AgentId --actor $env:USERNAME --reason 'acceptance revoke'
 "REVOKE_EXIT=$LASTEXITCODE"
 ```
 
-Expected output for an existing device ends with `DISCONNECT_EXIT=0` and `REVOKE_EXIT=0`. Both operations are idempotent; unknown IDs exit `1`, invalid arguments exit `2`, and repository/action failures exit `5`.
+Expected output for an existing device ends with `REVOKE_EXIT=0`. Revoke is idempotent; unknown IDs exit `1`, invalid arguments exit `2`, and repository failures exit `5`.
+
+There is deliberately no separate-process CLI disconnect command. Dashboard `D` is the only live disconnect surface because it uses the controller's in-process `DeviceActionService` and owns the live session socket. The CLI revoke above is durable: if the device is already connected, the controller rejects and closes that session at its next durable heartbeat authorization check. Dashboard `R` performs the same durable revoke and immediately closes the in-process live session.
 
 Renewal is automatic with 30 days or less remaining. Use a deliberately short-lived acceptance certificate or wait for the renewal window; never change a production clock. Expected: `CERTIFICATE_RENEWED` in audit data with the same agent ID. Result: **PENDING MANUAL ACCEPTANCE**.
 
@@ -301,8 +301,15 @@ pktmon start --capture --pkt-size 0 --file-name $CaptureEtl
 pktmon stop
 pktmon etl2pcap $CaptureEtl --out $CapturePcap
 if (-not (Test-Path -LiteralPath $CapturePcap -PathType Leaf)) { throw 'capture conversion failed' }
-$CaptureText = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($CapturePcap))
-$AgentId = '00000000-0000-4000-8000-000000000001'
+$DeviceJson = & $Python -m C2.managed_auth list-devices --db $env:PHANTOMLINK_MANAGED_DB
+if ($LASTEXITCODE -ne 0) { throw 'list-devices failed before capture scan' }
+$Devices = @($DeviceJson | ConvertFrom-Json)
+if ($Devices.Count -ne 1) { throw "expected exactly one enrolled device; found $($Devices.Count)" }
+$AgentId = [string]$Devices[0].agent_id
+if ($AgentId -notmatch '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$') {
+    throw 'enrolled agent ID absent or invalid'
+}
+$CaptureText = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($CapturePcap))
 $Leaks = @('PING','PONG',$AgentId) | Where-Object { $CaptureText.Contains($_) }
 if ($Leaks) { throw "plaintext managed content found: $($Leaks -join ',')" }
 'PLAINTEXT_SCAN=PASS'
@@ -345,7 +352,56 @@ Get-ChildItem $BackupRoot -File -Recurse | Get-FileHash -Algorithm SHA256 | Sele
 
 Expected integrity output: `ok`.
 
-For recovery, keep the controller stopped, copy the chosen backup files to their exact configured paths, reapply current-user-only ACLs to private keys, rerun `PRAGMA integrity_check`, restart, then repeat Sections 3, 8, and 10.
+Recover a chosen Phase 2 SQLite backup with this local controller block. It stops the one matching controller process, copies the current database to a timestamped side file, restores the explicitly selected Phase 2 database backup, reapplies private ACLs, runs integrity checking with the project Python, and restarts the controller. It never imports or copies Phase 1 `devices.bin` or `tokens.json` into SQLite.
+
+```powershell
+Set-Location 'G:\for_hack_all\Link_all - Copy'
+$Python = (Resolve-Path '.\.venv\Scripts\python.exe').Path
+$SelectedDatabaseBackup = 'C:\ProgramData\PhantomLink\backups\20260813-120000\managed.db'
+if (-not (Test-Path -LiteralPath $SelectedDatabaseBackup -PathType Leaf)) { throw 'chosen Phase 2 database backup is missing' }
+$ControllerProcesses = @(Get-CimInstance Win32_Process | Where-Object {
+    $_.CommandLine -match '(?i)-m\s+C2\.C2' -and $_.ProcessId -ne $PID
+})
+if ($ControllerProcesses.Count -gt 1) { throw 'ambiguous controller process set' }
+if ($ControllerProcesses.Count -eq 1) {
+    Stop-Process -Id $ControllerProcesses[0].ProcessId -Force -ErrorAction Stop
+    Wait-Process -Id $ControllerProcesses[0].ProcessId -Timeout 10 -ErrorAction SilentlyContinue
+}
+'CONTROLLER_STOPPED=PASS'
+$RecoveryStamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+$CurrentAside = "$env:PHANTOMLINK_MANAGED_DB.pre-recovery-$RecoveryStamp"
+if (Test-Path -LiteralPath $env:PHANTOMLINK_MANAGED_DB) {
+    Copy-Item -LiteralPath $env:PHANTOMLINK_MANAGED_DB -Destination $CurrentAside -Force
+}
+Copy-Item -LiteralPath $SelectedDatabaseBackup -Destination $env:PHANTOMLINK_MANAGED_DB -Force
+foreach ($PrivatePath in @($env:PHANTOMLINK_MANAGED_DB,$env:PHANTOMLINK_CA_KEY,$env:PHANTOMLINK_TLS_KEY)) {
+    icacls $PrivatePath /inheritance:r | Out-Null
+    icacls $PrivatePath /grant:r "${env:USERDOMAIN}\${env:USERNAME}:(F)" | Out-Null
+}
+$Integrity = & $Python -c "import sqlite3; c=sqlite3.connect(r'$env:PHANTOMLINK_MANAGED_DB'); print(c.execute('PRAGMA integrity_check').fetchone()[0]); c.close()"
+if ($LASTEXITCODE -ne 0 -or $Integrity -ne 'ok') { throw "database integrity failed: $Integrity" }
+'DATABASE_INTEGRITY=ok'
+$RecoveryOut = Join-Path $env:TEMP "phantomlink-recovery-$RecoveryStamp.out.log"
+$RecoveryErr = Join-Path $env:TEMP "phantomlink-recovery-$RecoveryStamp.err.log"
+$ControllerProcess = Start-Process -FilePath $Python -ArgumentList @('-u','-m','C2.C2') -WorkingDirectory (Get-Location).Path -WindowStyle Hidden -RedirectStandardOutput $RecoveryOut -RedirectStandardError $RecoveryErr -PassThru
+$Deadline = (Get-Date).AddSeconds(15)
+do {
+    Start-Sleep -Milliseconds 250
+    $Started = Test-Path $RecoveryOut -PathType Leaf -and (Select-String -LiteralPath $RecoveryOut -SimpleMatch '[+] Managed TLS on' -Quiet)
+} until ($Started -or $ControllerProcess.HasExited -or (Get-Date) -ge $Deadline)
+if (-not $Started) { Get-Content $RecoveryErr -ErrorAction SilentlyContinue; throw 'controller recovery restart failed' }
+'RECOVERY_RESTART=PASS'
+```
+
+Expected literal output includes:
+
+```text
+CONTROLLER_STOPPED=PASS
+DATABASE_INTEGRITY=ok
+RECOVERY_RESTART=PASS
+```
+
+Then repeat Sections 3, 8, and 10.
 
 ```powershell
 Get-Content -LiteralPath 'C:\ProgramData\PhantomLink\managed-agent.log' -Tail 100
