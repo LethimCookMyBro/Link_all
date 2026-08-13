@@ -26,13 +26,14 @@ def validate_managed_bind(host: str, *, allow_loopback: bool = False) -> str:
         address = ipaddress.ip_address(host)
     except ValueError as exc:
         raise ValueError("managed bind must be an exact managed IP") from exc
+    effective = getattr(address, "ipv4_mapped", None) or address
     if (
-        address.is_unspecified
-        or address.is_multicast
-        or address.is_link_local
-        or address.is_global
-        or str(address) == "255.255.255.255"
-        or (address.is_loopback and not allow_loopback)
+        effective.is_unspecified
+        or effective.is_multicast
+        or effective.is_link_local
+        or effective.is_global
+        or str(effective) == "255.255.255.255"
+        or (effective.is_loopback and not allow_loopback)
     ):
         raise ValueError("managed bind must be an exact managed IP")
     return str(address)

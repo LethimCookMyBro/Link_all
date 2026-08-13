@@ -62,6 +62,9 @@ def enrolled_device(registry):
         "255.255.255.255",
         "169.254.1.1",
         "fe80::1",
+        "::ffff:169.254.1.1",
+        "::ffff:0.0.0.0",
+        "::ffff:255.255.255.255",
         "8.8.8.8",
         "localhost",
         "vpn.example",
@@ -82,6 +85,8 @@ def test_loopback_requires_explicit_test_flag():
         validate_managed_bind("127.0.0.1")
     assert validate_managed_bind("127.0.0.1", allow_loopback=True) == "127.0.0.1"
     assert validate_managed_bind("::1", allow_loopback=True) == "::1"
+    with pytest.raises(ValueError):
+        validate_managed_bind("::ffff:127.0.0.1")
 
 
 def test_new_session_atomically_replaces_old_and_stale_unregister_cannot_remove_new(
