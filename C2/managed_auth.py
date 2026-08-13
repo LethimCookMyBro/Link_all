@@ -31,6 +31,7 @@ from C2.managed_registry import (
     EnrollmentTokenRejected,
     ManagedRegistry,
     ManagedRegistryError,
+    _token_digest,
     utc_now,
 )
 from client import transport
@@ -568,6 +569,7 @@ class EnrollmentService:
         agent_version: str | None = None,
     ) -> EnrollmentResponse | DeviceCredential:
         if not self._legacy:
+            _token_digest(token)
             csr_pem = _validated_device_csr(csr_pem)
             display_name = _bounded_text("display_name", display_name, 128)
             agent_version = _bounded_text(

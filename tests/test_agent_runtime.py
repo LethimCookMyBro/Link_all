@@ -101,6 +101,8 @@ def test_runtime_renews_only_at_30_days_or_less(valid_identity, config):
     assert renewer.calls == []
     assert runtime.prepare_identity(now=expiry - timedelta(days=30)) is True
     assert renewer.calls == [valid_identity.agent_id]
+    assert runtime.prepare_identity(now=expiry - timedelta(days=29)) is True
+    assert renewer.calls == [valid_identity.agent_id]
 
 
 def test_runtime_continues_on_failed_renewal_until_current_certificate_expires(
@@ -124,6 +126,67 @@ def test_runtime_continues_on_failed_renewal_until_current_certificate_expires(
     assert [event["event"] for event in events] == ["CERTIFICATE_RENEWAL_FAILED"]
     assert runtime.prepare_identity(now=expiry) is False
     assert [event["event"] for event in events][-1] == "CERTIFICATE_EXPIRED"
+
+
+def test_runtime_retries_failed_renewal_on_later_prepare(valid_identity, config):
+    class FailOnceRenewer(RecordingRenewer):
+        def __call__(self, _config, identity, _store):
+            self.calls.append(identity.agent_id)
+            if len(self.calls) == 1:
+                raise OSError("offline")
+            return identity
+
+    renewer = FailOnceRenewer()
+    runtime = AgentRuntime(
+        config,
+        valid_identity,
+        identity_store=object(),
+        connector=ScriptedConnector(),
+        renewer=renewer,
+    )
+    expiry = datetime.fromisoformat(
+        valid_identity.certificate_not_after.replace("Z", "+00:00")
+    )
+
+    assert runtime.prepare_identity(now=expiry - timedelta(days=1)) is True
+    assert runtime.prepare_identity(now=expiry - timedelta(hours=12)) is True
+    assert renewer.calls == [valid_identity.agent_id, valid_identity.agent_id]
+
+
+def test_runtime_deduplicates_simultaneous_renewal(valid_identity, config):
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BlockingRenewer(RecordingRenewer):
+        def __call__(self, _config, identity, _store):
+            self.calls.append(identity.agent_id)
+            entered.set()
+            assert release.wait(1)
+            return identity
+
+    renewer = BlockingRenewer()
+    runtime = AgentRuntime(
+        config,
+        valid_identity,
+        identity_store=object(),
+        connector=ScriptedConnector(),
+        renewer=renewer,
+    )
+    expiry = datetime.fromisoformat(
+        valid_identity.certificate_not_after.replace("Z", "+00:00")
+    )
+    first = threading.Thread(
+        target=lambda: runtime.prepare_identity(now=expiry - timedelta(days=1))
+    )
+    first.start()
+    try:
+        assert entered.wait(1)
+        assert runtime.prepare_identity(now=expiry - timedelta(days=1)) is True
+        assert renewer.calls == [valid_identity.agent_id]
+    finally:
+        release.set()
+        first.join(1)
+    assert not first.is_alive()
 
 
 class FakeSocket:

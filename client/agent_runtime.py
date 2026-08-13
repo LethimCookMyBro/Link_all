@@ -274,7 +274,8 @@ class AgentRuntime:
         self._event_sink = event_sink if event_sink is not None else _discard_event
         self.identity_store = identity_store
         self.renewer = renewer
-        self._renewal_attempted_for_serial = None
+        self._renewal_in_progress_serial = None
+        self._renewal_succeeded_for_serial = None
         self.connector = connector or ManagedConnector()
         bind = getattr(self.connector, "set_socket_hooks", None)
         if bind is not None:
@@ -298,9 +299,13 @@ class AgentRuntime:
         if expiry - now.astimezone(timezone.utc) > timedelta(days=30):
             return True
         serial = self.credential.certificate_serial
-        if self._renewal_attempted_for_serial == serial:
-            return True
-        self._renewal_attempted_for_serial = serial
+        with self._lock:
+            if (
+                self._renewal_succeeded_for_serial == serial
+                or self._renewal_in_progress_serial == serial
+            ):
+                return True
+            self._renewal_in_progress_serial = serial
         try:
             if self.renewer is None or self.identity_store is None:
                 raise RuntimeError("certificate renewer unavailable")
@@ -309,12 +314,15 @@ class AgentRuntime:
                 raise TypeError("renewer returned invalid identity")
             if renewed.agent_id != self.credential.agent_id:
                 raise ValueError("renewer changed agent identity")
-            self.credential = renewed
-            self._renewal_attempted_for_serial = (
-                serial if renewed.certificate_serial == serial else None
-            )
+            with self._lock:
+                self.credential = renewed
+                self._renewal_in_progress_serial = None
+                self._renewal_succeeded_for_serial = serial
             self._emit("CERTIFICATE_RENEWED")
         except Exception:  # noqa: BLE001 - valid current identity remains usable
+            with self._lock:
+                if self._renewal_in_progress_serial == serial:
+                    self._renewal_in_progress_serial = None
             self._emit("CERTIFICATE_RENEWAL_FAILED")
         return True
 

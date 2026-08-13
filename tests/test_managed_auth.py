@@ -190,14 +190,30 @@ def test_renewal_rejects_revoked_device(
 def test_certificate_https_uses_public_response_and_requires_peer_for_renewal(
     managed_registry, certificate_authority, csr_pem, controller_tls_material
 ):
+    class CountingAuthority:
+        def __init__(self, authority):
+            self.authority = authority
+            self.sign_calls = 0
+
+        def sign_device_csr(self, csr, agent_id):
+            self.sign_calls += 1
+            return self.authority.sign_device_csr(csr, agent_id)
+
+        def renew_device_csr(self, csr, agent_id):
+            return self.authority.renew_device_csr(csr, agent_id)
+
+        def ca_pem(self):
+            return self.authority.ca_pem()
+
     cert, key, _ = controller_tls_material
     token = managed_registry.issue_token(600)
+    counting_authority = CountingAuthority(certificate_authority)
     server = EnrollmentServer(
         "127.0.0.1",
         0,
         cert,
         key,
-        EnrollmentService(managed_registry, certificate_authority),
+        EnrollmentService(managed_registry, counting_authority),
     )
     thread = threading.Thread(target=server.serve_forever)
     thread.start()
@@ -214,6 +230,23 @@ def test_certificate_https_uses_public_response_and_requires_peer_for_renewal(
         }
     )
     try:
+        malformed = json.loads(body)
+        malformed["token"] = "not-canonical"
+        connection = http.client.HTTPSConnection(
+            "127.0.0.1", server.port, context=context, timeout=2
+        )
+        connection.request(
+            "POST",
+            "/v1/enroll",
+            body=json.dumps(malformed),
+            headers={"Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        assert response.status == 400
+        response.read()
+        connection.close()
+        assert counting_authority.sign_calls == 0
+
         connection = http.client.HTTPSConnection(
             "127.0.0.1", server.port, context=context, timeout=2
         )
@@ -234,6 +267,7 @@ def test_certificate_https_uses_public_response_and_requires_peer_for_renewal(
             "certificate_not_after",
         }
         connection.close()
+        assert counting_authority.sign_calls == 1
 
         connection = http.client.HTTPSConnection(
             "127.0.0.1", server.port, context=context, timeout=2
@@ -248,6 +282,7 @@ def test_certificate_https_uses_public_response_and_requires_peer_for_renewal(
         assert response.status == 403
         response.read()
         connection.close()
+        assert counting_authority.sign_calls == 2
 
         connection = http.client.HTTPSConnection(
             "127.0.0.1", server.port, context=context, timeout=2
