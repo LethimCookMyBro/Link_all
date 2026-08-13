@@ -9,6 +9,19 @@ PhantomLink only binds its managed TLS and enrollment listeners to an already-co
 
 The examples use controller VPN IP `10.8.0.1`, agent VPN IP `10.8.0.2`, managed port `5443`, and enrollment port `5444`.
 
+### Automated loopback preflight
+
+Before the two-machine steps, run the real CA, certificate, SQLite, enrollment HTTPS, and mTLS socket regression three times:
+
+```powershell
+1..3 | ForEach-Object {
+    .\.venv\Scripts\python.exe -m pytest tests/test_phase2_integration.py -q
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+}
+```
+
+Loopback is enabled only by the integration harness's explicit test flag. Production listener construction still rejects loopback, wildcard, LAN, and public binds. A green automated preflight does not change the two-machine or packet-capture results above from `PENDING MANUAL ACCEPTANCE`.
+
 ## 1. Prove the external VPN first
 
 Controller machine:

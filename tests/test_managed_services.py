@@ -234,6 +234,37 @@ def test_disconnect_audit_failure_leaves_socket_untouched(
     assert len(sessions.snapshot()) == 1
 
 
+def test_disconnect_result_audit_failure_reports_failure_after_closing_socket(
+    registry, enrolled_device, monkeypatch
+):
+    connection = FakeConnection()
+    sessions = SessionManager(registry)
+    sessions.register(
+        enrolled_device.agent_id,
+        enrolled_device.certificate_fingerprint,
+        enrolled_device.certificate_serial,
+        "10.8.0.21",
+        connection,
+    )
+    original = registry.append_audit
+
+    def fail_result(**kwargs):
+        if kwargs["action"] == "DISCONNECT_SUCCEEDED":
+            raise OSError("result audit unavailable")
+        return original(**kwargs)
+
+    monkeypatch.setattr(registry, "append_audit", fail_result)
+
+    result = DeviceActionService(registry, sessions).disconnect(
+        enrolled_device.agent_id, "operator", "maintenance"
+    )
+
+    assert result.code == "FAILED"
+    assert result.message == "Disconnect result audit failed."
+    assert connection.closed is True
+    assert sessions.snapshot() == ()
+
+
 def test_disconnect_stable_not_found_and_already_offline_codes(registry, enrolled_device):
     actions = DeviceActionService(registry, SessionManager(registry))
     missing = actions.disconnect(
