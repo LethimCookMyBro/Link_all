@@ -5224,10 +5224,10 @@ index 0000000..285448c
 +    unittest.main()
 diff --git a/tests/test_managed_auth.py b/tests/test_managed_auth.py
 new file mode 100644
-index 0000000..53e4215
+index 0000000..6ab7e93
 --- /dev/null
 +++ b/tests/test_managed_auth.py
-@@ -0,0 +1,1260 @@
+@@ -0,0 +1,1259 @@
 +import base64
 +import hashlib
 +import http.client
@@ -6487,7 +6487,6 @@ index 0000000..53e4215
 +    ]
 +    assert len(managed_threads) == 2
 +    assert all(thread.joined for thread in managed_threads)
-+
 diff --git a/tests/test_phantomlink_config_import.py b/tests/test_phantomlink_config_import.py
 new file mode 100644
 index 0000000..9f9f540

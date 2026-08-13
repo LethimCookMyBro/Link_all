@@ -137,7 +137,7 @@ No token or credential value is present in this record, config, or log. The smok
 
 Path: `debug-artifacts/managed-agent.patch`
 
-SHA-256: `6feb2bd7af0afbf86d8fe7d1cee968d0be4d361de74d5e6f4a2cee6cb02596da`
+SHA-256: `c006aa9fb1b73da3443ccf2545b2403816742f9e84928514b23cfc386d39416f`
 
 ```powershell
 $base = (Get-Content debug-artifacts/managed-agent-preflight/feature-base.txt -Raw).Trim()
@@ -154,7 +154,7 @@ Literal output and exit status:
 
 ```text
 PATCH_CHECK_EXIT=0
-PATCH_BYTES=225521
+PATCH_BYTES=225519
 ```
 
 The non-empty patch applied with `git apply --check` in a clean detached worktree at the baseline commit.
@@ -407,8 +407,8 @@ cmd /d /c "git diff $base..HEAD -- . :(exclude)debug-artifacts/managed-agent.pat
 
 `	ext
 PATCH_CHECK_EXIT=0
-PATCH_BYTES=225521
-PATCH_SHA256=6feb2bd7af0afbf86d8fe7d1cee968d0be4d361de74d5e6f4a2cee6cb02596da
+PATCH_BYTES=225519
+PATCH_SHA256=c006aa9fb1b73da3443ccf2545b2403816742f9e84928514b23cfc386d39416f
 PHANTOMLINK_PATH_INCLUDED=True
 `
 
@@ -437,3 +437,42 @@ PIP_CHECK_EXIT=0
 `
 
 Every managed source reported no threats; all 51 installed packages were compatible. No token or credential values were logged or added to artifacts.
+
+
+## Mechanical final-HEAD artifact refresh
+
+Regenerated from final implementation HEAD `47e1ce1` with the recorded dependency-complete exclusions.
+
+```powershell
+$base=(Get-Content debug-artifacts\managed-agent-preflight\feature-base.txt -Raw).Trim()
+cmd /d /c "git diff $base..HEAD -- . :(exclude)debug-artifacts/managed-agent.patch :(exclude)debug-artifacts/managed-agent-verification.md :(exclude)docs/runbooks/managed-agent-phase1.md :(exclude)scripts/rollback-managed-agent.ps1 :(exclude)tests/test_agent_runtime_integration.py > debug-artifacts\managed-agent.patch"
+git apply --reverse --check debug-artifacts\managed-agent.patch
+```
+
+```text
+PATCH_GENERATE_EXIT=0
+PATCH_SHA256=c006aa9fb1b73da3443ccf2545b2403816742f9e84928514b23cfc386d39416f
+PATCH_BYTES=225519
+PHANTOMLINK_PATH_INCLUDED=True
+MANAGED_AUTH_TEST_PATH_INCLUDED=True
+REVERSE_CHECK_EXIT=0
+```
+
+Forward clean-base check:
+
+```text
+FORWARD_CHECK_EXIT=0
+```
+
+Exact rollback script in a disposable worktree using the regenerated patch:
+
+```text
+23 passed in 0.08s
+6 passed in 0.81s
+ROLLBACK_EXIT=0
+TRANSPORT_EXISTS=False
+MANAGED_AUTH_EXISTS=False
+MANAGED_AGENT_EXISTS=False
+PHANTOMLINK_IMPORT=OK
+POST_IMPORT_EXIT=0
+```
