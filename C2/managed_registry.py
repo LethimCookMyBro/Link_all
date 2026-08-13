@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from client.agent_config import _apply_private_acl
 
@@ -281,6 +281,8 @@ class ManagedRegistry:
         agent_version: str,
         actor: str,
         correlation_id: str,
+        *,
+        agent_id: str | None = None,
     ) -> DeviceDetail:
         try:
             digest = _token_digest(token)
@@ -292,7 +294,15 @@ class ManagedRegistry:
         actor = _require_text("actor", actor, 128)
         correlation_id = _require_text("correlation_id", correlation_id, 128)
         occurred_at = _format_time(self.now())
-        agent_id = str(uuid4())
+        if agent_id is None:
+            agent_id = str(uuid4())
+        else:
+            agent_id = _require_text("agent_id", agent_id, 128)
+            try:
+                if str(UUID(agent_id)) != agent_id or UUID(agent_id).version != 4:
+                    raise ValueError
+            except (AttributeError, ValueError) as exc:
+                raise ValueError("agent_id must be a canonical version 4 UUID") from exc
         details_json = _audit_json(
             {
                 "agent_version": agent_version,
