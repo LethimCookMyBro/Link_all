@@ -4,6 +4,7 @@ import json
 import socket
 import ssl
 import threading
+from dataclasses import replace
 from datetime import datetime, timedelta
 
 import pytest
@@ -187,6 +188,132 @@ def test_runtime_deduplicates_simultaneous_renewal(valid_identity, config):
         release.set()
         first.join(1)
     assert not first.is_alive()
+
+
+def test_runtime_stale_expiry_reader_cannot_renew_newer_identity(
+    monkeypatch, valid_identity, config
+):
+    expiry_a = datetime.fromisoformat(
+        valid_identity.certificate_not_after.replace("Z", "+00:00")
+    )
+    identity_b = replace(
+        valid_identity,
+        certificate_serial="B",
+        certificate_not_after=(expiry_a + timedelta(days=90))
+        .isoformat()
+        .replace("+00:00", "Z"),
+    )
+    identity_c = replace(identity_b, certificate_serial="C")
+    swap_requested = threading.Event()
+    swap_finished = threading.Event()
+    swap_acquired = []
+    original_parse = agent_runtime._parse_certificate_time
+
+    def pause_stale_reader(value):
+        parsed = original_parse(value)
+        if threading.current_thread().name == "stale-renewal-reader":
+            swap_requested.set()
+            assert swap_finished.wait(1)
+        return parsed
+
+    class AdvancingRenewer:
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, _config, identity, _store):
+            self.calls.append(identity.certificate_serial)
+            return identity_b if identity.certificate_serial == "1" else identity_c
+
+    monkeypatch.setattr(agent_runtime, "_parse_certificate_time", pause_stale_reader)
+    renewer = AdvancingRenewer()
+    runtime = AgentRuntime(
+        config,
+        valid_identity,
+        identity_store=object(),
+        connector=ScriptedConnector(),
+        renewer=renewer,
+    )
+
+    def publish_newer_identity():
+        assert swap_requested.wait(1)
+        acquired = runtime._lock.acquire(blocking=False)
+        swap_acquired.append(acquired)
+        if acquired:
+            try:
+                runtime.credential = identity_b
+                runtime._renewal_succeeded_for_serial = "1"
+            finally:
+                runtime._lock.release()
+        swap_finished.set()
+
+    swapper = threading.Thread(target=publish_newer_identity)
+    stale = threading.Thread(
+        target=lambda: runtime.prepare_identity(now=expiry_a - timedelta(days=1)),
+        name="stale-renewal-reader",
+    )
+    swapper.start()
+    stale.start()
+    stale.join(1)
+    swapper.join(1)
+
+    assert not stale.is_alive()
+    assert not swapper.is_alive()
+    assert renewer.calls == ["1"]
+    assert runtime.credential.certificate_serial == "B"
+    assert swap_acquired == [False]
+
+
+def test_runtime_stale_renewal_result_cannot_overwrite_newer_identity(
+    valid_identity, config
+):
+    expiry_a = datetime.fromisoformat(
+        valid_identity.certificate_not_after.replace("Z", "+00:00")
+    )
+    identity_b = replace(
+        valid_identity,
+        certificate_serial="B",
+        certificate_not_after=(expiry_a + timedelta(days=90))
+        .isoformat()
+        .replace("+00:00", "Z"),
+    )
+    identity_c = replace(identity_b, certificate_serial="C")
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BlockingRenewer:
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, _config, identity, _store):
+            self.calls.append(identity.certificate_serial)
+            entered.set()
+            assert release.wait(1)
+            return identity_c
+
+    renewer = BlockingRenewer()
+    runtime = AgentRuntime(
+        config,
+        valid_identity,
+        identity_store=object(),
+        connector=ScriptedConnector(),
+        renewer=renewer,
+    )
+    stale = threading.Thread(
+        target=lambda: runtime.prepare_identity(now=expiry_a - timedelta(days=1))
+    )
+    stale.start()
+    try:
+        assert entered.wait(1)
+        with runtime._lock:
+            runtime.credential = identity_b
+            runtime._renewal_succeeded_for_serial = "1"
+    finally:
+        release.set()
+        stale.join(1)
+
+    assert not stale.is_alive()
+    assert renewer.calls == ["1"]
+    assert runtime.credential.certificate_serial == "B"
 
 
 class FakeSocket:

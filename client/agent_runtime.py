@@ -287,34 +287,46 @@ class AgentRuntime:
         )
 
     def prepare_identity(self, *, now=None) -> bool:
-        if not isinstance(self.credential, AgentCertificateIdentity):
-            return True
         now = datetime.now(timezone.utc) if now is None else now
         if not isinstance(now, datetime) or now.tzinfo is None:
             raise ValueError("now must be timezone-aware")
-        expiry = _parse_certificate_time(self.credential.certificate_not_after)
-        if expiry <= now.astimezone(timezone.utc):
+        now = now.astimezone(timezone.utc)
+        with self._lock:
+            identity = self.credential
+            if not isinstance(identity, AgentCertificateIdentity):
+                return True
+            expiry = _parse_certificate_time(identity.certificate_not_after)
+            if expiry <= now:
+                expired = True
+            elif expiry - now > timedelta(days=30):
+                return True
+            else:
+                expired = False
+                serial = identity.certificate_serial
+                if (
+                    self._renewal_succeeded_for_serial == serial
+                    or self._renewal_in_progress_serial == serial
+                ):
+                    return True
+                self._renewal_in_progress_serial = serial
+        if expired:
             self._emit("CERTIFICATE_EXPIRED")
             return False
-        if expiry - now.astimezone(timezone.utc) > timedelta(days=30):
-            return True
-        serial = self.credential.certificate_serial
-        with self._lock:
-            if (
-                self._renewal_succeeded_for_serial == serial
-                or self._renewal_in_progress_serial == serial
-            ):
-                return True
-            self._renewal_in_progress_serial = serial
         try:
             if self.renewer is None or self.identity_store is None:
                 raise RuntimeError("certificate renewer unavailable")
-            renewed = self.renewer(self.config, self.credential, self.identity_store)
+            renewed = self.renewer(self.config, identity, self.identity_store)
             if not isinstance(renewed, AgentCertificateIdentity):
                 raise TypeError("renewer returned invalid identity")
-            if renewed.agent_id != self.credential.agent_id:
+            if renewed.agent_id != identity.agent_id:
                 raise ValueError("renewer changed agent identity")
             with self._lock:
+                if self.credential is not identity or (
+                    self.credential.certificate_serial != serial
+                ):
+                    if self._renewal_in_progress_serial == serial:
+                        self._renewal_in_progress_serial = None
+                    return True
                 self.credential = renewed
                 self._renewal_in_progress_serial = None
                 self._renewal_succeeded_for_serial = serial
