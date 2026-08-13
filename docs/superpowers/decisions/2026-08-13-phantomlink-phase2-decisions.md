@@ -14,6 +14,7 @@
 7. Phase 1 specifications, plans, runbooks, verification records, and rollback artifacts remain retained as historical evidence. A file is deleted only after proving it is both unused by code and superseded by a named retained document.
 8. Decisions that change scope, trust boundaries, schemas, contracts, or operational limits are appended here with the date and affected design section. Routine implementation progress belongs in commits and verification records rather than this decision log.
 9. Direct Empire code reuse requires a provenance note and preservation of BSD-3-Clause notices. Phase 2 has no runtime dependency on Empire.
+10. The Phase 2 SQLite registry starts with public device metadata only. Existing Phase 1 `tokens.json` and `devices.bin` stores are preserved by verified byte-for-byte backup and are neither imported nor deleted; their legacy readers remain retained until the Task 8 production-import proof.
 
 ## Known ceilings accepted for Phase 2
 

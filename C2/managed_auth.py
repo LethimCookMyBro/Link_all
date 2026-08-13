@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import errno
 import hashlib
 import http.server
 import json
@@ -12,12 +13,13 @@ import select
 import socket
 import ssl
 import threading
-import errno
 from collections.abc import Callable, Mapping
+from dataclasses import asdict
 from pathlib import Path
 from time import monotonic, time
 from uuid import uuid4
 
+from C2.managed_registry import ManagedRegistry
 from client import transport
 from client.agent_config import (
     DeviceCredential,
@@ -1017,8 +1019,9 @@ class EnrollmentServer:
 
 def _store_services(path: os.PathLike[str] | str):
     root = Path(path)
-    registry = DeviceRegistry(root / "devices.bin")
-    return EnrollmentStore(root / "tokens.json"), registry
+    registry = ManagedRegistry(root / "managed.db")
+    registry.initialize()
+    return registry
 
 
 def _main(argv=None) -> int:
@@ -1032,17 +1035,26 @@ def _main(argv=None) -> int:
     revoke = commands.add_parser("revoke")
     revoke.add_argument("--store", default="managed-store")
     revoke.add_argument("--agent-id", required=True)
-    revoke.add_argument("--key-id", required=True)
+    revoke.add_argument("--key-id", help="retained Phase 1 argument; ignored")
+    revoke.add_argument("--reason", default="operator CLI request")
     args = parser.parse_args(argv)
 
-    tokens, registry = _store_services(args.store)
+    registry = _store_services(args.store)
     if args.command == "issue-token":
-        print(tokens.issue(args.ttl))
+        print(registry.issue_token(args.ttl))
         return 0
     if args.command == "list-devices":
-        print(json.dumps(registry.list_devices(), separators=(",", ":")))
+        print(
+            json.dumps(
+                [asdict(device) for device in registry.list_device_records()],
+                separators=(",", ":"),
+            )
+        )
         return 0
-    if registry.revoke(args.agent_id, args.key_id):
+    result = registry.revoke_device(
+        args.agent_id, "operator-cli", args.reason, str(uuid4())
+    )
+    if result.code in {"REVOKED", "ALREADY_REVOKED"}:
         print("revoked")
         return 0
     print("not found")
