@@ -140,13 +140,25 @@ class SessionManager:
             raise PermissionError("certificate is not allowed")
 
     def unregister(self, agent_id: str, session_id: str, reason: str) -> bool:
+        return self._remove(agent_id, session_id, reason)
+
+    def disconnect(self, agent_id: str) -> bool:
+        return self._remove(agent_id, None, "CONTROLLER_DISCONNECT")
+
+    def _remove(
+        self, agent_id: str, session_id: str | None, reason: str
+    ) -> bool:
         current = None
         try:
             with self._lock:
                 found = self._sessions.get(agent_id)
-                if found is None or found.snapshot.session_id != session_id:
+                if found is None or (
+                    session_id is not None
+                    and found.snapshot.session_id != session_id
+                ):
                     return False
                 current = found
+                correlation_id = found.snapshot.session_id
                 action = (
                     "HEARTBEAT_TIMEOUT"
                     if reason == "HEARTBEAT_TIMEOUT"
@@ -159,10 +171,10 @@ class SessionManager:
                         target_agent_id=agent_id,
                         result="SUCCEEDED",
                         reason=reason,
-                        correlation_id=session_id,
+                        correlation_id=correlation_id,
                         details={
                             "peer_ip": current.snapshot.peer_ip,
-                            "session_id": session_id,
+                            "session_id": correlation_id,
                             "status_code": reason,
                         },
                     )
@@ -172,13 +184,6 @@ class SessionManager:
             if current is not None:
                 _close_connection(current.connection)
         return True
-
-    def disconnect(self, agent_id: str) -> bool:
-        with self._lock:
-            current = self._sessions.get(agent_id)
-            if current is None:
-                return False
-        return self.unregister(agent_id, current.snapshot.session_id, "CONTROLLER_DISCONNECT")
 
     def snapshot(self) -> tuple[SessionSnapshot, ...]:
         with self._lock:

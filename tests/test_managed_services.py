@@ -235,6 +235,29 @@ def test_audit_failure_during_unregister_still_closes_and_removes_session(
     assert connection.closed
 
 
+def test_disconnect_removes_current_session_without_stale_unregister_window(
+    registry, enrolled_device, monkeypatch
+):
+    sessions = SessionManager(registry)
+    connection = FakeConnection()
+    sessions.register(
+        enrolled_device.agent_id,
+        enrolled_device.certificate_fingerprint,
+        enrolled_device.certificate_serial,
+        "10.8.0.21",
+        connection,
+    )
+    monkeypatch.setattr(
+        sessions,
+        "unregister",
+        lambda *_args: pytest.fail("disconnect must remove under its original lock"),
+    )
+
+    assert sessions.disconnect(enrolled_device.agent_id)
+    assert sessions.snapshot() == ()
+    assert connection.closed
+
+
 def test_session_snapshots_are_frozen(registry, enrolled_device):
     session = SessionManager(registry).register(
         enrolled_device.agent_id,
