@@ -22,27 +22,77 @@ if ($LASTEXITCODE -ne 0 -or -not $GitRoot.Equals($RepoRoot, [StringComparison]::
     throw 'RepoRoot must be the Git worktree root'
 }
 
+$ImplementationPaths = @(
+    '.',
+    ':(exclude).gitattributes',
+    ':(exclude)debug-artifacts/managed-agent-phase2.patch',
+    ':(exclude)debug-artifacts/managed-agent-phase2-verification.md',
+    ':(exclude)scripts/rollback-managed-agent-phase2.ps1',
+    ':(exclude)debug-artifacts/managed-agent-phase2-preflight/**'
+)
+$EvidencePaths = @(
+    '.gitattributes',
+    'debug-artifacts/managed-agent-phase2.patch',
+    'debug-artifacts/managed-agent-phase2-verification.md',
+    'scripts/rollback-managed-agent-phase2.ps1',
+    'debug-artifacts/managed-agent-phase2-preflight'
+)
+$ExpectedPatchHash = '4C3CC1C33BA74805B64249347B5346ACD16CCD8430776CB828F3570CD5DC5EAC'
+$BaseCommit = 'af64499'
+$OriginalHead = (& git -C $RepoRoot rev-parse HEAD).Trim()
+if ($LASTEXITCODE -ne 0) { throw 'could not resolve starting HEAD' }
+
+& git -C $RepoRoot diff --quiet
+if ($LASTEXITCODE -ne 0) { throw 'tracked worktree must be clean before rollback' }
+& git -C $RepoRoot diff --cached --quiet
+if ($LASTEXITCODE -ne 0) { throw 'tracked index must be clean before rollback' }
+
 $StatusBefore = (& git -C $RepoRoot status --short) -join "`n"
 $PatchHash = (Get-FileHash -LiteralPath $PatchPath -Algorithm SHA256).Hash
+if ($PatchHash -ne $ExpectedPatchHash) {
+    throw "patch hash mismatch: expected $ExpectedPatchHash, got $PatchHash"
+}
 "REPO_ROOT=$RepoRoot"
 "PATCH_PATH=$PatchPath"
 "PATCH_SHA256=$PatchHash"
+"ORIGINAL_HEAD=$OriginalHead"
 "STATUS_BEFORE_BEGIN"
 $StatusBefore
 "STATUS_BEFORE_END"
 
-& git -C $RepoRoot apply --reverse --check $PatchPath
-if ($LASTEXITCODE -ne 0) { throw 'reverse patch check failed' }
-'REVERSE_CHECK=PASS'
-& git -C $RepoRoot apply --reverse $PatchPath
-if ($LASTEXITCODE -ne 0) { throw 'reverse patch apply failed' }
-'REVERSE_APPLY=PASS'
-& git -C $RepoRoot diff --check
-if ($LASTEXITCODE -ne 0) { throw 'rollback diff check failed' }
-& git -C $RepoRoot diff --quiet af64499 -- .
-if ($LASTEXITCODE -ne 0) { throw 'rollback does not reproduce base af64499' }
+$Applied = $false
+try {
+    & git -C $RepoRoot apply --reverse --index --check $PatchPath
+    if ($LASTEXITCODE -ne 0) { throw 'reverse patch index check failed' }
+    'REVERSE_INDEX_CHECK=PASS'
+    & git -C $RepoRoot apply --reverse --index $PatchPath
+    if ($LASTEXITCODE -ne 0) { throw 'reverse patch index apply failed' }
+    $Applied = $true
+    'REVERSE_INDEX_APPLY=PASS'
+
+    & git -C $RepoRoot diff --check -- $ImplementationPaths
+    if ($LASTEXITCODE -ne 0) { throw 'rollback implementation diff check failed' }
+    & git -C $RepoRoot diff --quiet -- $ImplementationPaths
+    if ($LASTEXITCODE -ne 0) { throw 'rollback worktree does not match its index' }
+    & git -C $RepoRoot diff --cached --quiet $BaseCommit -- $ImplementationPaths
+    if ($LASTEXITCODE -ne 0) { throw "rollback index does not reproduce base $BaseCommit" }
+    & git -C $RepoRoot diff --quiet $OriginalHead -- $EvidencePaths
+    if ($LASTEXITCODE -ne 0) { throw 'rollback changed an evidence role' }
+} catch {
+    $Failure = $_
+    if ($Applied) {
+        & git -C $RepoRoot restore --source $OriginalHead --staged --worktree -- $ImplementationPaths
+        if ($LASTEXITCODE -ne 0) {
+            throw "rollback verification failed and tracked recovery failed: $Failure"
+        }
+        'ROLLBACK_RECOVERY=PASS'
+    }
+    throw $Failure
+}
 'ROLLBACK_BASE=af64499'
-'ROLLBACK_VERIFY=PASS'
+'ROLLBACK_INDEX_VERIFY=PASS'
+'ROLLBACK_WORKTREE_VERIFY=PASS'
+'EVIDENCE_ROLES_PRESERVED=PASS'
 
 $ManagedStore = if ($env:PHANTOMLINK_MANAGED_STORE) {
     $env:PHANTOMLINK_MANAGED_STORE

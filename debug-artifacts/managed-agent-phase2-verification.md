@@ -3,15 +3,15 @@
 ## Artifact identity
 
 - Approved base: `af64499`
-- Implementation commit: `5aca7a2f9a1b190a3a86f9f7c0ab8bff33ae21c8`
+- Implementation commit: `7dc9bbc767b0affbe165108092bfad33f22d55f9`
 - Modified artifact: `tests/test_phase2_integration.py`
 - Exact patch: `debug-artifacts/managed-agent-phase2.patch`
 - Rollback: `scripts/rollback-managed-agent-phase2.ps1`
 - Verification record: `debug-artifacts/managed-agent-phase2-verification.md`
-- Patch SHA-256: `D51F97B380F653E0E759B16B92D9511C97229734D16CA3AC2C8573E06C6B06D7`
-- Patch bytes: `535897`
+- Patch SHA-256: `4C3CC1C33BA74805B64249347B5346ACD16CCD8430776CB828F3570CD5DC5EAC`
+- Patch bytes: `536550`
 
-The patch contains `af64499..5aca7a2` and excludes this record, the patch itself, the rollback script, and all four preserved preflight paths.
+The patch contains the implementation delta `af64499..7dc9bbc` and excludes `.gitattributes`, this record, the patch itself, the rollback script, the committed Task 8 preflight directory, and the three preserved pre-existing untracked paths. The single `.gitattributes` evidence rule marks only the patch `-text`, so a normal Windows checkout preserves the committed binary bytes.
 
 ## TDD record
 
@@ -48,23 +48,50 @@ EXIT=0
 
 The harness uses an ephemeral CA, server and device certificates, pinned enrollment HTTPS, an on-disk SQLite registry, actual TLS sockets, and `allow_loopback=True` only inside tests. It covers enroll/online/D disconnect/reconnect/R revoke/reject, restart without reenrollment, wrong CA, missing client certificate, unknown/mismatched/revoked certificates, token replay, replacement, heartbeat timeout, database busy timeout, absent signer with a live session, worker saturation, and clean shutdown.
 
+### Fix-round mechanical RED/GREEN: real replacement closure
+
+After adding the bounded TLS read/EOF assertion, the assertion was placed mechanically before opening the replacement socket to prove that it detects a still-live peer:
+
+```text
+COMMAND=.\.venv\Scripts\python.exe -m pytest -q tests/test_phase2_integration.py::test_duplicate_session_replaces_and_closes_the_previous_socket
+FAILED tests/test_phase2_integration.py::test_duplicate_session_replaces_and_closes_the_previous_socket
+Failed: replaced peer socket remained open
+1 failed in 0.80s
+EXIT=1
+```
+
+The assertion was then moved after the second real mTLS connection replaced the first:
+
+```text
+COMMAND=.\.venv\Scripts\python.exe -m pytest -q tests/test_phase2_integration.py::test_duplicate_session_replaces_and_closes_the_previous_socket
+.                                                                        [100%]
+1 passed in 0.94s
+EXIT=0
+
+COMMAND=.\.venv\Scripts\python.exe -m ruff check tests/test_phase2_integration.py
+All checks passed!
+EXIT=0
+```
+
+The observation happens before test cleanup closes either client socket. The harness now catches only `RuntimeError`, `TypeError`, and `ValueError` from the agent owner thread; the Task 8 `BaseException` finding is gone.
+
 ## Three consecutive integration runs
 
 ```text
 RUN=1
 COMMAND=.\.venv\Scripts\python.exe -m pytest tests/test_phase2_integration.py -q
 ............                                                             [100%]
-12 passed in 8.86s
+12 passed in 8.74s
 EXIT=0
 RUN=2
 COMMAND=.\.venv\Scripts\python.exe -m pytest tests/test_phase2_integration.py -q
 ............                                                             [100%]
-12 passed in 9.15s
+12 passed in 8.73s
 EXIT=0
 RUN=3
 COMMAND=.\.venv\Scripts\python.exe -m pytest tests/test_phase2_integration.py -q
 ............                                                             [100%]
-12 passed in 9.59s
+12 passed in 8.88s
 EXIT=0
 ```
 
@@ -107,7 +134,7 @@ COMMAND=.\.venv\Scripts\python.exe -m pytest -q
 tests/test_commands_registry.py::TestCmdContextSend::test_send_prepends_cmd_prefix
   RuntimeWarning: coroutine 'AsyncMockMixin._execute_mock_call' was never awaited
 
-507 passed, 2 warnings in 171.96s (0:02:51)
+507 passed, 2 warnings in 171.56s (0:02:51)
 EXIT=0
 
 COMMAND=.\.venv\Scripts\python.exe -m compileall -q C2 client config.py
@@ -118,7 +145,7 @@ G:\for_hack_all\Link_all - Copy\.worktrees\managed-background-agent\.venv\Script
 EXIT=1
 
 COMMAND=uv pip check --python .\.venv\Scripts\python.exe
-Checked 51 packages in 22ms
+Checked 51 packages in 7ms
 All installed packages are compatible
 EXIT=0
 
@@ -148,11 +175,15 @@ Open concern: `requirements.txt` resolves `cryptography==41.0.7` and `pillow==10
 
 ```text
 COMMAND=.\.venv\Scripts\ruff.exe check C2/managed_auth.py tests/test_phase2_integration.py tests/test_agent_runtime_integration.py tests/test_managed_auth.py tests/test_managed_services.py
-Found 10 errors.
+Found 9 errors.
 RUFF_EXIT=1
+
+COMMAND=.\.venv\Scripts\python.exe -m ruff check tests/test_phase2_integration.py
+All checks passed!
+RUFF_PHASE2_EXIT=0
 ```
 
-The findings are six intentional broad exception boundaries in operator/storage handling, one pre-existing nested context, one pre-existing import formatting item, one broad exception in a concurrency test, and the integration harness's `BaseException` capture that surfaces worker errors during teardown. None was suppressed or auto-fixed to obtain a green record.
+The remaining findings are six intentional broad exception boundaries in operator/storage handling, one pre-existing nested context, one pre-existing import formatting item, and one broad exception in a concurrency test. The Task 8 integration path is clean; its prior broad `BaseException` capture was replaced with the three expected owner-loop exception types. None of the nine pre-existing findings was suppressed or auto-fixed to obtain a green record.
 
 ## Windows Defender
 
@@ -203,54 +234,66 @@ The unfiltered command returned unrelated historical resources elsewhere on the 
 ## Patch generation and reproducibility
 
 ```text
-COMMAND=.\.venv\Scripts\python.exe -c "import pathlib,subprocess; args=['git','diff','--binary','af64499','HEAD','--','.',':(exclude)debug-artifacts/managed-agent-phase2.patch',':(exclude)debug-artifacts/managed-agent-phase2-verification.md',':(exclude)scripts/rollback-managed-agent-phase2.ps1',':(exclude)debug-artifacts/managed-agent-phase2-preflight/**',':(exclude)debug-artifacts/managed-agent-preflight/**',':(exclude)debug-artifacts/task4-cli-store/**',':(exclude)debug-artifacts/task4-current.diff']; pathlib.Path('debug-artifacts/managed-agent-phase2.patch').write_bytes(subprocess.check_output(args))"
+COMMAND=.\.venv\Scripts\python.exe -c "import pathlib,subprocess; args=['git','diff','--binary','af64499','HEAD','--','.',':(exclude).gitattributes',':(exclude)debug-artifacts/managed-agent-phase2.patch',':(exclude)debug-artifacts/managed-agent-phase2-verification.md',':(exclude)scripts/rollback-managed-agent-phase2.ps1',':(exclude)debug-artifacts/managed-agent-phase2-preflight/**',':(exclude)debug-artifacts/managed-agent-preflight/**',':(exclude)debug-artifacts/task4-cli-store/**',':(exclude)debug-artifacts/task4-current.diff']; pathlib.Path('debug-artifacts/managed-agent-phase2.patch').write_bytes(subprocess.check_output(args))"
 PATCH_GENERATE_EXIT=0
-PATCH_SHA256=D51F97B380F653E0E759B16B92D9511C97229734D16CA3AC2C8573E06C6B06D7
-PATCH_BYTES=535897
+PATCH_SHA256=4C3CC1C33BA74805B64249347B5346ACD16CCD8430776CB828F3570CD5DC5EAC
+PATCH_BYTES=536550
 
 COMMAND=git apply --reverse --check debug-artifacts/managed-agent-phase2.patch
 REVERSE_CHECK_EXIT=0
 
-COMMAND=.\.venv\Scripts\python.exe -c "import os,pathlib,subprocess; args=['git','diff','--binary','af64499','HEAD','--','.',':(exclude)debug-artifacts/managed-agent-phase2.patch',':(exclude)debug-artifacts/managed-agent-phase2-verification.md',':(exclude)scripts/rollback-managed-agent-phase2.ps1',':(exclude)debug-artifacts/managed-agent-phase2-preflight/**',':(exclude)debug-artifacts/managed-agent-preflight/**',':(exclude)debug-artifacts/task4-cli-store/**',':(exclude)debug-artifacts/task4-current.diff']; pathlib.Path(os.environ['TEMP'],'managed-agent-phase2-reproduced.patch').write_bytes(subprocess.check_output(args))"
+COMMAND=.\.venv\Scripts\python.exe -c "import os,pathlib,subprocess; args=['git','diff','--binary','af64499','HEAD','--','.',':(exclude).gitattributes',':(exclude)debug-artifacts/managed-agent-phase2.patch',':(exclude)debug-artifacts/managed-agent-phase2-verification.md',':(exclude)scripts/rollback-managed-agent-phase2.ps1',':(exclude)debug-artifacts/managed-agent-phase2-preflight/**',':(exclude)debug-artifacts/managed-agent-preflight/**',':(exclude)debug-artifacts/task4-cli-store/**',':(exclude)debug-artifacts/task4-current.diff']; pathlib.Path(os.environ['TEMP'],'managed-agent-phase2-reproduced.patch').write_bytes(subprocess.check_output(args))"
 REPRODUCE_EXIT=0
-REPRODUCED_SHA256=D51F97B380F653E0E759B16B92D9511C97229734D16CA3AC2C8573E06C6B06D7
-REPRODUCED_BYTES=535897
+REPRODUCED_SHA256=4C3CC1C33BA74805B64249347B5346ACD16CCD8430776CB828F3570CD5DC5EAC
+REPRODUCED_BYTES=536550
 BYTE_IDENTICAL=PASS
+
+COMMAND=git check-attr text -- debug-artifacts/managed-agent-phase2.patch
+debug-artifacts/managed-agent-phase2.patch: text: unset
+EXIT=0
 ```
 
 ## Disposable rollback and forward proof
 
-Input was detached implementation commit `5aca7a2`, plus a copied patch below the disposable worktree root.
+Input is a clean disposable checkout of the evidence HEAD. The rollback script permits untracked archives but rejects any tracked worktree or index change before it starts. It reverse-applies only the implementation patch with `--index`; `.gitattributes`, the patch, this record, the rollback script, and committed preflight remain at the evidence HEAD by design.
 
 ```text
 COMMAND=& scripts\rollback-managed-agent-phase2.ps1 -RepoRoot <DISPOSABLE> -PatchPath <DISPOSABLE>\debug-artifacts\managed-agent-phase2.patch
-PATCH_SHA256=D51F97B380F653E0E759B16B92D9511C97229734D16CA3AC2C8573E06C6B06D7
-REVERSE_CHECK=PASS
-REVERSE_APPLY=PASS
+PATCH_SHA256=4C3CC1C33BA74805B64249347B5346ACD16CCD8430776CB828F3570CD5DC5EAC
+REVERSE_INDEX_CHECK=PASS
+REVERSE_INDEX_APPLY=PASS
 ROLLBACK_BASE=af64499
-ROLLBACK_VERIFY=PASS
+ROLLBACK_INDEX_VERIFY=PASS
+ROLLBACK_WORKTREE_VERIFY=PASS
+EVIDENCE_ROLES_PRESERVED=PASS
 EXIT=0
 
 COMMAND=<PYTHON> -m pytest tests/test_client_transport.py tests/test_protocol_auth.py tests/test_encryption.py tests/test_dashboard.py -q
 ......................................................                   [100%]
-54 passed in 1.01s
+54 passed in 1.09s
 EXIT=0
 
 COMMAND=<PYTHON> -c "import client.PhantomLink; import C2.dashboard; print('ROLLBACK_IMPORT_OK')"
 ROLLBACK_IMPORT_OK
 EXIT=0
 
-COMMAND=git apply --check debug-artifacts/managed-agent-phase2.patch
+COMMAND=git apply --check --index debug-artifacts/managed-agent-phase2.patch
 EXIT=0
-COMMAND=git apply debug-artifacts/managed-agent-phase2.patch
+COMMAND=git apply --index debug-artifacts/managed-agent-phase2.patch
 EXIT=0
-COMMAND=git diff --quiet 5aca7a2
-EXIT=0
+COMMAND=git diff --cached --quiet 7dc9bbc -- <IMPLEMENTATION_PATHSPEC_WITH_EVIDENCE_EXCLUSIONS>
+FORWARD_INDEX_EQUALS_IMPLEMENTATION_EXIT=0
+COMMAND=git diff --quiet -- <IMPLEMENTATION_PATHSPEC_WITH_EVIDENCE_EXCLUSIONS>
+FORWARD_WORKTREE_EQUALS_INDEX_EXIT=0
 COMMAND=git worktree remove --force <DISPOSABLE>
 EXIT=0
 ```
 
-The rollback prints database, CA, TLS, and Phase 1 backup paths for operator archival. It does not remove any database, CA, certificate, key, or backup.
+The old non-indexed `git diff --quiet 5aca7a2` proof is superseded: it ignored untracked added paths and was not an equality proof. The corrected proof compares the complete staged implementation tree to `7dc9bbc`, with evidence-only paths explicitly excluded, and separately proves worktree equals index. On any failure after reverse application, the script restores implementation paths in both index and worktree from the original evidence HEAD before rethrowing. It prints database, CA, TLS, and Phase 1 backup paths for operator archival and never deletes any database, CA, certificate, key, backup, or unrelated untracked path.
+
+## Fresh Windows checkout byte proof
+
+The final evidence HEAD is also checked out into a new normal Git worktree while global `core.autocrlf=true`. The prior global value is restored in `finally`. The checkout artifact, committed blob, and Python-regenerated artifact all remain exactly 536550 bytes with SHA-256 `4C3CC1C33BA74805B64249347B5346ACD16CCD8430776CB828F3570CD5DC5EAC`; the literal output is appended after the evidence commit and repeated in the ignored Task 8 report.
 
 ## Preserved pre-existing artifacts
 
