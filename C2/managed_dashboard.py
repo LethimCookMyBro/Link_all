@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import queue
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Callable
 
@@ -45,6 +45,8 @@ class ManagedDashboardData:
         self._lock = threading.Lock()
         self._hints: queue.Queue[None] = queue.Queue(maxsize=256)
         self._last_refresh: datetime | None = None
+        self._details: dict[str, DeviceDetail] = {}
+        self._selected_agent_id: str | None = None
         self._snapshot = ManagedDashboardSnapshot((), (), None, True, "", None)
 
     def refresh(self) -> ManagedDashboardSnapshot:
@@ -53,23 +55,39 @@ class ManagedDashboardData:
         captured = current_time.isoformat(timespec="microseconds").replace("+00:00", "Z")
         try:
             devices = tuple(self._query.list_devices())
-            selected = self._query.get_device(devices[0].agent_id) if devices else None
+            details = {
+                device.agent_id: detail
+                for device in devices
+                if (detail := self._query.get_device(device.agent_id)) is not None
+            }
             events = tuple(self._query.list_audit_events(100))
-            fresh = ManagedDashboardSnapshot(devices, events, selected, True, captured, None)
         except RegistryUnavailable:
             with self._lock:
                 previous = self._snapshot
-            fresh = ManagedDashboardSnapshot(
-                previous.devices,
-                previous.audit_events,
-                previous.selected,
-                False,
-                previous.captured_at,
-                "REGISTRY_UNAVAILABLE",
-            )
-        with self._lock:
-            self._snapshot = fresh
-            self._last_refresh = current_time
+                fresh = ManagedDashboardSnapshot(
+                    previous.devices,
+                    previous.audit_events,
+                    previous.selected,
+                    False,
+                    previous.captured_at,
+                    "REGISTRY_UNAVAILABLE",
+                )
+                self._snapshot = fresh
+                self._last_refresh = current_time
+        else:
+            with self._lock:
+                selected_id = self._selected_agent_id
+                if selected_id not in details:
+                    selected_id = next(
+                        (device.agent_id for device in devices if device.agent_id in details),
+                        None,
+                    )
+                selected = details.get(selected_id) if selected_id is not None else None
+                fresh = ManagedDashboardSnapshot(devices, events, selected, True, captured, None)
+                self._details = details
+                self._selected_agent_id = selected_id
+                self._snapshot = fresh
+                self._last_refresh = current_time
         self._discard_hints()
         return fresh
 
@@ -82,6 +100,14 @@ class ManagedDashboardData:
 
     def snapshot(self) -> ManagedDashboardSnapshot:
         with self._lock:
+            return self._snapshot
+
+    def select(self, agent_id: str | None) -> ManagedDashboardSnapshot:
+        """Select from the last immutable detail cache; never touches storage."""
+        with self._lock:
+            selected = self._details.get(agent_id) if agent_id is not None else None
+            self._selected_agent_id = selected.agent_id if selected is not None else None
+            self._snapshot = replace(self._snapshot, selected=selected)
             return self._snapshot
 
     def notify_event(self) -> None:

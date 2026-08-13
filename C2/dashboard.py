@@ -185,6 +185,8 @@ def build_app(
             self._managed_snapshot = managed_data.snapshot() if managed_data is not None else None
             self._confirming_disconnect = False
             self._closing = False
+            self._rendering_managed = False
+            self._visible_managed_ids = ()
 
         def compose(self) -> ComposeResult:
             yield Header(show_clock=True)
@@ -321,6 +323,25 @@ def build_app(
             self._close_revoke_form()
             self._start_managed_action("revoke", selected.agent_id, reason)
 
+        def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+            self._select_managed_row(event)
+
+        def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+            self._select_managed_row(event)
+
+        def _select_managed_row(self, event) -> None:
+            agent_id = event.row_key.value
+            if (
+                event.data_table.id != "managed-devices"
+                or self._rendering_managed
+                or event.cursor_row != event.data_table.cursor_row
+                or agent_id not in self._visible_managed_ids
+                or self._managed_data is None
+            ):
+                return
+            self._managed_snapshot = self._managed_data.select(agent_id)
+            self._render_managed_detail()
+
         def _close_revoke_form(self) -> None:
             self.query_one("#revoke-form", Vertical).add_class("hidden")
             self.query_one("#managed-devices", DataTable).focus()
@@ -383,22 +404,43 @@ def build_app(
 
         def _render_managed_devices(self) -> None:
             table = self.query_one("#managed-devices", DataTable)
-            table.clear()
             query = self.query_one("#managed-filter", Input).value.strip().casefold()
             colors = {"ONLINE": "green", "OFFLINE": "yellow", "REVOKED": "red"}
-            for row in self._managed_snapshot.devices:
-                searchable = f"{row.display_name} {row.agent_id} {row.state}".casefold()
-                if query and query not in searchable:
-                    continue
-                table.add_row(
-                    Text(row.state, style=colors.get(row.state, "white")),
-                    row.display_name,
-                    row.agent_id,
-                    row.last_vpn_ip or "-",
-                    row.last_seen_at or "-",
-                    row.certificate_not_after,
-                    key=row.agent_id,
-                )
+            visible = [
+                row
+                for row in self._managed_snapshot.devices
+                if not query
+                or query in f"{row.display_name} {row.agent_id} {row.state}".casefold()
+            ]
+            visible_ids = tuple(row.agent_id for row in visible)
+            selected_id = (
+                self._managed_snapshot.selected.agent_id
+                if self._managed_snapshot.selected is not None
+                else None
+            )
+            if selected_id not in visible_ids:
+                selected_id = visible_ids[0] if visible_ids else None
+            if self._managed_data is not None:
+                self._managed_snapshot = self._managed_data.select(selected_id)
+            self._visible_managed_ids = visible_ids
+            self._rendering_managed = True
+            try:
+                table.clear()
+                for row in visible:
+                    table.add_row(
+                        Text(row.state, style=colors.get(row.state, "white")),
+                        row.display_name,
+                        row.agent_id,
+                        row.last_vpn_ip or "-",
+                        row.last_seen_at or "-",
+                        row.certificate_not_after,
+                        key=row.agent_id,
+                    )
+                if selected_id is not None:
+                    table.move_cursor(row=visible_ids.index(selected_id))
+            finally:
+                self._rendering_managed = False
+            self._render_managed_detail()
 
         def _render_managed_detail(self) -> None:
             detail = self._managed_snapshot.selected
