@@ -1,3 +1,5 @@
+import base64
+import hashlib
 import json
 import os
 import sys
@@ -367,3 +369,110 @@ def test_atomic_write_removes_temp_after_replace_failure(monkeypatch, tmp_path):
         write_identity(path, "agent-1", "key-1", acl_applier=lambda _: None)
 
     assert temporary_paths and not temporary_paths[0].exists()
+
+
+def test_enroll_requires_tty_without_token_file(monkeypatch):
+    from client.managed_agent import main
+
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
+    assert main(["enroll"]) == 2
+
+
+def test_run_without_credential_is_not_retried(tmp_path, monkeypatch, caplog):
+    from client import managed_agent
+    from client.agent_config import AgentConfig
+
+    config_path = tmp_path / "agent.json"
+    config_path.write_text("{}", "utf-8")
+    config = AgentConfig.from_mapping(valid_config(tmp_path))
+
+    class EmptyStore:
+        def load(self):
+            return None
+
+    monkeypatch.setattr(managed_agent, "load_config", lambda _: config)
+    monkeypatch.setattr(managed_agent, "DpapiCredentialStore", lambda _: EmptyStore())
+    assert managed_agent.main(["run", "--config", str(config_path)]) == 3
+    assert "ENROLLMENT_REQUIRED" in caplog.text
+
+
+def test_token_file_is_consumed_and_deleted_before_enrollment(tmp_path, monkeypatch):
+    from client import managed_agent
+
+    token_path = tmp_path / "token.txt"
+    token_path.write_text("token-value\n", "utf-8")
+    monkeypatch.setattr(managed_agent, "validate_private_file", lambda _: None)
+
+    assert managed_agent._read_token_file(str(token_path)) == "token-value"
+    assert not token_path.exists()
+
+
+def test_enroll_invalid_config_returns_four(monkeypatch):
+    from client import managed_agent
+
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(managed_agent.getpass, "getpass", lambda _: "token")
+    monkeypatch.setattr(managed_agent, "load_config", lambda _: (_ for _ in ()).throw(ValueError()))
+
+    assert managed_agent.main(["enroll"]) == 4
+
+
+def test_enroll_saves_credential_before_identity(tmp_path, monkeypatch):
+    from client import managed_agent
+    from client.agent_config import AgentConfig
+
+    events = []
+
+    class Response:
+        status = 201
+
+        def read(self, _):
+            return json.dumps(
+                {"agent_id": "agent", "key_id": "key", "secret": base64.b64encode(b"s" * 32).decode()}
+            ).encode()
+
+    class Connection:
+        def __init__(self, *_args, **_kwargs):
+            self.sock = self
+
+        def connect(self):
+            events.append("connect")
+
+        def getpeercert(self, binary_form):
+            assert binary_form is True
+            return b"certificate"
+
+        def request(self, method, path, body, headers):
+            events.append((method, path, json.loads(body), headers["Content-Type"]))
+
+        def getresponse(self):
+            return Response()
+
+        def close(self):
+            events.append("close")
+
+    class Store:
+        path = tmp_path / "credential.bin"
+
+        def save(self, credential):
+            events.append(("save", credential))
+
+    monkeypatch.setattr(managed_agent.http.client, "HTTPSConnection", Connection)
+    monkeypatch.setattr(managed_agent, "write_identity", lambda *_: events.append("identity"))
+    config = AgentConfig.from_mapping(
+        {
+            **valid_config(tmp_path),
+            "tls_cert_sha256": hashlib.sha256(b"certificate").hexdigest(),
+        }
+    )
+
+    credential = managed_agent.enroll(config, "token", Store())
+
+    assert credential.secret == b"s" * 32
+    assert events == [
+        "connect",
+        ("POST", "/v1/enroll", {"token": "token"}, "application/json"),
+        ("save", credential),
+        "identity",
+        "close",
+    ]
