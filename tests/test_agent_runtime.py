@@ -1,4 +1,3 @@
-import base64
 import hashlib
 import json
 import socket
@@ -10,7 +9,7 @@ from datetime import datetime, timedelta
 import pytest
 
 from client import agent_runtime
-from client.agent_config import AgentConfig, DeviceCredential
+from client.agent_config import AgentConfig
 from client.agent_runtime import (
     AgentRuntime,
     AgentState,
@@ -20,15 +19,10 @@ from client.agent_runtime import (
     send_frame,
 )
 from client.managed_identity import AgentCertificateIdentity
-from client.transport import build_proof
 
 
 def frame(payload):
     return len(payload).to_bytes(4, "big") + payload
-
-
-def json_frame(message):
-    return frame(json.dumps(message, sort_keys=True, separators=(",", ":")).encode())
 
 
 def decode_frame(packet):
@@ -57,7 +51,14 @@ def config():
 
 @pytest.fixture
 def credential():
-    return DeviceCredential("agent-1", "key-1", b"s" * 32)
+    return AgentCertificateIdentity(
+        agent_id="11111111-1111-4111-8111-111111111111",
+        certificate_pem=b"certificate",
+        chain_pem=b"chain",
+        private_key_pem=b"private-key",
+        certificate_serial="1",
+        certificate_not_after="2026-11-11T00:00:00Z",
+    )
 
 
 @pytest.fixture
@@ -416,9 +417,15 @@ def test_send_frame_uses_transport_framing():
 
 def runtime_for_session(config, conn, *, clock=lambda: 0):
     connector = ScriptedConnector(conn)
-    return AgentRuntime(
-        config, DeviceCredential("a", "k", b"s"), connector=connector, clock=clock
+    identity = AgentCertificateIdentity(
+        "11111111-1111-4111-8111-111111111111",
+        b"certificate",
+        b"chain",
+        b"private-key",
+        "1",
+        "2026-11-11T00:00:00Z",
     )
+    return AgentRuntime(config, identity, connector=connector, clock=clock)
 
 
 def test_socket_timeout_is_poll_tick_not_disconnect(config):
@@ -577,15 +584,7 @@ class FakeTlsContext:
 
 def make_connector(config, credential, result="AUTH_OK", *, fragments=False):
     events = []
-    nonce = b"n" * 32
-    challenge = json_frame(
-        {"type": "CHALLENGE", "nonce": base64.b64encode(nonce).decode("ascii")}
-    )
-    auth_result = json_frame({"type": result})
-    incoming = [challenge, auth_result]
-    if fragments:
-        incoming = [challenge[:2], challenge[2:], auth_result[:5], auth_result[5:]]
-    tls = FakeTlsSocket(incoming, events)
+    tls = FakeTlsSocket([], events)
     raw = FakeRawSocket(events)
     context = FakeTlsContext(tls, events)
     connector = ManagedConnector(
@@ -604,13 +603,40 @@ def make_connector(config, credential, result="AUTH_OK", *, fragments=False):
         events.append("clear")
 
     connector.set_socket_hooks(publish, clear)
-    return connector, raw, tls, events, publications, nonce
+    return connector, raw, tls, events, publications, None
+
+
+def test_certificate_connector_uses_store_context_and_sends_no_authentication_frames(
+    config, valid_identity
+):
+    events = []
+    raw = FakeRawSocket(events)
+    tls = FakeTlsSocket([], events)
+    context = FakeTlsContext(tls, events)
+
+    class Store:
+        def __init__(self):
+            self.identities = []
+
+        def client_context(self, identity):
+            self.identities.append(identity)
+            return context
+
+    store = Store()
+    connector = ManagedConnector(
+        certificate_store=store,
+        socket_factory=lambda *_: raw,
+    )
+
+    assert connector.connect(config, valid_identity) is tls
+    assert store.identities == [valid_identity]
+    assert tls.sent == []
 
 
 def test_connector_publishes_raw_before_connect_and_tls_before_handshake(
     config, credential
 ):
-    connector, raw, tls, events, publications, nonce = make_connector(
+    connector, raw, tls, events, publications, _ = make_connector(
         config, credential
     )
 
@@ -628,53 +654,8 @@ def test_connector_publishes_raw_before_connect_and_tls_before_handshake(
         "handshake"
     )
     assert publications == [(raw, None), (tls, raw)]
-    hello = json.loads(decode_frame(tls.sent[0]))
-    proof = json.loads(decode_frame(tls.sent[1]))
-    assert hello == {
-        "agent_id": credential.agent_id,
-        "key_id": credential.key_id,
-        "type": "HELLO",
-        "version": 1,
-    }
-    expected = build_proof(
-        credential.secret, 1, credential.agent_id, credential.key_id, nonce
-    )
-    assert proof == {
-        "type": "AUTH_PROOF",
-        "proof": base64.b64encode(expected).decode("ascii"),
-    }
+    assert tls.sent == []
     assert not raw.closed and not tls.closed
-
-
-def test_connector_decodes_fragmented_auth_frames(config, credential):
-    connector, _, tls, _, _, _ = make_connector(config, credential, fragments=True)
-    assert connector.connect(config, credential) is tls
-
-
-def test_auth_reader_does_not_consume_first_online_frame(config, credential):
-    connector, _, tls, _, _, _ = make_connector(config, credential)
-    challenge, result = tls.incoming
-    stopped = threading.Event()
-
-    def stop_poll():
-        stopped.set()
-        raise TimeoutError()
-
-    tls.incoming = [challenge, result + frame(b"PING"), stop_poll]
-
-    assert connector.connect(config, credential) is tls
-    runtime = AgentRuntime(config, credential, connector=ScriptedConnector(tls))
-    runtime.stop_event = stopped
-    runtime.run_one_session(tls)
-
-    assert tls.sent_frames[-1] == b"PONG"
-
-
-def test_default_connector_context_requires_tls_1_2_or_newer():
-    context = agent_runtime._tls_client_context()
-    assert context.minimum_version is ssl.TLSVersion.TLSv1_2
-    assert context.check_hostname is False
-    assert context.verify_mode is ssl.CERT_NONE
 
 
 def test_connector_rejects_missing_peer_certificate(config, credential):
@@ -685,65 +666,6 @@ def test_connector_rejects_missing_peer_certificate(config, credential):
         connector.connect(config, credential)
 
     assert tls.sent == []
-    assert tls.closed
-
-
-@pytest.mark.parametrize(
-    "challenge",
-    [
-        {"type": "CHALLENGE"},
-        {"type": "CHALLENGE", "nonce": "", "extra": True},
-        {"type": "WRONG", "nonce": ""},
-        {"type": "CHALLENGE", "nonce": 1},
-        {"type": "CHALLENGE", "nonce": "not-base64!"},
-        {
-            "type": "CHALLENGE",
-            "nonce": base64.b64encode(b"n" * 32).decode("ascii") + "=",
-        },
-        {
-            "type": "CHALLENGE",
-            "nonce": base64.b64encode(b"n" * 31).decode("ascii"),
-        },
-    ],
-)
-def test_connector_rejects_malformed_challenge(config, credential, challenge):
-    connector, _, tls, _, _, _ = make_connector(config, credential)
-    tls.incoming = [json_frame(challenge)]
-
-    with pytest.raises(ValueError):
-        connector.connect(config, credential)
-
-    assert tls.closed
-
-
-def test_connector_normalizes_recursive_auth_json(config, credential):
-    connector, _, tls, _, _, _ = make_connector(config, credential)
-    nested = b"[" * 5000 + b"]" * 5000
-    tls.incoming = [frame(b'{"type":"CHALLENGE","nonce":' + nested + b"}")]
-
-    with pytest.raises(ValueError, match="invalid authentication message") as raised:
-        connector.connect(config, credential)
-
-    assert isinstance(raised.value.__cause__, RecursionError)
-    assert tls.closed
-
-
-@pytest.mark.parametrize(
-    "result",
-    [
-        {},
-        {"type": "AUTH_OK", "extra": True},
-        {"type": "WRONG"},
-        {"type": 1},
-    ],
-)
-def test_connector_rejects_malformed_auth_result(config, credential, result):
-    connector, _, tls, _, _, _ = make_connector(config, credential)
-    tls.incoming[-1] = json_frame(result)
-
-    with pytest.raises(ValueError, match="authentication result"):
-        connector.connect(config, credential)
-
     assert tls.closed
 
 
@@ -775,33 +697,6 @@ def test_connector_uses_fresh_socket_and_closes_before_clear(config, credential)
     assert events[-2:] == ["raw-close", "clear"]
 
 
-def test_authenticated_auth_reject_is_fatal_and_closed(config, credential):
-    connector, _, tls, events, publications, _ = make_connector(
-        config, credential, result="AUTH_REJECT"
-    )
-
-    with pytest.raises(AuthRejected):
-        connector.connect(config, credential)
-
-    assert tls.closed
-    assert events[-2:] == ["tls-close", "clear"]
-    assert publications[-1] == (None, tls)
-
-
-def test_close_error_does_not_mask_authenticated_auth_reject(config, credential):
-    connector, _, tls, events, publications, _ = make_connector(
-        config, credential, result="AUTH_REJECT"
-    )
-    tls.close_error = OSError("close failed")
-
-    with pytest.raises(AuthRejected):
-        connector.connect(config, credential)
-
-    assert tls.closed
-    assert events[-2:] == ["tls-close", "clear"]
-    assert publications[-1] == (None, tls)
-
-
 def test_pin_mismatch_happens_before_hello_and_is_not_auth_rejected(config, credential):
     connector, _, tls, _, _, _ = make_connector(config, credential)
     tls.certificate = b"different"
@@ -830,95 +725,6 @@ def test_connector_uses_constant_time_pin_comparison(monkeypatch, config, creden
     ]
 
 
-def test_eof_before_authenticated_result_is_transient_oserror(config, credential):
-    connector, _, tls, _, _, _ = make_connector(config, credential)
-    tls.incoming = [b""]
-
-    with pytest.raises(OSError) as raised:
-        connector.connect(config, credential)
-
-    assert not isinstance(raised.value, AuthRejected)
-
-
-@pytest.mark.parametrize(
-    ("mode", "error"),
-    [("timeout", TimeoutError), ("unexpected-result", ValueError)],
-)
-def test_non_reject_auth_outcomes_are_transient_and_cleaned(
-    config, credential, mode, error
-):
-    connector, _, tls, events, publications, _ = make_connector(
-        config, credential, result="UNEXPECTED"
-    )
-    if mode == "timeout":
-        tls.incoming = [TimeoutError()]
-
-    with pytest.raises(error) as raised:
-        connector.connect(config, credential)
-
-    assert not isinstance(raised.value, AuthRejected)
-    assert tls.closed
-    assert events[-2:] == ["tls-close", "clear"]
-    assert publications[-1] == (None, tls)
-
-
-def test_auth_trickle_cannot_extend_connect_timeout(config, credential):
-    class Clock:
-        now = 0.0
-
-        def __call__(self):
-            return self.now
-
-    clock = Clock()
-    connector, _, tls, _, _, _ = make_connector(config, credential)
-    challenge = tls.incoming[0]
-    tls.incoming = [bytes([byte]) for byte in challenge]
-    original_recv = tls.recv
-
-    def advancing_recv(size):
-        clock.now += 0.75
-        return original_recv(size)
-
-    tls.recv = advancing_recv
-    connector.clock = clock
-
-    with pytest.raises(TimeoutError, match="authentication deadline"):
-        connector.connect(config, credential)
-
-    assert tls.closed
-
-
-def test_late_complete_auth_reject_is_timeout_not_fatal(config, credential):
-    class Clock:
-        now = 0.0
-
-        def __call__(self):
-            return self.now
-
-    clock = Clock()
-    connector, _, tls, _, _, _ = make_connector(
-        config, credential, result="AUTH_REJECT"
-    )
-    original_recv = tls.recv
-    receives = 0
-
-    def recv(size):
-        nonlocal receives
-        packet = original_recv(size)
-        receives += 1
-        if receives == 4:
-            clock.now = config.connect_timeout
-        return packet
-
-    tls.recv = recv
-    connector.clock = clock
-
-    with pytest.raises(TimeoutError, match="authentication deadline") as raised:
-        connector.connect(config, credential)
-
-    assert not isinstance(raised.value, AuthRejected)
-
-
 def test_auth_rejection_stops_without_backoff(config, credential):
     connector = ScriptedConnector(AuthRejected())
     retry = FakeRetryPolicy()
@@ -931,60 +737,6 @@ def test_auth_rejection_stops_without_backoff(config, credential):
     assert connector.calls == 1
     assert connector.states == [AgentState.CONNECTING]
     assert retry.next_calls == 0
-
-
-@pytest.mark.parametrize(
-    ("credential", "error", "message"),
-    [
-        (object(), TypeError, "DeviceCredential"),
-        (DeviceCredential("", "key-1", b"s" * 32), ValueError, "agent_id"),
-        (DeviceCredential("a" * 129, "key-1", b"s" * 32), ValueError, "agent_id"),
-        (DeviceCredential(1, "key-1", b"s" * 32), ValueError, "agent_id"),
-        (DeviceCredential("agent-1", "", b"s" * 32), ValueError, "key_id"),
-        (DeviceCredential("agent-1", "k" * 129, b"s" * 32), ValueError, "key_id"),
-        (DeviceCredential("agent-1", 1, b"s" * 32), ValueError, "key_id"),
-        (DeviceCredential("agent-1", "key-1", b"s" * 31), ValueError, "secret"),
-        (DeviceCredential("agent-1", "key-1", b"s" * 33), ValueError, "secret"),
-        (DeviceCredential("agent-1", "key-1", bytearray(32)), ValueError, "secret"),
-    ],
-)
-def test_invalid_local_credential_fails_before_socket(
-    config, credential, error, message
-):
-    connector = ScriptedConnector()
-    events = []
-    runtime = AgentRuntime(
-        config, credential, connector=connector, event_sink=events.append
-    )
-
-    with pytest.raises(error, match=message):
-        runtime.run()
-
-    assert connector.calls == 0
-    assert runtime.state is AgentState.STOPPED
-    assert [event for event in events if event["event"] == "CONNECTION_FAILURE"] == [
-        {
-            "event": "CONNECTION_FAILURE",
-            "state": "STARTING",
-            "attempt": 0,
-            "category": "credential",
-        }
-    ]
-
-
-@pytest.mark.parametrize("size", [1, 128])
-def test_valid_credential_boundaries_reach_connector(config, size):
-    connector = ScriptedConnector(AuthRejected())
-    runtime = AgentRuntime(
-        config,
-        DeviceCredential("a" * size, "k" * size, b"s" * 32),
-        connector=connector,
-    )
-
-    runtime.run()
-
-    assert connector.calls == 1
-    assert runtime.state is AgentState.STOPPED
 
 
 def test_second_concurrent_run_is_rejected_without_second_owner(config, credential):
@@ -1136,7 +888,6 @@ def test_lifecycle_events_are_exact_ordered_and_sanitized(config, credential):
         {"event": "PROCESS_START", "state": "STARTING", "attempt": 0},
         {"event": "STATE_TRANSITION", "state": "CONNECTING", "attempt": 1},
         {"event": "CONNECTION_ATTEMPT", "state": "CONNECTING", "attempt": 1},
-        {"event": "AUTH_ACCEPTED", "state": "CONNECTING", "attempt": 1},
         {"event": "CONNECTION_SUCCESS", "state": "CONNECTING", "attempt": 1},
         {"event": "STATE_TRANSITION", "state": "ONLINE", "attempt": 1},
         {
@@ -1179,47 +930,12 @@ def test_lifecycle_events_are_exact_ordered_and_sanitized(config, credential):
     for sensitive in (
         config.controller_host,
         credential.agent_id,
-        credential.key_id,
         "credential",
         "payload",
         "PING",
         "secret exception text",
     ):
         assert sensitive not in serialized
-
-
-def test_production_auth_reject_emits_cause_before_single_close(config, credential):
-    events = []
-    connector, _, tls, _, _, _ = make_connector(
-        config, credential, result="AUTH_REJECT"
-    )
-    runtime = AgentRuntime(
-        config, credential, connector=connector, event_sink=events.append
-    )
-
-    runtime.run()
-
-    relevant = [
-        event
-        for event in events
-        if event["event"] in {"AUTH_REJECTED", "CONNECTION_FAILURE", "SOCKET_CLOSE"}
-    ]
-    assert relevant == [
-        {"event": "AUTH_REJECTED", "state": "CONNECTING", "attempt": 1},
-        {
-            "event": "CONNECTION_FAILURE",
-            "state": "CONNECTING",
-            "attempt": 1,
-            "category": "auth",
-        },
-        {
-            "event": "SOCKET_CLOSE",
-            "state": "CONNECTING",
-            "attempt": 1,
-            "category": "clean",
-        },
-    ]
-    assert tls.closed
 
 
 def test_protocol_and_heartbeat_failures_emit_safe_categories(config, credential):
@@ -1474,16 +1190,7 @@ class BlockingRaw(FakeRawSocket):
 
 class BlockingTls(FakeTlsSocket):
     def __init__(self, events, phase, entered, released):
-        nonce = b"n" * 32
-        super().__init__(
-            [
-                json_frame(
-                    {"type": "CHALLENGE", "nonce": base64.b64encode(nonce).decode()}
-                ),
-                json_frame({"type": "AUTH_OK"}),
-            ],
-            events,
-        )
+        super().__init__([], events)
         self.phase = phase
         self.entered = entered
         self.released = released
@@ -1495,19 +1202,12 @@ class BlockingTls(FakeTlsSocket):
             assert self.released.wait(1)
             raise OSError("handshake interrupted")
 
-    def recv(self, size):
-        if self.phase == "auth":
-            self.entered.set()
-            assert self.released.wait(1)
-            raise OSError("auth interrupted")
-        return super().recv(size)
-
     def shutdown(self, how):
         super().shutdown(how)
         self.released.set()
 
 
-@pytest.mark.parametrize("phase", ["connect", "tls", "auth"])
+@pytest.mark.parametrize("phase", ["connect", "tls"])
 def test_stop_interrupts_every_connection_phase_without_thread_leak(
     config, credential, phase
 ):

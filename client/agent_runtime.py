@@ -1,29 +1,20 @@
 from __future__ import annotations
 
-import base64
 import hashlib
 import hmac
 import random as _random
 import socket
 import ssl
 import threading
-from collections import deque
 from datetime import datetime, timedelta, timezone
 from enum import Enum, auto
 from time import monotonic
 
-from client.agent_config import AgentConfig, DeviceCredential
+from client.agent_config import AgentConfig
 from client.managed_identity import AgentCertificateIdentity
-from client.transport import (
-    FrameDecoder,
-    build_proof,
-    decode_json_payload,
-    encode_json_payload,
-    encode_message,
-)
+from client.transport import FrameDecoder, encode_message
 
 _MAX_MANAGED_FRAME = 64 * 1024
-_PROTOCOL_VERSION = 1
 
 
 class AgentState(Enum):
@@ -68,54 +59,16 @@ def send_frame(conn, payload) -> None:
     conn.sendall(header + body)
 
 
-def _tls_client_context():
-    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    context.check_hostname = False
-    context.verify_mode = ssl.CERT_NONE
-    context.minimum_version = ssl.TLSVersion.TLSv1_2
-    return context
-
-
-def _set_deadline_timeout(conn, deadline, clock) -> None:
-    remaining = deadline - clock()
-    if remaining <= 0:
-        raise TimeoutError("authentication deadline")
-    conn.settimeout(remaining)
-
-
-class _FrameReader:
-    def __init__(self, conn, deadline, clock):
-        self.conn = conn
-        self.deadline = deadline
-        self.clock = clock
-        self.decoder = FrameDecoder(max_size=_MAX_MANAGED_FRAME)
-        self.pending = deque()
-
-    def read(self):
-        while not self.pending:
-            _set_deadline_timeout(self.conn, self.deadline, self.clock)
-            missing = (
-                4 - len(self.decoder.buffer)
-                if self.decoder.expected is None
-                else self.decoder.expected - len(self.decoder.buffer)
-            )
-            chunk = self.conn.recv(missing)
-            if self.clock() >= self.deadline:
-                raise TimeoutError("authentication deadline")
-            if not chunk:
-                raise ConnectionError("peer closed")
-            self.pending.extend(self.decoder.feed(chunk))
-        return self.pending.popleft()
-
-
 class ManagedConnector:
     def __init__(
         self,
         *,
+        certificate_store=None,
         socket_factory=socket.socket,
-        context_factory=_tls_client_context,
+        context_factory=None,
         clock=monotonic,
     ):
+        self._certificate_store = certificate_store
         self._socket_factory = socket_factory
         self._context_factory = context_factory
         self.clock = clock
@@ -126,7 +79,7 @@ class ManagedConnector:
         self._publish_socket = publish
         self._clear_socket = clear
 
-    def connect(self, config: AgentConfig, credential: DeviceCredential):
+    def connect(self, config: AgentConfig, identity: AgentCertificateIdentity):
         raw = self._socket_factory(socket.AF_INET, socket.SOCK_STREAM)
         conn = raw
         try:
@@ -135,7 +88,12 @@ class ManagedConnector:
                 raise OSError("connection stopped")
             raw.connect((config.controller_host, config.managed_port))
 
-            context = self._context_factory()
+            if self._context_factory is not None:
+                context = self._context_factory()
+            elif self._certificate_store is not None:
+                context = self._certificate_store.client_context(identity)
+            else:
+                raise RuntimeError("certificate store is required")
             conn = context.wrap_socket(
                 raw,
                 server_hostname=config.controller_host,
@@ -152,7 +110,6 @@ class ManagedConnector:
             if not hmac.compare_digest(fingerprint, config.tls_cert_sha256):
                 raise ssl.SSLError("peer certificate pin mismatch")
 
-            self._authenticate(conn, credential, config.connect_timeout)
             return conn
         except Exception:
             try:
@@ -162,74 +119,6 @@ class ManagedConnector:
             finally:
                 self._clear_socket(conn)
             raise
-
-    def _authenticate(self, conn, credential: DeviceCredential, timeout: float) -> None:
-        deadline = self.clock() + timeout
-        _set_deadline_timeout(conn, deadline, self.clock)
-        send_frame(
-            conn,
-            encode_json_payload(
-                {
-                    "type": "HELLO",
-                    "version": _PROTOCOL_VERSION,
-                    "agent_id": credential.agent_id,
-                    "key_id": credential.key_id,
-                }
-            ),
-        )
-        reader = _FrameReader(conn, deadline, self.clock)
-        challenge = _decode_auth_message(reader.read())
-        if set(challenge) != {"type", "nonce"} or challenge["type"] != "CHALLENGE":
-            raise ValueError("invalid CHALLENGE")
-        nonce_text = challenge["nonce"]
-        if not isinstance(nonce_text, str) or len(nonce_text) > 64:
-            raise ValueError("invalid CHALLENGE")
-        nonce = base64.b64decode(nonce_text, validate=True)
-        if len(nonce) != 32 or base64.b64encode(nonce).decode("ascii") != nonce_text:
-            raise ValueError("invalid CHALLENGE")
-
-        proof = build_proof(
-            credential.secret,
-            _PROTOCOL_VERSION,
-            credential.agent_id,
-            credential.key_id,
-            nonce,
-        )
-        _set_deadline_timeout(conn, deadline, self.clock)
-        send_frame(
-            conn,
-            encode_json_payload(
-                {
-                    "type": "AUTH_PROOF",
-                    "proof": base64.b64encode(proof).decode("ascii"),
-                }
-            ),
-        )
-        result = _decode_auth_message(reader.read())
-        if result == {"type": "AUTH_OK"}:
-            return
-        if result == {"type": "AUTH_REJECT"}:
-            raise AuthRejected()
-        raise ValueError("invalid authentication result")
-
-
-def _decode_auth_message(payload):
-    try:
-        return decode_json_payload(payload)
-    except RecursionError as exc:
-        raise ValueError("invalid authentication message") from exc
-
-
-def _validate_credential(credential: DeviceCredential) -> None:
-    if not isinstance(credential, DeviceCredential):
-        raise TypeError("credential must be a DeviceCredential")
-    for name in ("agent_id", "key_id"):
-        value = getattr(credential, name)
-        if not isinstance(value, str) or not 0 < len(value) <= 128:
-            raise ValueError(f"credential {name} is invalid")
-    if not isinstance(credential.secret, bytes) or len(credential.secret) != 32:
-        raise ValueError("credential secret is invalid")
-
 
 def _failure_category(exc) -> str:
     if isinstance(exc, _HeartbeatDeadline):
@@ -251,7 +140,7 @@ class AgentRuntime:
     def __init__(
         self,
         config: AgentConfig,
-        credential: DeviceCredential,
+        credential: AgentCertificateIdentity,
         *,
         connector=None,
         retry_policy=None,
@@ -276,7 +165,7 @@ class AgentRuntime:
         self.renewer = renewer
         self._renewal_in_progress_serial = None
         self._renewal_succeeded_for_serial = None
-        self.connector = connector or ManagedConnector()
+        self.connector = connector or ManagedConnector(certificate_store=identity_store)
         bind = getattr(self.connector, "set_socket_hooks", None)
         if bind is not None:
             bind(self._publish_connection, self._clear_connection)
@@ -449,10 +338,8 @@ class AgentRuntime:
         try:
             self._emit("PROCESS_START")
             try:
-                if isinstance(self.credential, DeviceCredential):
-                    _validate_credential(self.credential)
-                elif not isinstance(self.credential, AgentCertificateIdentity):
-                    raise TypeError("credential must be a DeviceCredential")
+                if not isinstance(self.credential, AgentCertificateIdentity):
+                    raise TypeError("credential must be an AgentCertificateIdentity")
             except (TypeError, ValueError):
                 self._emit("CONNECTION_FAILURE", category="credential")
                 raise
@@ -470,7 +357,6 @@ class AgentRuntime:
                 transient = False
                 try:
                     conn = self.connector.connect(self.config, self.credential)
-                    self._emit("AUTH_ACCEPTED")
                     self._emit("CONNECTION_SUCCESS")
                     if not self._publish_connection(conn):
                         continue
