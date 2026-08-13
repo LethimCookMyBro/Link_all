@@ -140,6 +140,7 @@ def build_app(
     """Factory so the Textual import stays lazy and testable."""
     from textual.app import App, ComposeResult
     from textual.containers import Vertical
+    from textual.css.query import NoMatches
     from textual.widgets import DataTable, Footer, Header, Static
 
     class C2DashboardApp(App):
@@ -176,12 +177,16 @@ def build_app(
 
         def _refresh(self) -> None:
             try:
+                table = self.query_one("#clients", DataTable)
+                status = self.query_one("#status", Static)
+            except NoMatches:
+                return
+            try:
                 rows = self._data.refresh_if_stale()
                 summary = self._data.summary()
             except Exception as exc:  # defensive: never let the loop die
-                self.query_one("#status", Static).update(f"[red]snapshot error: {exc}[/red]")
+                status.update(f"[red]snapshot error: {exc}[/red]")
                 return
-            table = self.query_one("#clients", DataTable)
             table.clear()
             for row in rows:
                 state = "ON" if row.connected else "off"
@@ -191,7 +196,7 @@ def build_app(
                     row.quality, str(row.total_commands), state,
                 )
             uptime = int(time.time() - self._started)
-            self.query_one("#status", Static).update(
+            status.update(
                 f"[bold cyan]Uptime {uptime}s[/bold cyan] | "
                 f"Total [bold]{int(summary['total'])}[/bold] | "
                 f"Connected [bold green]{int(summary['connected'])}[/bold green] | "

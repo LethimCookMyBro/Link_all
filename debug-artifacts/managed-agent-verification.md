@@ -74,6 +74,16 @@ Exit statuses: `0`, `0`, `0`. There were no unhandled thread exception warnings.
 
 ## Repeated loopback integration
 
+```powershell
+$python = 'G:\for_hack_all\Link_all - Copy\.venv\Scripts\python.exe'
+1..3 | ForEach-Object {
+  & $python -m pytest tests/test_agent_runtime_integration.py -q --maxfail=1
+  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+}
+```
+
+Literal output and exit statuses:
+
 ```text
 RUN=1
 ...............                                                          [100%]
@@ -90,6 +100,19 @@ EXIT_STATUS=0
 ```
 
 ## Windows logging and pythonw smoke
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests/test_agent_logging.py -q
+$pythonw = Resolve-Path .\.venv\Scripts\pythonw.exe
+$proc = Start-Process $pythonw -ArgumentList 'client/managed_agent.py','run','--config','debug-artifacts/managed-agent-test.json' -WindowStyle Hidden -PassThru
+Start-Sleep -Seconds 3
+if (-not $proc.HasExited) { Stop-Process -Id $proc.Id }
+Wait-Process -Id $proc.Id -ErrorAction SilentlyContinue
+Test-Path debug-artifacts/managed-agent.log
+Get-Content debug-artifacts/managed-agent.log | ForEach-Object { $_ | ConvertFrom-Json | Out-Null }
+```
+
+Literal output and exit statuses:
 
 ```text
 .....                                                                    [100%]
@@ -116,6 +139,19 @@ Path: `debug-artifacts/managed-agent.patch`
 
 SHA-256: `52fb0202daffb458dcedeb937e40cd5104042a781600ee30acbfc1ecc2693ed5`
 
+```powershell
+$base = (Get-Content debug-artifacts/managed-agent-preflight/feature-base.txt -Raw).Trim()
+cmd /d /c "git diff $base..HEAD -- client/transport.py client/agent_config.py client/agent_runtime.py client/agent_logging.py client/managed_agent.py C2/managed_auth.py C2/crypto.py C2/C2.py config.py .env.example tests/test_client_transport.py tests/test_agent_config.py tests/test_managed_auth.py tests/test_agent_runtime.py tests/test_agent_logging.py tests/test_encryption.py > debug-artifacts\managed-agent.patch"
+$patch = (Resolve-Path debug-artifacts/managed-agent.patch).Path
+$checkRoot = Join-Path 'G:\for_hack_all\Link_all - Copy\.worktrees' "managed-agent-patch-check-$PID"
+git worktree add --detach $checkRoot $base
+Push-Location $checkRoot
+try { git apply --check $patch }
+finally { Pop-Location; git worktree remove --force $checkRoot }
+```
+
+Literal output and exit status:
+
 ```text
 PATCH_CHECK_EXIT=0
 PATCH_BYTES=206205
@@ -124,6 +160,20 @@ PATCH_BYTES=206205
 The non-empty patch applied with `git apply --check` in a clean detached worktree at the baseline commit.
 
 ## Dependency, static, and Defender validation
+
+```powershell
+$python = 'G:\for_hack_all\Link_all - Copy\.venv\Scripts\python.exe'
+uv pip check --python $python
+rg -n "av_bypass|av_killer|subprocess|os\.system|CreateProcess|powershell" client/transport.py client/agent_config.py client/agent_runtime.py client/agent_logging.py client/managed_agent.py C2/managed_auth.py
+$defender = "$env:ProgramFiles\Windows Defender\MpCmdRun.exe"
+$files = 'client/transport.py','client/agent_config.py','client/agent_runtime.py','client/agent_logging.py','client/managed_agent.py','C2/managed_auth.py'
+foreach ($file in $files) {
+  & $defender -Scan -ScanType 3 -File (Resolve-Path $file).Path -DisableRemediation
+  Write-Output "$file DEFENDER_EXIT=$LASTEXITCODE"
+}
+```
+
+Literal output and exit statuses (`rg` exit `1` means no matches):
 
 ```text
 PIP_CHECK_EXIT=0
@@ -140,6 +190,22 @@ Each managed Phase 1 source file reported `found no threats`. A broad scan of th
 
 ## Rollback execution
 
+```powershell
+$rollbackRoot = Join-Path 'G:\for_hack_all\Link_all - Copy\.worktrees' "managed-agent-rollback-$PID"
+git worktree add --detach $rollbackRoot HEAD
+$junction = Join-Path $rollbackRoot '.venv'
+New-Item -ItemType Junction -Path $junction -Target 'G:\for_hack_all\Link_all - Copy\.venv' | Out-Null
+Push-Location $rollbackRoot
+try { powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\rollback-managed-agent.ps1 }
+finally {
+  Pop-Location
+  cmd /d /c "rmdir `"$junction`""
+  git worktree remove --force $rollbackRoot
+}
+```
+
+Literal output and exit status:
+
 ```text
 .............................                                            [100%]
 29 passed in 0.74s
@@ -149,6 +215,102 @@ MANAGED_AUTH_EXISTS=False
 ```
 
 The exact `scripts/rollback-managed-agent.ps1` command completed at exit `0` in a detached disposable worktree. Both managed implementation paths were absent after reverse application, and the legacy listener tests passed.
+
+## Task 7 gate fix round 1
+
+Deterministic RED command:
+
+```powershell
+G:\for_hack_all\Link_all - Copy\.venv\Scripts\python.exe -m pytest tests/test_dashboard.py::TestDashboardApp::test_late_refresh_after_teardown_is_contained -q
+```
+
+Literal output and exit status:
+
+```text
+F                                                                        [100%]
+textual.css.query.NoMatches: No nodes match '#clients' on Screen(id='_default')
+1 failed in 0.38s
+RED_EXIT=1
+```
+
+The shared `_refresh` callback now treats only Textual's `NoMatches` lifecycle signal as a late-teardown no-op. Snapshot and widget update errors keep their existing behavior.
+
+Repeated dashboard command:
+
+```powershell
+1..30 | ForEach-Object {
+  G:\for_hack_all\Link_all - Copy\.venv\Scripts\python.exe -m pytest tests/test_dashboard.py -q
+  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+}
+```
+
+Literal output and exit status:
+
+```text
+30 consecutive runs: 13 passed
+DASHBOARD_REPEAT_30_EXIT=0
+```
+
+Runbook config encoding/load command:
+
+```powershell
+$python = 'G:\for_hack_all\Link_all - Copy\.venv\Scripts\python.exe'
+$configPath = Join-Path (Resolve-Path debug-artifacts).Path 'runbook-config-check.json'
+$pin = '0' * 64
+$configJson = @{
+  controller_host='127.0.0.1'; managed_port=5443; enrollment_port=5444
+  tls_cert_sha256=$pin; connect_timeout=0.5; io_poll_interval=0.5
+  controller_ping_interval=30; controller_pong_timeout=10; agent_read_deadline=90
+  retry_base=1; retry_max=30; retry_jitter=0.2
+  log_path=(Join-Path (Resolve-Path debug-artifacts).Path 'managed-agent.log')
+  log_max_bytes=1048576; log_backup_count=5
+} | ConvertTo-Json
+[IO.File]::WriteAllText($configPath, $configJson, [Text.UTF8Encoding]::new($false))
+Remove-Variable configJson
+@'
+from pathlib import Path
+from client.agent_config import _apply_private_acl, load_config
+path=Path('debug-artifacts/runbook-config-check.json')
+_apply_private_acl(path)
+config=load_config(path)
+print(f'CONFIG_VALID={config.controller_host}:{config.managed_port}')
+print(f'BOM_PRESENT={path.read_bytes().startswith(bytes.fromhex("efbbbf"))}')
+path.unlink()
+'@ | & $python -
+```
+
+Literal output and exit status:
+
+```text
+CONFIG_VALID=127.0.0.1:5443
+BOM_PRESENT=False
+RUNBOOK_CONFIG_EXIT=0
+```
+
+Fresh Task 7 and full-gate commands:
+
+```powershell
+1..3 | ForEach-Object {
+  G:\for_hack_all\Link_all - Copy\.venv\Scripts\python.exe -m pytest tests/test_agent_runtime_integration.py -q --maxfail=1
+  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+}
+G:\for_hack_all\Link_all - Copy\.venv\Scripts\python.exe -m pytest tests/test_client_transport.py tests/test_agent_config.py tests/test_managed_auth.py tests/test_agent_runtime.py tests/test_agent_logging.py tests/test_agent_runtime_integration.py -q
+G:\for_hack_all\Link_all - Copy\.venv\Scripts\python.exe -m pytest -q
+```
+
+Literal output and exit statuses:
+
+```text
+INTEGRATION_RUN=1: 15 passed in 11.82s; INTEGRATION_EXIT=0
+INTEGRATION_RUN=2: 15 passed in 12.90s; INTEGRATION_EXIT=0
+INTEGRATION_RUN=3: 15 passed in 11.82s; INTEGRATION_EXIT=0
+204 passed in 19.48s
+FOCUSED_EXIT=0
+403 passed, 2 warnings in 93.53s (0:01:33)
+FULL_FRESH_EXIT=0
+```
+
+No unhandled thread exception warning appeared.
 
 ## All new or modified paths
 

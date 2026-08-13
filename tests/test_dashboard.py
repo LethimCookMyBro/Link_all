@@ -138,6 +138,17 @@ class TestDashboardData:
 
 
 class TestDashboardApp:
+    def test_late_refresh_after_teardown_is_contained(self):
+        import asyncio
+
+        async def run():
+            app = build_app(DashboardData(snapshot_fn=sample_snapshot), refresh_interval=0.05)
+            async with app.run_test(size=(80, 24)) as pilot:
+                await pilot.pause()
+            app._refresh()
+
+        asyncio.run(run())
+
     def test_headless_app_builds_table(self):
         import asyncio
 

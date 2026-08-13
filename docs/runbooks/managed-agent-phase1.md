@@ -52,10 +52,21 @@ In a second PowerShell window:
 
 ```powershell
 $python = (Resolve-Path .\.venv\Scripts\python.exe).Path
+$pin = @'
+from pathlib import Path
+from hashlib import sha256
+from cryptography import x509
+from cryptography.hazmat.primitives.serialization import Encoding
+cert = x509.load_pem_x509_certificate(Path("debug-artifacts/managed-cert.pem").read_bytes())
+print(sha256(cert.public_bytes(Encoding.DER)).hexdigest())
+'@ | & $python -
+$pin = $pin.Trim()
 $store = (Resolve-Path debug-artifacts\managed-store).Path
 $tokenFile = Join-Path (Resolve-Path debug-artifacts).Path 'managed-enrollment-token.txt'
-& $python -m C2.managed_auth issue-token --store $store --ttl 600 |
-    Set-Content -LiteralPath $tokenFile -NoNewline
+$token = & $python -m C2.managed_auth issue-token --store $store --ttl 600
+if ($LASTEXITCODE -ne 0) { throw "Token issue failed: $LASTEXITCODE" }
+[IO.File]::WriteAllText($tokenFile, $token.Trim(), [Text.UTF8Encoding]::new($false))
+Remove-Variable token
 @'
 from pathlib import Path
 from client.agent_config import _apply_private_acl
@@ -63,7 +74,7 @@ _apply_private_acl(Path("debug-artifacts/managed-enrollment-token.txt"))
 '@ | & $python -
 
 $configPath = Join-Path (Resolve-Path debug-artifacts).Path 'managed-agent-test.json'
-@{
+$configJson = @{
     controller_host = '127.0.0.1'
     managed_port = 5443
     enrollment_port = 5444
@@ -79,11 +90,16 @@ $configPath = Join-Path (Resolve-Path debug-artifacts).Path 'managed-agent-test.
     log_path = (Join-Path (Resolve-Path debug-artifacts).Path 'managed-agent.log')
     log_max_bytes = 1048576
     log_backup_count = 5
-} | ConvertTo-Json | Set-Content -LiteralPath $configPath -Encoding UTF8
+} | ConvertTo-Json
+[IO.File]::WriteAllText($configPath, $configJson, [Text.UTF8Encoding]::new($false))
+Remove-Variable configJson
 @'
 from pathlib import Path
-from client.agent_config import _apply_private_acl
-_apply_private_acl(Path("debug-artifacts/managed-agent-test.json"))
+from client.agent_config import _apply_private_acl, load_config
+path = Path("debug-artifacts/managed-agent-test.json")
+_apply_private_acl(path)
+load_config(path)
+print("CONFIG_VALID")
 '@ | & $python -
 ```
 
