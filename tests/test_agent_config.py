@@ -2,6 +2,7 @@ import base64
 import hashlib
 import json
 import os
+import socket
 import sys
 
 from dataclasses import FrozenInstanceError
@@ -609,6 +610,31 @@ def test_enroll_pywin_storage_failure_returns_five(tmp_path, monkeypatch):
 
     assert managed_agent.main(["enroll", "--config", str(tmp_path / "agent.json")]) == 5
 
+
+def test_managed_certificate_config_defaults_and_validates(tmp_path, monkeypatch):
+    monkeypatch.setattr(socket, "gethostname", lambda: "pc-default")
+    config = AgentConfig.from_mapping(valid_config(tmp_path))
+    assert config.display_name == "pc-default"
+    assert config.agent_version == "2.0"
+    assert config.certificate_store_path == "managed-identity.dpapi"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("display_name", "x" * 129),
+        ("display_name", "bad\nname"),
+        ("agent_version", ""),
+        ("agent_version", "x" * 33),
+        ("agent_version", "v\u00e9"),
+        ("certificate_store_path", ""),
+    ],
+)
+def test_rejects_invalid_managed_certificate_config(tmp_path, field, value):
+    data = valid_config(tmp_path)
+    data[field] = value
+    with pytest.raises(ValueError, match=field):
+        AgentConfig.from_mapping(data)
 
 def test_config_platform_failure_returns_five(monkeypatch):
     from client import managed_agent

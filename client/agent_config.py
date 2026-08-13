@@ -5,6 +5,7 @@ import json
 import math
 import os
 import re
+import socket
 import stat
 import tempfile
 from dataclasses import dataclass
@@ -43,6 +44,9 @@ class AgentConfig:
     log_path: str = "managed-agent.log"
     log_max_bytes: int = 1048576
     log_backup_count: int = 5
+    display_name: str = ""
+    agent_version: str = "2.0"
+    certificate_store_path: str = "managed-identity.dpapi"
 
     def __post_init__(self) -> None:
         if not isinstance(self.controller_host, str) or not self.controller_host.strip():
@@ -55,6 +59,22 @@ class AgentConfig:
             r"[0-9a-f]{64}", self.tls_cert_sha256
         ):
             raise ValueError("tls_cert_sha256 must be 64 lowercase hexadecimal characters")
+        if type(self.display_name) is not str or (
+            self.display_name
+            and (len(self.display_name) > 128 or not self.display_name.isprintable())
+        ):
+            raise ValueError("display_name must be 1 to 128 printable characters")
+        if (
+            type(self.agent_version) is not str
+            or not 1 <= len(self.agent_version) <= 32
+            or any(not 0x21 <= ord(character) <= 0x7E for character in self.agent_version)
+        ):
+            raise ValueError("agent_version must be 1 to 32 visible ASCII characters")
+        if (
+            type(self.certificate_store_path) is not str
+            or not self.certificate_store_path
+        ):
+            raise ValueError("certificate_store_path must not be empty")
         for name in (
             "connect_timeout",
             "controller_ping_interval",
@@ -78,8 +98,17 @@ class AgentConfig:
     def from_mapping(cls, data: Mapping[str, Any]) -> AgentConfig:
         if not isinstance(data, Mapping):
             raise ValueError("config must be a mapping")
+        values = dict(data)
+        if values.get("display_name", "") == "":
+            values["display_name"] = socket.gethostname()
+        if (
+            type(values["display_name"]) is not str
+            or not 1 <= len(values["display_name"]) <= 128
+            or not values["display_name"].isprintable()
+        ):
+            raise ValueError("display_name must be 1 to 128 printable characters")
         try:
-            return cls(**dict(data))
+            return cls(**values)
         except TypeError as exc:
             raise ValueError(f"invalid config fields: {exc}") from exc
 
