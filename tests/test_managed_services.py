@@ -210,6 +210,31 @@ def test_heartbeat_timeout_removes_session_and_audits(registry, enrolled_device)
     assert registry.list_audit_events(1)[0].action == "HEARTBEAT_TIMEOUT"
 
 
+def test_audit_failure_during_unregister_still_closes_and_removes_session(
+    registry, enrolled_device, monkeypatch
+):
+    sessions = SessionManager(registry)
+    connection = FakeConnection()
+    session = sessions.register(
+        enrolled_device.agent_id,
+        enrolled_device.certificate_fingerprint,
+        enrolled_device.certificate_serial,
+        "10.8.0.21",
+        connection,
+    )
+    monkeypatch.setattr(
+        registry,
+        "append_audit",
+        lambda **_kwargs: (_ for _ in ()).throw(OSError("audit unavailable")),
+    )
+
+    with pytest.raises(OSError, match="audit unavailable"):
+        sessions.unregister(enrolled_device.agent_id, session.session_id, "peer_closed")
+
+    assert sessions.snapshot() == ()
+    assert connection.closed
+
+
 def test_session_snapshots_are_frozen(registry, enrolled_device):
     session = SessionManager(registry).register(
         enrolled_device.agent_id,

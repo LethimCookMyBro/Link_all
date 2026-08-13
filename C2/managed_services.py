@@ -140,26 +140,37 @@ class SessionManager:
             raise PermissionError("certificate is not allowed")
 
     def unregister(self, agent_id: str, session_id: str, reason: str) -> bool:
-        with self._lock:
-            current = self._sessions.get(agent_id)
-            if current is None or current.snapshot.session_id != session_id:
-                return False
-            action = "HEARTBEAT_TIMEOUT" if reason == "HEARTBEAT_TIMEOUT" else "DISCONNECTED"
-            self.registry.append_audit(
-                actor="managed-listener",
-                action=action,
-                target_agent_id=agent_id,
-                result="SUCCEEDED",
-                reason=reason,
-                correlation_id=session_id,
-                details={
-                    "peer_ip": current.snapshot.peer_ip,
-                    "session_id": session_id,
-                    "status_code": reason,
-                },
-            )
-            del self._sessions[agent_id]
-        _close_connection(current.connection)
+        current = None
+        try:
+            with self._lock:
+                found = self._sessions.get(agent_id)
+                if found is None or found.snapshot.session_id != session_id:
+                    return False
+                current = found
+                action = (
+                    "HEARTBEAT_TIMEOUT"
+                    if reason == "HEARTBEAT_TIMEOUT"
+                    else "DISCONNECTED"
+                )
+                try:
+                    self.registry.append_audit(
+                        actor="managed-listener",
+                        action=action,
+                        target_agent_id=agent_id,
+                        result="SUCCEEDED",
+                        reason=reason,
+                        correlation_id=session_id,
+                        details={
+                            "peer_ip": current.snapshot.peer_ip,
+                            "session_id": session_id,
+                            "status_code": reason,
+                        },
+                    )
+                finally:
+                    del self._sessions[agent_id]
+        finally:
+            if current is not None:
+                _close_connection(current.connection)
         return True
 
     def disconnect(self, agent_id: str) -> bool:
@@ -383,15 +394,19 @@ class ManagedServer:
         except (ConnectionError, OSError, ssl.SSLError, ValueError, PermissionError):
             pass
         finally:
-            if session is not None:
-                self.sessions.unregister(session.agent_id, session.session_id, reason)
-            else:
-                _close_connection(connection)
-            with self._lock:
-                self._connections.discard(raw_connection)
-                self._connections.discard(connection)
-                self._threads.discard(threading.current_thread())
-            self._worker_slots.release()
+            try:
+                if session is not None:
+                    self.sessions.unregister(
+                        session.agent_id, session.session_id, reason
+                    )
+                else:
+                    _close_connection(connection)
+            finally:
+                with self._lock:
+                    self._connections.discard(raw_connection)
+                    self._connections.discard(connection)
+                    self._threads.discard(threading.current_thread())
+                self._worker_slots.release()
 
     def expire_session_for_test(self, session: SessionSnapshot) -> None:
         self.sessions.unregister(session.agent_id, session.session_id, "HEARTBEAT_TIMEOUT")
