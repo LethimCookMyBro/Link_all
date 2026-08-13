@@ -12,6 +12,7 @@ import select
 import socket
 import ssl
 import threading
+import errno
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from time import monotonic, time
@@ -42,6 +43,74 @@ __all__ = [
 
 _MAX_JSON_SIZE = 64 * 1024
 _MAX_ID_SIZE = 128
+_PROCESS_LOCK_TIMEOUT = 5.0
+_local_locks_guard = threading.Lock()
+_local_locks = {}
+
+
+class _ProcessFileLock:
+    """Serialize one store across threads and processes without dependencies."""
+
+    def __init__(self, data_path, timeout=_PROCESS_LOCK_TIMEOUT):
+        self.path = Path(f"{data_path}.lock")
+        self.timeout = timeout
+        key = str(self.path.resolve())
+        with _local_locks_guard:
+            self._thread_lock = _local_locks.setdefault(key, threading.Lock())
+        self._file = None
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("a+b") as lock_file:
+            if lock_file.tell() == 0:
+                lock_file.write(b"\0")
+                lock_file.flush()
+
+    def __enter__(self):
+        if not self._thread_lock.acquire(timeout=self.timeout):
+            raise TimeoutError("store lock timed out")
+        try:
+            self._file = self.path.open("r+b")
+            deadline = monotonic() + self.timeout
+            while True:
+                try:
+                    self._lock_byte()
+                    return self
+                except OSError as exc:
+                    if exc.errno not in (errno.EACCES, errno.EAGAIN, 13, 36) or monotonic() >= deadline:
+                        raise TimeoutError("store lock timed out") from exc
+                    threading.Event().wait(min(0.01, deadline - monotonic()))
+        except Exception:
+            if self._file is not None:
+                self._file.close()
+                self._file = None
+            self._thread_lock.release()
+            raise
+
+    def _lock_byte(self):
+        self._file.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(self._file.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(self._file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def __exit__(self, *_):
+        try:
+            self._file.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(self._file.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(self._file.fileno(), fcntl.LOCK_UN)
+        finally:
+            self._file.close()
+            self._file = None
+            self._thread_lock.release()
 
 
 def _recv_exactly(conn, size: int) -> bytes:
@@ -94,7 +163,7 @@ class EnrollmentStore:
     ) -> None:
         self.path = Path(path)
         self._now = now
-        self._lock = threading.Lock()
+        self._lock = _ProcessFileLock(self.path)
         self._needs_migration = False
         self._acl_inspector = acl_inspector
         self._acl_applier = acl_applier or _apply_private_acl
@@ -231,7 +300,7 @@ class DeviceRegistry:
         self.path = Path(path)
         self._test_boundary = protector is not None
         self._protector = protector or _DpapiProtector()
-        self._lock = threading.Lock()
+        self._lock = _ProcessFileLock(self.path)
         self._needs_migration = False
         self._acl_inspector = acl_inspector
         self._acl_applier = (
@@ -516,6 +585,8 @@ class ManagedServer:
         initial_ping_delay: float = 10.0,
         ping_interval: float = 30.0,
         pong_timeout: float = 10.0,
+        max_workers: int = 32,
+        handshake_timeout: float = 0.5,
     ) -> None:
         for name, value in (
             ("initial_ping_delay", initial_ping_delay),
@@ -534,6 +605,12 @@ class ManagedServer:
         self._initial_ping_delay = initial_ping_delay
         self._ping_interval = ping_interval
         self._pong_timeout = pong_timeout
+        if type(max_workers) is not int or max_workers <= 0:
+            raise ValueError("max_workers must be positive")
+        if not isinstance(handshake_timeout, (int, float)) or handshake_timeout <= 0:
+            raise ValueError("handshake_timeout must be positive")
+        self._handshake_timeout = handshake_timeout
+        self._worker_slots = threading.BoundedSemaphore(max_workers)
         self._stopped = threading.Event()
         self._lock = threading.Lock()
         self._startup = threading.Condition()
@@ -589,11 +666,14 @@ class ManagedServer:
                     continue
                 except OSError:
                     break
+                if not self._worker_slots.acquire(blocking=False):
+                    conn.close()
+                    continue
                 thread = threading.Thread(
                     target=self._serve_connection,
                     args=(conn,),
                     name="managed-session",
-                    daemon=False,
+                    daemon=True,
                 )
                 with self._lock:
                     if self._stopped.is_set() or stop_event.is_set():
@@ -608,7 +688,7 @@ class ManagedServer:
     def _serve_connection(self, raw_conn: socket.socket) -> None:
         conn = raw_conn
         try:
-            raw_conn.settimeout(10.0)
+            raw_conn.settimeout(self._handshake_timeout)
             conn = self._context.wrap_socket(raw_conn, server_side=True)
             with self._lock:
                 self._connections.discard(raw_conn)
@@ -628,6 +708,7 @@ class ManagedServer:
                 self._connections.discard(raw_conn)
                 self._connections.discard(conn)
                 self._threads.discard(threading.current_thread())
+            self._worker_slots.release()
 
     def _authenticate_and_heartbeat(self, conn) -> None:
         try:
@@ -745,11 +826,11 @@ class ManagedServer:
 
 
 class _EnrollmentHTTPServer(http.server.ThreadingHTTPServer):
-    daemon_threads = False
-    block_on_close = True
+    daemon_threads = True
+    block_on_close = False
 
     def __init__(
-        self, address, handler, context, enrollment_service, handshake_timeout
+        self, address, handler, context, enrollment_service, handshake_timeout, max_workers
     ):
         self._context = context
         self.enrollment_service = enrollment_service
@@ -757,7 +838,24 @@ class _EnrollmentHTTPServer(http.server.ThreadingHTTPServer):
         self._closing = threading.Event()
         self._connections = set()
         self._connections_lock = threading.Lock()
+        self._worker_slots = threading.BoundedSemaphore(max_workers)
         super().__init__(address, handler)
+
+    def process_request(self, request, client_address):
+        if not self._worker_slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._worker_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._worker_slots.release()
 
     def get_request(self):
         conn, address = super().get_request()
@@ -884,7 +982,10 @@ class EnrollmentServer:
         service: EnrollmentService,
         *,
         handshake_timeout: float = 10.0,
+        max_workers: int = 32,
     ) -> None:
+        if type(max_workers) is not int or max_workers <= 0:
+            raise ValueError("max_workers must be positive")
         if (
             not isinstance(handshake_timeout, (int, float))
             or isinstance(handshake_timeout, bool)
@@ -898,6 +999,7 @@ class EnrollmentServer:
             _server_context(certfile, keyfile),
             service,
             handshake_timeout,
+            max_workers,
         )
         self.port = self._server.server_address[1]
 

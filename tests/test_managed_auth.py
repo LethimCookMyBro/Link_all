@@ -2,8 +2,12 @@ import base64
 import hashlib
 import http.client
 import json
+import multiprocessing
+import os
 import socket
 import ssl
+import subprocess
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -28,6 +32,20 @@ from C2.managed_auth import (
     send_json_frame,
     verify_proof,
 )
+
+
+def _issue_tokens_in_process(path, start, count):
+    store = EnrollmentStore(path, acl_inspector=lambda _: {"owner": True}, acl_applier=lambda _: None)
+    start.wait(5)
+    for _ in range(count):
+        store.issue(60)
+
+
+def _consume_token_in_process(path, start, token):
+    store = EnrollmentStore(path, acl_inspector=lambda _: {"owner": True}, acl_applier=lambda _: None)
+    start.wait(5)
+    if not store.consume(token):
+        raise AssertionError("token was not consumed")
 
 
 class FakeProtector:
@@ -219,7 +237,7 @@ def test_expired_token_is_rejected(tmp_path):
         "a" * 43 + "=",
         "+" + "a" * 42,
         "/" + "a" * 42,
-        "é" * 43,
+        "รฉ" * 43,
         base64.urlsafe_b64encode(b"x" * 32).rstrip(b"=").decode("ascii")[:-1] + "h",
     ],
 )
@@ -971,6 +989,64 @@ def test_enrollment_tls_handshake_has_deadline(tls_material, tmp_path):
     assert not thread.is_alive()
 
 
+def test_managed_unauthenticated_workers_are_bounded(tls_material, tmp_path):
+    cert, key = tls_material
+    server = ManagedServer(
+        "127.0.0.1",
+        0,
+        cert,
+        key,
+        DeviceRegistry(tmp_path / "devices.bin", FakeProtector()),
+        max_workers=2,
+        handshake_timeout=0.5,
+    )
+    stop = threading.Event()
+    thread = server.start(stop)
+    stalled = [socket.create_connection(("127.0.0.1", server.port), timeout=0.5) for _ in range(8)]
+    try:
+        assert _wait_until(lambda: len(server._threads) == 2)
+        assert len(server._threads) <= 2
+        started = monotonic()
+        server.stop(timeout=1)
+        assert monotonic() - started < 1.1
+        assert not any(worker.is_alive() for worker in server._threads)
+    finally:
+        for conn in stalled:
+            conn.close()
+        stop.set()
+        server.stop(timeout=1)
+        thread.join(1)
+
+
+def test_enrollment_unauthenticated_workers_are_bounded(tls_material, tmp_path):
+    cert, key = tls_material
+    service = EnrollmentService(
+        EnrollmentStore(tmp_path / "tokens.json", acl_applier=lambda _: None),
+        DeviceRegistry(tmp_path / "devices.bin", FakeProtector()),
+    )
+    server = EnrollmentServer(
+        "127.0.0.1", 0, cert, key, service, handshake_timeout=0.5, max_workers=2
+    )
+    thread = threading.Thread(target=server.serve_forever)
+    thread.start()
+    stalled = [socket.create_connection(("127.0.0.1", server.port), timeout=0.5) for _ in range(8)]
+    try:
+        assert _wait_until(lambda: len(server._server._connections) == 2)
+        assert len(server._server._connections) <= 2
+        started = monotonic()
+        server.shutdown()
+        server.server_close()
+        thread.join(1)
+        assert monotonic() - started < 1.1
+        assert not thread.is_alive()
+    finally:
+        for conn in stalled:
+            conn.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(1)
+
+
 def test_operator_cli_prints_token_once_and_not_found_is_nonzero(tmp_path, capsys):
     store = tmp_path / "store"
 
@@ -998,6 +1074,43 @@ def test_operator_cli_prints_token_once_and_not_found_is_nonzero(tmp_path, capsy
     assert capsys.readouterr().out.strip() == "not found"
 
 
+def test_cross_process_token_issues_do_not_lose_updates(tmp_path):
+    context = multiprocessing.get_context("spawn")
+    start = context.Event()
+    path = tmp_path / "tokens.json"
+    processes = [
+        context.Process(target=_issue_tokens_in_process, args=(path, start, 5))
+        for _ in range(6)
+    ]
+    for process in processes:
+        process.start()
+    start.set()
+    for process in processes:
+        process.join(10)
+        assert process.exitcode == 0
+    records = EnrollmentStore(
+        path, acl_inspector=lambda _: {"owner": True}, acl_applier=lambda _: None
+    )._read_unlocked()
+    assert len(records) == 30
+
+
+def test_cross_process_issue_cannot_resurrect_consumed_token(tmp_path):
+    context = multiprocessing.get_context("spawn")
+    path = tmp_path / "tokens.json"
+    store = EnrollmentStore(path, acl_inspector=lambda _: {"owner": True}, acl_applier=lambda _: None)
+    token_a = store.issue(60)
+    start = context.Event()
+    consume = context.Process(target=_consume_token_in_process, args=(path, start, token_a))
+    issue = context.Process(target=_issue_tokens_in_process, args=(path, start, 10))
+    consume.start()
+    issue.start()
+    start.set()
+    consume.join(10)
+    issue.join(10)
+    assert consume.exitcode == issue.exitcode == 0
+    assert store.consume(token_a) is False
+
+
 def test_controller_keeps_managed_services_disabled_without_certificates(capsys):
     import C2.C2 as controller
 
@@ -1017,6 +1130,30 @@ def test_controller_keeps_managed_services_disabled_without_certificates(capsys)
     assert thread_type.called
 
 
+def test_managed_bind_host_defaults_to_loopback_and_rejects_non_loopback():
+    environment = os.environ.copy()
+    environment.pop("PHANTOMLINK_MANAGED_HOST", None)
+    default = subprocess.run(
+        [sys.executable, "-c", "import config; print(config.MANAGED_HOST)"],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert default.returncode == 0
+    assert default.stdout.strip() == "127.0.0.1"
+    environment["PHANTOMLINK_MANAGED_HOST"] = "0.0.0.0"
+    invalid = subprocess.run(
+        [sys.executable, "-c", "import config"],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert invalid.returncode != 0
+    assert "must be a loopback IP address" in invalid.stderr
+
+
 def test_controller_starts_and_cleans_up_managed_services(tls_material, tmp_path):
     import C2.C2 as controller
 
@@ -1024,12 +1161,13 @@ def test_controller_starts_and_cleans_up_managed_services(tls_material, tmp_path
     legacy_socket = MagicMock()
     managed = MagicMock()
     enrollment = MagicMock()
+    bind_hosts = []
     with (
         patch.object(controller, "MANAGED_TLS_CERT", str(cert)),
         patch.object(controller, "MANAGED_TLS_KEY", str(key)),
         patch.object(controller, "MANAGED_STORE", str(tmp_path / "store")),
-        patch.object(controller, "ManagedServer", return_value=managed),
-        patch.object(controller, "EnrollmentServer", return_value=enrollment),
+        patch.object(controller, "ManagedServer", side_effect=lambda host, *_a: (bind_hosts.append(host), managed)[1]),
+        patch.object(controller, "EnrollmentServer", side_effect=lambda host, *_a: (bind_hosts.append(host), enrollment)[1]),
         patch.object(controller, "EnrollmentStore"),
         patch.object(controller, "DeviceRegistry"),
         patch.object(controller, "EnrollmentService"),
@@ -1043,6 +1181,7 @@ def test_controller_starts_and_cleans_up_managed_services(tls_material, tmp_path
     managed.stop.assert_called_once_with(timeout=5)
     enrollment.shutdown.assert_called_once_with()
     enrollment.server_close.assert_called_once_with()
+    assert bind_hosts == [controller.MANAGED_HOST, controller.MANAGED_HOST]
     legacy_socket.close.assert_called_once_with()
 
 
@@ -1118,3 +1257,4 @@ def test_controller_rolls_back_after_enrollment_thread_started(tls_material, tmp
     ]
     assert len(managed_threads) == 2
     assert all(thread.joined for thread in managed_threads)
+

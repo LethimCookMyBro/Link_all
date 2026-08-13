@@ -35,7 +35,7 @@ $pin = $pin.Trim()
 ## 2. Set the five managed/TLS values and start the loopback controller
 
 ```powershell
-$env:PHANTOMLINK_HOST = '127.0.0.1'
+$env:PHANTOMLINK_MANAGED_HOST = '127.0.0.1'
 $env:PHANTOMLINK_MANAGED_PORT = '5443'
 $env:PHANTOMLINK_ENROLLMENT_PORT = '5444'
 $env:PHANTOMLINK_TLS_CERT = (Resolve-Path debug-artifacts\managed-cert.pem).Path
@@ -111,7 +111,7 @@ The config contains no token or credential. Do not print the token. The next com
 & $python client/managed_agent.py enroll --config $configPath --token-file $tokenFile
 if ($LASTEXITCODE -ne 0) { throw "Enrollment failed: $LASTEXITCODE" }
 Test-Path $tokenFile # expected: False
-& $python client/managed_agent.py run --config $configPath
+& $python client/managed_agent.py run --config $configPath # Ctrl+C requests a clean stop and exits 0
 ```
 
 Stop the foreground run with Ctrl+C after authenticated lifecycle events, then run:

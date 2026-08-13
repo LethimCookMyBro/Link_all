@@ -1,5 +1,6 @@
 import os
 import sys
+import ipaddress
 
 # Automatically load .env file from working directory, exe directory, or script directory
 _possible_env_paths = [
@@ -36,6 +37,12 @@ SERVER_HOST = os.getenv("PHANTOMLINK_HOST", "0.0.0.0")
 SERVER_PORT = int(os.getenv("PHANTOMLINK_PORT", "5000"))
 MANAGED_PORT = int(os.getenv("PHANTOMLINK_MANAGED_PORT", "5443"))
 ENROLLMENT_PORT = int(os.getenv("PHANTOMLINK_ENROLLMENT_PORT", "5444"))
+MANAGED_HOST = os.getenv("PHANTOMLINK_MANAGED_HOST", "127.0.0.1")
+try:
+    if not ipaddress.ip_address(MANAGED_HOST).is_loopback:
+        raise ValueError
+except ValueError as exc:
+    raise ValueError("PHANTOMLINK_MANAGED_HOST must be a loopback IP address") from exc
 MANAGED_TLS_CERT = os.getenv("PHANTOMLINK_TLS_CERT", "")
 MANAGED_TLS_KEY = os.getenv("PHANTOMLINK_TLS_KEY", "")
 MANAGED_STORE = os.getenv("PHANTOMLINK_MANAGED_STORE", "managed-store")

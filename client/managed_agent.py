@@ -258,7 +258,12 @@ def main(argv=None) -> int:
             auth_rejected = auth_rejected or event.get("event") == "AUTH_REJECTED"
             logging_runtime.emit(event)
 
-        AgentRuntime(config, credential, event_sink=observe).run()
+        runtime = AgentRuntime(config, credential, event_sink=observe)
+        try:
+            runtime.run()
+        except KeyboardInterrupt:
+            runtime.stop()
+            return 0
         return 5 if auth_rejected else 0
     except (AuthRejected, ValueError):
         logging_runtime.emit(

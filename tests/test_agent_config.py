@@ -502,6 +502,45 @@ def test_run_returns_five_after_observed_auth_rejection(tmp_path, monkeypatch):
     assert managed_agent.main(["run", "--config", str(tmp_path / "agent.json")]) == 5
 
 
+def test_ctrl_c_stops_runtime_and_flushes_logging(tmp_path, monkeypatch):
+    from client import managed_agent
+    from client.agent_config import AgentConfig, DeviceCredential
+
+    config = AgentConfig.from_mapping(valid_config(tmp_path))
+    stopped = []
+    flushed = []
+
+    class Store:
+        def load(self):
+            return DeviceCredential("agent", "key", b"s" * 32)
+
+    class InterruptedRuntime:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def run(self):
+            raise KeyboardInterrupt
+
+        def stop(self):
+            stopped.append(True)
+
+    class Logging:
+        def emit(self, _event):
+            pass
+
+        def stop(self, timeout):
+            flushed.append(timeout)
+
+    monkeypatch.setattr(managed_agent, "load_config", lambda _: config)
+    monkeypatch.setattr(managed_agent, "DpapiCredentialStore", lambda _: Store())
+    monkeypatch.setattr(managed_agent, "AgentRuntime", InterruptedRuntime)
+    monkeypatch.setattr(managed_agent, "start_agent_logging", lambda _: Logging())
+
+    assert managed_agent.main(["run", "--config", str(tmp_path / "agent.json")]) == 0
+    assert stopped == [True]
+    assert flushed == [1.0]
+
+
 def test_token_file_uses_same_handle_reader_and_deletes_file(tmp_path, monkeypatch):
     from client import managed_agent
 

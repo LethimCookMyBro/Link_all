@@ -20,6 +20,7 @@ from config import (
     DISCORD_WEBHOOK,
     ENROLLMENT_PORT,
     MANAGED_PORT,
+    MANAGED_HOST,
     MANAGED_STORE,
     MANAGED_TLS_CERT,
     MANAGED_TLS_KEY,
@@ -974,14 +975,14 @@ def main():
                 EnrollmentStore(os.path.join(MANAGED_STORE, "tokens.json")), registry
             )
             managed_server = ManagedServer(
-                HOST,
+                MANAGED_HOST,
                 MANAGED_PORT,
                 MANAGED_TLS_CERT,
                 MANAGED_TLS_KEY,
                 registry,
             )
             enrollment_server = EnrollmentServer(
-                HOST,
+                MANAGED_HOST,
                 ENROLLMENT_PORT,
                 MANAGED_TLS_CERT,
                 MANAGED_TLS_KEY,
@@ -995,8 +996,8 @@ def main():
             )
             enrollment_thread.start()
             print(
-                f"[+] Managed TLS on {HOST}:{MANAGED_PORT}; "
-                f"enrollment HTTPS on {HOST}:{ENROLLMENT_PORT}"
+                f"[+] Managed TLS on {MANAGED_HOST}:{MANAGED_PORT}; "
+                f"enrollment HTTPS on {MANAGED_HOST}:{ENROLLMENT_PORT}"
             )
         except Exception as e:
             cleanup_errors = cleanup_managed_services()
