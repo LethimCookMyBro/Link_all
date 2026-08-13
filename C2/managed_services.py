@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ipaddress
 import math
+import select
 import socket
 import ssl
 import threading
@@ -369,6 +370,8 @@ class ManagedServer:
                 agent_id, fingerprint, serial, peer_ip, connection
             )
             while not self._stopped.is_set():
+                if _has_pending_input(connection):
+                    raise ValueError("unexpected managed frame")
                 _send_frame(connection, b"PING")
                 if _recv_frame(connection, self._pong_timeout) != b"PONG":
                     raise ValueError("unexpected managed frame")
@@ -431,9 +434,22 @@ def _recv_frame(connection, timeout: float) -> bytes:
     decoder = FrameDecoder(max_size=_MAX_FRAME)
     connection.settimeout(timeout)
     while True:
-        chunk = connection.recv(4)
+        chunk = connection.recv(8)
         if not chunk:
             raise ConnectionError("peer closed")
         frames = decoder.feed(chunk)
         if frames:
+            if (
+                len(frames) != 1
+                or decoder.expected is not None
+                or decoder.buffer
+            ):
+                raise ValueError("unexpected managed frame")
             return frames[0]
+
+
+def _has_pending_input(connection) -> bool:
+    pending = getattr(connection, "pending", None)
+    if pending is not None and pending():
+        return True
+    return bool(select.select([connection], [], [], 0)[0])

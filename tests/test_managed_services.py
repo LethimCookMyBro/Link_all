@@ -15,6 +15,7 @@ from C2.managed_registry import IssuedDeviceCertificate, ManagedRegistry
 from C2.managed_services import (
     ManagedServer,
     SessionManager,
+    _recv_frame,
     _server_context,
     validate_managed_bind,
 )
@@ -286,6 +287,21 @@ def test_managed_server_context_requires_client_certificate(tmp_path):
     assert context.verify_mode == ssl.CERT_REQUIRED
     if hasattr(ssl, "OP_NO_COMPRESSION"):
         assert context.options & ssl.OP_NO_COMPRESSION
+
+
+def test_server_frame_reader_rejects_queued_extra_frame():
+    first_header, first_body = encode_message(b"PONG")
+    extra_header, extra_body = encode_message(b"PONG")
+
+    class Connection:
+        def settimeout(self, _timeout):
+            pass
+
+        def recv(self, _size):
+            return first_header + first_body + extra_header + extra_body
+
+    with pytest.raises(ValueError, match="unexpected managed frame"):
+        _recv_frame(Connection(), 1)
 
 
 def test_managed_server_rejects_saturation_before_second_tls_handshake(tmp_path):
