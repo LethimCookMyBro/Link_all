@@ -20,24 +20,29 @@ from C2.managed_registry import ManagedRegistry, utc_now
 from client.transport import FrameDecoder, encode_message
 
 _MAX_FRAME = 4
+_PRIVATE_V4 = tuple(
+    ipaddress.ip_network(network)
+    for network in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10")
+)
+_PRIVATE_V6 = ipaddress.ip_network("fc00::/7")
 
 
 def validate_managed_bind(host: str, *, allow_loopback: bool = False) -> str:
+    if type(host) is not str:
+        raise ValueError("managed bind must be an exact managed IP")
     try:
         address = ipaddress.ip_address(host)
     except ValueError as exc:
         raise ValueError("managed bind must be an exact managed IP") from exc
     effective = getattr(address, "ipv4_mapped", None) or address
-    if (
-        effective.is_unspecified
-        or effective.is_multicast
-        or effective.is_link_local
-        or effective.is_global
-        or str(effective) == "255.255.255.255"
-        or (effective.is_loopback and not allow_loopback)
-    ):
+    allowed = effective.is_loopback and allow_loopback is True
+    if isinstance(effective, ipaddress.IPv4Address) and not effective.is_loopback:
+        allowed = any(effective in network for network in _PRIVATE_V4)
+    elif isinstance(effective, ipaddress.IPv6Address) and not effective.is_loopback:
+        allowed = effective in _PRIVATE_V6
+    if not allowed:
         raise ValueError("managed bind must be an exact managed IP")
-    return str(address)
+    return address.compressed
 
 
 @dataclass(frozen=True)
@@ -73,71 +78,80 @@ class SessionManager:
         connection: socket.socket,
     ) -> SessionSnapshot:
         previous = None
-        with self._lock:
-            previous = self._sessions.get(agent_id)
-            session_id = str(uuid4())
-            timestamp = _format_time(self.now())
-            snapshot = SessionSnapshot(
-                agent_id,
-                session_id,
-                str(ipaddress.ip_address(peer_ip)),
-                timestamp,
-                timestamp,
-            )
-            details = {
-                "peer_ip": snapshot.peer_ip,
-                "session_id": session_id,
-            }
-            action = "CONNECTED"
-            if previous is not None:
-                action = "SESSION_REPLACED"
-                details["previous_session_id"] = previous.snapshot.session_id
-            if not self.registry.is_connection_allowed(agent_id, fingerprint, serial):
-                raise PermissionError("certificate is not allowed")
-            current = _Session(snapshot, fingerprint, serial, connection)
-            self._sessions[agent_id] = current
-            try:
-                self.registry.append_audit(
-                    actor="managed-listener",
-                    action=action,
-                    target_agent_id=agent_id,
-                    result="SUCCEEDED",
-                    reason=None,
-                    correlation_id=session_id,
-                    details=details,
+        try:
+            with self._lock:
+                previous = self._sessions.get(agent_id)
+                session_id = str(uuid4())
+                timestamp = _format_time(self.now())
+                snapshot = SessionSnapshot(
+                    agent_id,
+                    session_id,
+                    str(ipaddress.ip_address(peer_ip)),
+                    timestamp,
+                    timestamp,
                 )
-            except Exception:
-                if previous is None:
-                    del self._sessions[agent_id]
-                else:
-                    self._sessions[agent_id] = previous
-                raise
+                details = {
+                    "peer_ip": snapshot.peer_ip,
+                    "session_id": session_id,
+                }
+                action = "CONNECTED"
+                if previous is not None:
+                    action = "SESSION_REPLACED"
+                    details["previous_session_id"] = previous.snapshot.session_id
+                if not self.registry.is_connection_allowed(agent_id, fingerprint, serial):
+                    raise PermissionError("certificate is not allowed")
+                current = _Session(snapshot, fingerprint, serial, connection)
+                self._sessions[agent_id] = current
+                try:
+                    self.registry.append_audit(
+                        actor="managed-listener",
+                        action=action,
+                        target_agent_id=agent_id,
+                        result="SUCCEEDED",
+                        reason=None,
+                        correlation_id=session_id,
+                        details=details,
+                    )
+                except Exception:
+                    if previous is None:
+                        del self._sessions[agent_id]
+                    else:
+                        self._sessions[agent_id] = previous
+                    raise
+        except Exception:
+            _close_connection(connection)
+            raise
         if previous is not None:
             _close_connection(previous.connection)
         return snapshot
 
     def heartbeat(self, agent_id: str, session_id: str) -> None:
-        rejected = None
-        with self._lock:
-            current = self._sessions.get(agent_id)
-            if current is None or current.snapshot.session_id != session_id:
-                return
-            if not self.registry.is_connection_allowed(
-                agent_id, current.fingerprint, current.serial
-            ):
-                rejected = self._sessions.pop(agent_id)
-            else:
-                occurred_at = self.now()
-                timestamp = _format_time(occurred_at)
-                self.registry.touch_last_seen(
-                    agent_id, current.snapshot.peer_ip, occurred_at
-                )
-                current.snapshot = replace(
-                    current.snapshot, last_heartbeat_at=timestamp
-                )
-        if rejected is not None:
-            _close_connection(rejected.connection)
-            raise PermissionError("certificate is not allowed")
+        removed = None
+        try:
+            with self._lock:
+                current = self._sessions.get(agent_id)
+                if current is None or current.snapshot.session_id != session_id:
+                    return
+                try:
+                    if not self.registry.is_connection_allowed(
+                        agent_id, current.fingerprint, current.serial
+                    ):
+                        raise PermissionError("certificate is not allowed")
+                    occurred_at = self.now()
+                    timestamp = _format_time(occurred_at)
+                    self.registry.touch_last_seen(
+                        agent_id, current.snapshot.peer_ip, occurred_at
+                    )
+                    current.snapshot = replace(
+                        current.snapshot, last_heartbeat_at=timestamp
+                    )
+                except Exception:
+                    if self._sessions.get(agent_id) is current:
+                        removed = self._sessions.pop(agent_id)
+                    raise
+        finally:
+            if removed is not None:
+                _close_connection(removed.connection)
 
     def unregister(self, agent_id: str, session_id: str, reason: str) -> bool:
         return self._remove(agent_id, session_id, reason)
@@ -271,6 +285,8 @@ class ManagedServer:
         ping_interval: float = 30.0,
         pong_timeout: float = 10.0,
     ) -> None:
+        if sessions.registry is not registry:
+            raise ValueError("sessions and server must use the same registry")
         host = validate_managed_bind(host, allow_loopback=allow_loopback)
         if type(max_workers) is not int or max_workers <= 0:
             raise ValueError("max_workers must be positive")

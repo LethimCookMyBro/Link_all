@@ -66,6 +66,11 @@ def enrolled_device(registry):
         "::ffff:169.254.1.1",
         "::ffff:0.0.0.0",
         "::ffff:255.255.255.255",
+        "192.0.2.1",
+        "2001:db8::1",
+        "240.0.0.1",
+        "::ffff:192.0.2.1",
+        "::ffff:240.0.0.1",
         "8.8.8.8",
         "localhost",
         "vpn.example",
@@ -81,9 +86,28 @@ def test_production_bind_accepts_exact_private_or_shared_vpn_ip(host):
     assert validate_managed_bind(host) == host
 
 
+@pytest.mark.parametrize(
+    "host",
+    [True, 0x0A080001, b"\x0a\x08\x00\x01", bytearray(b"\x0a\x08\x00\x01")],
+)
+def test_production_bind_rejects_non_string_ip_representations(host):
+    with pytest.raises(ValueError, match="exact managed IP"):
+        validate_managed_bind(host)
+
+
+def test_mapped_private_and_explicit_test_loopback_are_canonicalized():
+    assert validate_managed_bind("::ffff:10.8.0.1") == "::ffff:10.8.0.1"
+    assert validate_managed_bind("FD00:0:0:0:0:0:0:1") == "fd00::1"
+    assert (
+        validate_managed_bind("::ffff:127.0.0.1", allow_loopback=True)
+        == "::ffff:127.0.0.1"
+    )
+
+
 def test_loopback_requires_explicit_test_flag():
-    with pytest.raises(ValueError):
-        validate_managed_bind("127.0.0.1")
+    for flag in (False, 1, "yes"):
+        with pytest.raises(ValueError):
+            validate_managed_bind("127.0.0.1", allow_loopback=flag)
     assert validate_managed_bind("127.0.0.1", allow_loopback=True) == "127.0.0.1"
     assert validate_managed_bind("::1", allow_loopback=True) == "::1"
     with pytest.raises(ValueError):
@@ -126,15 +150,124 @@ def test_register_rechecks_durable_certificate_and_rejects_revoked_device(
     sessions = SessionManager(registry)
     registry.revoke_device(enrolled_device.agent_id, "operator", "retired", "revoke")
 
+    connection = FakeConnection()
     with pytest.raises(PermissionError, match="certificate"):
         sessions.register(
             enrolled_device.agent_id,
             enrolled_device.certificate_fingerprint,
             enrolled_device.certificate_serial,
             "10.8.0.21",
-            FakeConnection(),
+            connection,
         )
     assert sessions.snapshot() == ()
+    assert connection.closed
+
+
+def test_register_audit_failure_rolls_back_and_closes_candidate(
+    registry, enrolled_device, monkeypatch
+):
+    sessions = SessionManager(registry)
+    connection = FakeConnection()
+    monkeypatch.setattr(
+        registry,
+        "append_audit",
+        lambda **_kwargs: (_ for _ in ()).throw(OSError("audit unavailable")),
+    )
+
+    with pytest.raises(OSError, match="audit unavailable"):
+        sessions.register(
+            enrolled_device.agent_id,
+            enrolled_device.certificate_fingerprint,
+            enrolled_device.certificate_serial,
+            "10.8.0.21",
+            connection,
+        )
+
+    assert sessions.snapshot() == ()
+    assert connection.closed
+
+
+def test_replacement_audit_failure_preserves_old_and_closes_candidate(
+    registry, enrolled_device, monkeypatch
+):
+    sessions = SessionManager(registry)
+    old_connection, candidate = FakeConnection(), FakeConnection()
+    old = sessions.register(
+        enrolled_device.agent_id,
+        enrolled_device.certificate_fingerprint,
+        enrolled_device.certificate_serial,
+        "10.8.0.21",
+        old_connection,
+    )
+    monkeypatch.setattr(
+        registry,
+        "append_audit",
+        lambda **_kwargs: (_ for _ in ()).throw(OSError("audit unavailable")),
+    )
+
+    with pytest.raises(OSError, match="audit unavailable"):
+        sessions.register(
+            enrolled_device.agent_id,
+            enrolled_device.certificate_fingerprint,
+            enrolled_device.certificate_serial,
+            "10.8.0.22",
+            candidate,
+        )
+
+    assert sessions.snapshot() == (old,)
+    assert not old_connection.closed
+    assert candidate.closed
+
+
+def test_register_durable_check_failure_closes_candidate(
+    registry, enrolled_device, monkeypatch
+):
+    sessions = SessionManager(registry)
+    candidate = FakeConnection()
+    monkeypatch.setattr(
+        registry,
+        "is_connection_allowed",
+        lambda *_args: (_ for _ in ()).throw(OSError("registry unavailable")),
+    )
+
+    with pytest.raises(OSError, match="registry unavailable"):
+        sessions.register(
+            enrolled_device.agent_id,
+            enrolled_device.certificate_fingerprint,
+            enrolled_device.certificate_serial,
+            "10.8.0.21",
+            candidate,
+        )
+
+    assert sessions.snapshot() == ()
+    assert candidate.closed
+
+
+@pytest.mark.parametrize("failure_point", ["allowed", "touch"])
+def test_heartbeat_registry_failure_removes_and_closes_current_session(
+    registry, enrolled_device, monkeypatch, failure_point
+):
+    sessions = SessionManager(registry)
+    connection = FakeConnection()
+    session = sessions.register(
+        enrolled_device.agent_id,
+        enrolled_device.certificate_fingerprint,
+        enrolled_device.certificate_serial,
+        "10.8.0.21",
+        connection,
+    )
+    method = "is_connection_allowed" if failure_point == "allowed" else "touch_last_seen"
+    monkeypatch.setattr(
+        registry,
+        method,
+        lambda *_args: (_ for _ in ()).throw(OSError(f"{failure_point} unavailable")),
+    )
+
+    with pytest.raises(OSError, match=f"{failure_point} unavailable"):
+        sessions.heartbeat(enrolled_device.agent_id, session.session_id)
+
+    assert sessions.snapshot() == ()
+    assert connection.closed
 
 
 def test_heartbeat_updates_memory_and_durable_last_seen(registry, enrolled_device):
@@ -335,6 +468,25 @@ def test_managed_server_context_requires_client_certificate(tmp_path):
     assert context.verify_mode == ssl.CERT_REQUIRED
     if hasattr(ssl, "OP_NO_COMPRESSION"):
         assert context.options & ssl.OP_NO_COMPRESSION
+
+
+def test_managed_server_rejects_session_manager_for_different_registry(
+    tmp_path, registry
+):
+    other = ManagedRegistry(tmp_path / "other" / "managed.db", now=lambda: NOW)
+    other.initialize()
+
+    with pytest.raises(ValueError, match="same registry"):
+        ManagedServer(
+            "127.0.0.1",
+            0,
+            tmp_path / "missing-server.pem",
+            tmp_path / "missing-key.pem",
+            tmp_path / "missing-ca.pem",
+            other,
+            SessionManager(registry),
+            allow_loopback=True,
+        )
 
 
 def test_server_frame_reader_rejects_queued_extra_frame():
