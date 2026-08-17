@@ -96,3 +96,6 @@ Desktop.ini
 *.gz
 *.rar
 *.7z
+
+# Freebuff agent workspace state
+.freebuff/

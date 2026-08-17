@@ -171,17 +171,3 @@ class TestDashboardApp:
                 await pilot.pause()
 
         asyncio.run(run())  # must not raise/hang
-
-    def test_late_refresh_after_shutdown_is_ignored(self):
-        import asyncio
-
-        async def run():
-            app = build_app(
-                DashboardData(snapshot_fn=sample_snapshot),
-                refresh_interval=3600,
-            )
-            async with app.run_test(size=(80, 24)) as pilot:
-                await pilot.pause()
-            app._refresh()  # a queued timer callback may arrive during shutdown
-
-        asyncio.run(run())

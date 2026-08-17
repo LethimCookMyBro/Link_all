@@ -101,7 +101,7 @@ class DiscordBotTests(unittest.TestCase):
     def test_c2_server_offline_handling(self):
         import discord_bot
 
-        with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("Connection Refused")):
+        with patch.object(discord_bot, "_check_c2_server", return_value=False):
             result = discord_bot._send_commands_sync(["dir"])
             self.assertIn("C2 Server ไม่ได้เปิดอยู่", result)
 

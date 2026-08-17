@@ -59,5 +59,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon='D:\8211\PhantomLink\icon.ico'  # Optional: add your icon
+    icon=None
 )

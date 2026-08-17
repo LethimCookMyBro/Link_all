@@ -1,0 +1,559 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PhantomLink C2 - Concept & Security Architecture</title>
+    <!-- Google Fonts: Prompt & Inter -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&family=Prompt:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-primary: #0b0f19;
+            --bg-secondary: #111827;
+            --bg-card: #1f2937;
+            --bg-card-hover: #374151;
+            --border-color: #374151;
+            
+            --text-main: #f9fafb;
+            --text-muted: #9ca3af;
+            --text-dim: #6b7280;
+            
+            --accent-cyan: #06b6d4;
+            --accent-blue: #3b82f6;
+            --accent-emerald: #10b981;
+            --accent-rose: #f43f5e;
+            --accent-amber: #f59e0b;
+            
+            --font-main: 'Prompt', 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            background-color: var(--bg-primary);
+            color: var(--text-main);
+            font-family: var(--font-main);
+            line-height: 1.6;
+            padding: 2rem 1rem;
+            min-height: 100vh;
+        }
+
+        .container {
+            max-width: 1100px;
+            margin: 0 auto;
+        }
+
+        /* Header */
+        header {
+            text-align: center;
+            margin-bottom: 3rem;
+            padding-bottom: 2rem;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .badge {
+            display: inline-block;
+            padding: 0.35rem 0.8rem;
+            background: rgba(6, 182, 212, 0.15);
+            color: var(--accent-cyan);
+            border: 1px solid rgba(6, 182, 212, 0.3);
+            border-radius: 9999px;
+            font-size: 0.85rem;
+            font-weight: 500;
+            margin-bottom: 1rem;
+            letter-spacing: 0.5px;
+        }
+
+        h1 {
+            font-size: 2.2rem;
+            font-weight: 700;
+            color: #ffffff;
+            margin-bottom: 0.75rem;
+            background: linear-gradient(135deg, #ffffff 0%, #94a3b8 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        p.subtitle {
+            color: var(--text-muted);
+            font-size: 1.05rem;
+            max-width: 700px;
+            margin: 0 auto;
+        }
+
+        /* Grid Layout */
+        .grid-2 {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+            gap: 1.5rem;
+            margin-bottom: 2.5rem;
+        }
+
+        /* Card Styles */
+        .card {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 16px;
+            padding: 1.75rem;
+            transition: all 0.25s ease;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .card:hover {
+            border-color: var(--accent-cyan);
+            transform: translateY(-2px);
+        }
+
+        .card-header {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            margin-bottom: 1.25rem;
+        }
+
+        .icon-box {
+            width: 44px;
+            height: 44px;
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.4rem;
+            flex-shrink: 0;
+        }
+
+        .icon-box.amber { background: rgba(245, 158, 11, 0.15); color: var(--accent-amber); }
+        .icon-box.rose { background: rgba(244, 63, 94, 0.15); color: var(--accent-rose); }
+        .icon-box.cyan { background: rgba(6, 182, 212, 0.15); color: var(--accent-cyan); }
+        .icon-box.emerald { background: rgba(16, 185, 129, 0.15); color: var(--accent-emerald); }
+
+        .card-title {
+            font-size: 1.25rem;
+            font-weight: 600;
+            color: #ffffff;
+        }
+
+        .card-body {
+            color: var(--text-muted);
+            font-size: 0.95rem;
+        }
+
+        .card-body ul {
+            list-style: none;
+            margin-top: 0.75rem;
+        }
+
+        .card-body li {
+            position: relative;
+            padding-left: 1.5rem;
+            margin-bottom: 0.6rem;
+        }
+
+        .card-body li::before {
+            content: "•";
+            position: absolute;
+            left: 0.4rem;
+            color: var(--accent-cyan);
+            font-size: 1.2rem;
+            line-height: 1;
+        }
+
+        /* Interactive Simulation Box */
+        .simulation-container {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 16px;
+            padding: 2rem;
+            margin-bottom: 2.5rem;
+        }
+
+        .sim-header {
+            text-align: center;
+            margin-bottom: 1.5rem;
+        }
+
+        .sim-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 1.5rem;
+            align-items: center;
+        }
+
+        .agent-status-box {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 1.5rem;
+            text-align: center;
+        }
+
+        .status-badge {
+            display: inline-block;
+            padding: 0.4rem 1rem;
+            border-radius: 8px;
+            font-weight: 600;
+            font-size: 0.9rem;
+            margin-top: 0.75rem;
+            transition: all 0.3s ease;
+        }
+
+        .status-online { background: rgba(16, 185, 129, 0.2); color: var(--accent-emerald); border: 1px solid var(--accent-emerald); }
+        .status-offline { background: rgba(245, 158, 11, 0.2); color: var(--accent-amber); border: 1px solid var(--accent-amber); }
+        .status-banned { background: rgba(244, 63, 94, 0.2); color: var(--accent-rose); border: 1px solid var(--accent-rose); }
+
+        .btn-group {
+            display: flex;
+            flex-direction: column;
+            gap: 0.75rem;
+        }
+
+        .btn {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            color: var(--text-main);
+            padding: 0.85rem 1.25rem;
+            border-radius: 10px;
+            font-family: var(--font-main);
+            font-size: 0.95rem;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .btn:hover {
+            background: var(--bg-card-hover);
+            border-color: var(--accent-cyan);
+        }
+
+        .btn-amber:hover { border-color: var(--accent-amber); color: var(--accent-amber); }
+        .btn-rose:hover { border-color: var(--accent-rose); color: var(--accent-rose); }
+        .btn-emerald:hover { border-color: var(--accent-emerald); color: var(--accent-emerald); }
+
+        .sim-explanation {
+            background: rgba(15, 23, 42, 0.6);
+            border-left: 4px solid var(--accent-cyan);
+            padding: 1.25rem;
+            border-radius: 0 12px 12px 0;
+            font-size: 0.95rem;
+            color: var(--text-muted);
+            min-height: 120px;
+        }
+
+        /* Architectural Diagram Section */
+        .diagram-container {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 16px;
+            padding: 2rem;
+            margin-bottom: 2.5rem;
+        }
+
+        .diagram-visual {
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: center;
+            align-items: center;
+            gap: 1.5rem;
+            margin: 2rem 0;
+        }
+
+        .node {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 1.25rem 1.75rem;
+            text-align: center;
+            min-width: 200px;
+        }
+
+        .node-title {
+            font-weight: 600;
+            color: #ffffff;
+            font-size: 1rem;
+            margin-bottom: 0.25rem;
+        }
+
+        .node-sub {
+            font-size: 0.8rem;
+            color: var(--text-dim);
+        }
+
+        .connector {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            color: var(--text-dim);
+            font-size: 0.85rem;
+        }
+
+        .connector-line {
+            width: 80px;
+            height: 2px;
+            background: var(--border-color);
+            margin: 0.5rem 0;
+            position: relative;
+        }
+
+        .connector-line.danger {
+            background: var(--accent-rose);
+        }
+
+        .tag-danger {
+            background: rgba(244, 63, 94, 0.2);
+            color: var(--accent-rose);
+            padding: 0.2rem 0.5rem;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            font-weight: 600;
+        }
+
+        /* Summary Box */
+        .summary-box {
+            background: linear-gradient(135deg, rgba(6, 182, 212, 0.1) 0%, rgba(59, 130, 246, 0.1) 100%);
+            border: 1px solid rgba(6, 182, 212, 0.3);
+            border-radius: 16px;
+            padding: 2rem;
+            text-align: center;
+        }
+
+        .summary-title {
+            font-size: 1.3rem;
+            font-weight: 600;
+            color: var(--accent-cyan);
+            margin-bottom: 1rem;
+        }
+
+        .summary-list {
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: center;
+            gap: 1rem;
+            margin-top: 1.5rem;
+        }
+
+        .summary-item {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            padding: 1rem 1.5rem;
+            border-radius: 12px;
+            text-align: left;
+            flex: 1 1 280px;
+        }
+
+        .summary-item strong {
+            color: #ffffff;
+            display: block;
+            margin-bottom: 0.25rem;
+        }
+
+        footer {
+            text-align: center;
+            margin-top: 3rem;
+            color: var(--text-dim);
+            font-size: 0.85rem;
+        }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <!-- Header -->
+    <header>
+        <div class="badge">ANTIGRAVITY RED TEAM ASSISTANT</div>
+        <h1>PhantomLink C2: สรุปเข้าใจง่ายสไตล์ Visual Diagram</h1>
+        <p class="subtitle">อธิบายความแตกต่างระหว่าง Disconnect vs Revoke และเหตุผลด้านความปลอดภัยว่าทำไม Red Team ถึงไม่ควรเพิ่มช่องทาง Local IPC</p>
+    </header>
+
+    <!-- Interactive Simulation Box -->
+    <div class="simulation-container">
+        <div class="sim-header">
+            <h2 style="font-size: 1.4rem; color: #fff; margin-bottom: 0.5rem;">🎮 จำลองสถานการณ์ (Interactive Demo)</h2>
+            <p style="color: var(--text-muted); font-size: 0.9rem;">ทดลองกดปุ่มด้านล่างเพื่อดูความแตกต่างระหว่างการสั่ง **Disconnect** และ **Revoke**</p>
+        </div>
+
+        <div class="sim-grid">
+            <!-- Agent State Card -->
+            <div class="agent-status-box">
+                <div style="font-size: 0.85rem; color: var(--text-dim);">สถานะของเครื่องลูก (Agent PC-01)</div>
+                <div id="agent-name" style="font-size: 1.2rem; font-weight: 700; margin-top: 0.25rem;">PC-OPERATOR-01</div>
+                <div id="status-badge" class="status-badge status-online">🟢 ONLINE (ต่อกับ C2 อยู่)</div>
+                <div id="cert-status" style="font-size: 0.8rem; color: var(--text-muted); margin-top: 0.75rem;">
+                    ใบอนุญาต (Certificate): <span style="color: var(--accent-emerald);">VALID (ใช้งานได้)</span>
+                </div>
+            </div>
+
+            <!-- Action Buttons -->
+            <div class="btn-group">
+                <button class="btn btn-amber" onclick="simulateDisconnect()">
+                    <span>Disconnect (เตะออก)</span>
+                    <span style="font-size: 0.8rem; color: var(--accent-amber);">กดปุ่ม D บน Dashboard</span>
+                </button>
+                <button class="btn btn-rose" onclick="simulateRevoke()">
+                    <span>Revoke (แบนถาวร)</span>
+                    <span style="font-size: 0.8rem; color: var(--accent-rose);">พิมพ์สั่งใน Terminal</span>
+                </button>
+                <button class="btn btn-emerald" onclick="resetSim()">
+                    <span>Reset (ต่อสายใหม่)</span>
+                    <span style="font-size: 0.8rem;">จำลอง Agent Reconnect</span>
+                </button>
+            </div>
+
+            <!-- Realtime Result Explanation -->
+            <div class="sim-explanation" id="sim-exp">
+                <strong style="color: var(--accent-cyan); display: block; margin-bottom: 0.5rem;">💡 ผลลัพธ์:</strong>
+                <span id="exp-text">ขณะนี้ Agent กำลังเชื่อมต่อและส่งสัญญาณ Heartbeat กับ C2 ตามปกติ</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- Comparison Cards -->
+    <div class="grid-2">
+        <!-- Disconnect Card -->
+        <div class="card">
+            <div class="card-header">
+                <div class="icon-box amber">🔌</div>
+                <div>
+                    <div class="card-title">1. Disconnect (ตัดสายชั่วคราว)</div>
+                    <div style="font-size: 0.8rem; color: var(--accent-amber);">สั่งผ่าน Dashboard UI (กดปุ่ม D)</div>
+                </div>
+            </div>
+            <div class="card-body">
+                <p>เปรียบเหมือน รปภ. เดินไปสะกิดบอกเครื่องลูกว่า <em>"ตัดการเชื่อมต่อ Socket ตอนนี้ออกไปก่อน"</em></p>
+                <ul>
+                    <li><strong>ผลลัพธ์:</strong> สายหลุดทันที (Session Closed)</li>
+                    <li><strong>ใบบัตรผ่าน (Certificate):</strong> ยังคงใช้งานได้ปกติ</li>
+                    <li><strong>ข้อควรรู้:</strong> Agent สามารถหมุนตั้งเวลา Reconnect กลับมาใหม่ได้เมื่อไหร่ก็ได้</li>
+                </ul>
+            </div>
+        </div>
+
+        <!-- Revoke Card -->
+        <div class="card">
+            <div class="card-header">
+                <div class="icon-box rose">🚫</div>
+                <div>
+                    <div class="card-title">2. Revoke (แบนถาวร)</div>
+                    <div style="font-size: 0.8rem; color: var(--accent-rose);">สั่งผ่าน Terminal (CLI Command)</div>
+                </div>
+            </div>
+            <div class="card-body">
+                <p>เปรียบเหมือนการเดินไปที่ <strong>สมุดทะเบียนกลาง (Database)</strong> แล้วขีดฆ่าทำลายบัตรอนุญาตทิ้ง</p>
+                <ul>
+                    <li><strong>ผลลัพธ์:</strong> บันทึกลง SQLite DB ว่า Agent นี้ถูกเพิกถอนแล้ว</li>
+                    <li><strong>ใบบัตรผ่าน (Certificate):</strong> ถูกทำลายทิ้งทันที</li>
+                    <li><strong>ข้อควรรู้:</strong> ต่อให้ Agent พยายามต่อสายกลับมา จะถูกระบบม้าเร็ว mTLS ปฏิเสธตั้งแต่ประตูหน้า</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+
+    <!-- Security & Architecture Section -->
+    <div class="diagram-container">
+        <h2 style="font-size: 1.3rem; color: #fff; text-align: center; margin-bottom: 0.5rem;">🛡️ ทำไม Red Team ถึงไม่แนะนำให้สร้าง "ท่อเชื่อมพิเศษ" (Local IPC)?</h2>
+        <p style="text-align: center; color: var(--text-muted); font-size: 0.9rem; max-width: 750px; margin: 0 auto 1.5rem auto;">
+            การพยายามทำให้คำสั่ง Terminal สั่ง Disconnect ได้โดยตรง ต้องแอบเจาะช่องทางสื่อสารพิเศษ (Local IPC) เชื่อมเข้า Dashboard ซึ่งเพิ่มความเสี่ยงโดยไม่จำเป็น
+        </p>
+
+        <div class="diagram-visual">
+            <div class="node">
+                <div class="node-title">💻 CLI Process</div>
+                <div class="node-sub">คำสั่งใน Terminal</div>
+            </div>
+
+            <div class="connector">
+                <span class="tag-danger">⚠️ เพิ่มช่องโหว่ (Attack Surface)</span>
+                <div class="connector-line danger"></div>
+                <span style="font-size: 0.75rem; color: var(--accent-rose);">Local IPC / Pipe</span>
+            </div>
+
+            <div class="node" style="border-color: var(--accent-cyan);">
+                <div class="node-title" style="color: var(--accent-cyan);">🖥️ C2 Controller Process</div>
+                <div class="node-sub">หน้าจอ Dashboard + Session Memory</div>
+            </div>
+        </div>
+
+        <div style="background: rgba(244, 63, 94, 0.1); border: 1px solid rgba(244, 63, 94, 0.3); padding: 1rem; border-radius: 12px; font-size: 0.9rem; color: #fca5a5;">
+            <strong>📌 สรุปมุมมอง Security:</strong>
+            หากมีแฮกเกอร์สามารถเข้าถึงเครื่องแม่ข่าย C2 ของเราได้ (Local Privilege Escalation) แฮกเกอร์อาจแอบส่งสัญญาณผ่าน "ช่องท่อเชื่อมพิเศษ" นี้เพื่อมาป่วนหรือตัดสาย C2 Agent ของเราทั้งหมดได้!
+        </div>
+    </div>
+
+    <!-- Summary Box -->
+    <div class="summary-box">
+        <div class="summary-title">สรุปทางออกที่ปลอดภัยและลงตัวที่สุด</div>
+        <p style="color: var(--text-muted); font-size: 0.95rem;">การเลือกแนวทางนี้ช่วยให้ระบบสะอาด ปลอดภัย และตรงตามหลักเกณฑ์ของ Red Team Architecture</p>
+
+        <div class="summary-list">
+            <div class="summary-item">
+                <strong style="color: var(--accent-amber);">1. ปิดการตั้งค่า CLI Disconnect</strong>
+                <span style="font-size: 0.85rem; color: var(--text-muted);">ตัดคำสั่ง Disconnect ออกจาก Terminal เพื่อไม่ต้องสร้างท่อสื่อสารที่เสี่ยงโดนแฮก</span>
+            </div>
+            <div class="summary-item">
+                <strong style="color: var(--accent-cyan);">2. ใช้ Dashboard ตัดสายชั่วคราว</strong>
+                <span style="font-size: 0.85rem; color: var(--text-muted);">เมื่อต้องการ Disconnect สั่งจากหน้าจอ Dashboard (กดปุ่ม D) ซึ่งอยู่ใน Memory เดียวกัน</span>
+            </div>
+            <div class="summary-item">
+                <strong style="color: var(--accent-rose);">3. ใช้ Terminal สั่งแบนถาวร</strong>
+                <span style="font-size: 0.85rem; color: var(--text-muted);">เมื่อต้องการ Revoke สั่งผ่าน Terminal ได้ปกติเพราะไปอัปเดตไฟล์ฐานข้อมูล SQLite ตรงๆ</span>
+            </div>
+        </div>
+    </div>
+
+    <footer>
+        PhantomLink C2 Private Network Project • Red Team Security Advisor
+    </footer>
+</div>
+
+<script>
+    function simulateDisconnect() {
+        const badge = document.getElementById('status-badge');
+        const cert = document.getElementById('cert-status');
+        const exp = document.getElementById('exp-text');
+
+        badge.className = "status-badge status-offline";
+        badge.innerText = "🟡 OFFLINE (เตะออกชั่วคราว)";
+
+        cert.innerHTML = 'ใบอนุญาต (Certificate): <span style="color: var(--accent-emerald);">VALID (ยังมีสิทธิ์ Reconnect)</span>';
+
+        exp.innerHTML = '<b style="color: var(--accent-amber);">ผลของการสั่ง Disconnect (กด D บน Dashboard):</b><br>สายถูกตัดขาดชั่วคราว! แต่เนื่องจากใบบัตรผ่าน (Certificate) ยังไม่ถูกยกเลิก Agent ตัวนี้จะสามารถพยายามต่อสายกลับเข้ามาใหม่ได้ตามเวลาที่ตั้งไว้';
+    }
+
+    function simulateRevoke() {
+        const badge = document.getElementById('status-badge');
+        const cert = document.getElementById('cert-status');
+        const exp = document.getElementById('exp-text');
+
+        badge.className = "status-badge status-banned";
+        badge.innerText = "🔴 REVOKED (แบนถาวร)";
+
+        cert.innerHTML = 'ใบอนุญาต (Certificate): <span style="color: var(--accent-rose);">REVOKED (ยึดบัตรแล้ว)</span>';
+
+        exp.innerHTML = '<b style="color: var(--accent-rose);">ผลของการสั่ง Revoke (สั่งผ่าน Terminal):</b><br>ใบบัตรผ่านในสมุดทะเบียน SQLite ถูกขีดฆ่าทิ้งทันที! ต่อให้ Agent พยายามจะต่อสายกลับมาแค่ไหน ประตู mTLS ก็จะปฏิเสธและบล็อกทันทีตลอดไป';
+    }
+
+    function resetSim() {
+        const badge = document.getElementById('status-badge');
+        const cert = document.getElementById('cert-status');
+        const exp = document.getElementById('exp-text');
+
+        badge.className = "status-badge status-online";
+        badge.innerText = "🟢 ONLINE (ต่อกับ C2 อยู่)";
+
+        cert.innerHTML = 'ใบอนุญาต (Certificate): <span style="color: var(--accent-emerald);">VALID (ใช้งานได้)</span>';
+
+        exp.innerHTML = 'ขณะนี้ Agent กำลังเชื่อมต่อและส่งสัญญาณ Heartbeat กับ C2 ตามปกติ';
+    }
+</script>
+
+</body>
+</html>

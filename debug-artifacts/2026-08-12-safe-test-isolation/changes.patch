@@ -1,0 +1,148 @@
+diff --git a/C2/dashboard.py b/C2/dashboard.py
+index aaa395e..76945e1 100644
+--- a/C2/dashboard.py
++++ b/C2/dashboard.py
+@@ -138,8 +138,9 @@ def build_app(
+     refresh_interval: float = 2.0,
+ ):
+     """Factory so the Textual import stays lazy and testable."""
+-    from textual.app import App, ComposeResult
++    from textual.app import App, ComposeResult, ScreenStackError
+     from textual.containers import Vertical
++    from textual.css.query import NoMatches
+     from textual.widgets import DataTable, Footer, Header, Static
+ 
+     class C2DashboardApp(App):
+@@ -175,13 +176,19 @@ def build_app(
+             self._refresh()
+ 
+         def _refresh(self) -> None:
++            if not self.is_running:
++                return
++            try:
++                table = self.query_one("#clients", DataTable)
++                status = self.query_one("#status", Static)
++            except (NoMatches, ScreenStackError):
++                return
+             try:
+                 rows = self._data.refresh_if_stale()
+                 summary = self._data.summary()
+             except Exception as exc:  # defensive: never let the loop die
+-                self.query_one("#status", Static).update(f"[red]snapshot error: {exc}[/red]")
++                status.update(f"[red]snapshot error: {exc}[/red]")
+                 return
+-            table = self.query_one("#clients", DataTable)
+             table.clear()
+             for row in rows:
+                 state = "ON" if row.connected else "off"
+@@ -191,7 +198,7 @@ def build_app(
+                     row.quality, str(row.total_commands), state,
+                 )
+             uptime = int(time.time() - self._started)
+-            self.query_one("#status", Static).update(
++            status.update(
+                 f"[bold cyan]Uptime {uptime}s[/bold cyan] | "
+                 f"Total [bold]{int(summary['total'])}[/bold] | "
+                 f"Connected [bold green]{int(summary['connected'])}[/bold green] | "
+diff --git a/requirements.txt b/requirements.txt
+index cf1f34a..5d38af9 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,6 +1,8 @@
+ discord.py>=2.3,<3
+ notify-py>=0.3,<1
+ requests>=2.31,<3
++PyNaCl>=1.5,<2
++textual>=8,<9
+ pywin32>=306; sys_platform == 'win32'
+ psutil>=5.9,<6
+ pyautogui>=0.9,<1
+diff --git a/tests/test_combined_launcher.py b/tests/test_combined_launcher.py
+index 9414022..0f868bc 100644
+--- a/tests/test_combined_launcher.py
++++ b/tests/test_combined_launcher.py
+@@ -36,11 +36,13 @@ class CombinedLauncherUnitTests(unittest.TestCase):
+                 self.assertTrue(mock_c2_mod.main.called)
+ 
+         # Test choice 3 (Bot Only)
++        bot_coro = object()
+         with patch("builtins.input", return_value="3"):
+-            with patch("discord_bot.main") as mock_bot_main:
++            with patch("discord_bot.main", new=MagicMock(return_value=bot_coro)) as mock_bot_main:
+                 with patch("asyncio.run") as mock_async_run:
+                     combined_launcher.main()
+-                    self.assertTrue(mock_async_run.called)
++                    mock_bot_main.assert_called_once_with()
++                    mock_async_run.assert_called_once_with(bot_coro)
+ 
+         # Test choice 4 (Exit)
+         with patch("builtins.input", return_value="4"):
+diff --git a/tests/test_dashboard.py b/tests/test_dashboard.py
+index 2557fa3..ed82125 100644
+--- a/tests/test_dashboard.py
++++ b/tests/test_dashboard.py
+@@ -171,3 +171,17 @@ class TestDashboardApp:
+                 await pilot.pause()
+ 
+         asyncio.run(run())  # must not raise/hang
++
++    def test_late_refresh_after_shutdown_is_ignored(self):
++        import asyncio
++
++        async def run():
++            app = build_app(
++                DashboardData(snapshot_fn=sample_snapshot),
++                refresh_interval=3600,
++            )
++            async with app.run_test(size=(80, 24)) as pilot:
++                await pilot.pause()
++            app._refresh()  # a queued timer callback may arrive during shutdown
++
++        asyncio.run(run())
+diff --git a/tests/test_phantomlink_deep_coverage.py b/tests/test_phantomlink_deep_coverage.py
+index ebab257..2bb7949 100644
+--- a/tests/test_phantomlink_deep_coverage.py
++++ b/tests/test_phantomlink_deep_coverage.py
+@@ -62,22 +62,32 @@ class PhantomLinkDeepCoverageComprehensiveTests(unittest.TestCase):
+             res = sc.execute_command("sleep 500")
+             self.assertIn("timed out", res)
+ 
+-    def test_main_startup_sequence(self):
++    @patch("time.sleep", return_value=None)
++    @patch("requests.post")
++    def test_main_startup_sequence(self, mock_post, mock_sleep):
+         with patch("ctypes.windll.shell32.IsUserAnAdmin", return_value=False), \
+-             patch("client.PhantomLink.disable_uac"), \
+-             patch("client.PhantomLink.update"), \
+-             patch("client.PhantomLink.bypass_security"), \
+-             patch("client.PhantomLink.move_to_hidden_location"), \
+-             patch("client.PhantomLink.bypass_all_security"), \
+-             patch("client.PhantomLink.ShellClient") as mock_client_cls:
+-            
++                patch("client.PhantomLink.disable_uac"), \
++                patch("client.PhantomLink.update"), \
++                patch("client.PhantomLink.bypass_security"), \
++                patch("client.PhantomLink.move_to_hidden_location"), \
++                patch("client.PhantomLink.bypass_all_security"), \
++                patch("client.PhantomLink.KeyloggerModule.start") as mock_keylogger_start, \
++                patch("client.PhantomLink.ScreenshotModule.start") as mock_screenshot_start, \
++                patch("client.PhantomLink.ShellClient") as mock_client_cls:
++
+             mock_client_inst = MagicMock()
+             mock_client_cls.return_value = mock_client_inst
+             mock_client_inst.run.side_effect = Exception("Stop main loop test")
+ 
+             with patch("os.path.exists", return_value=True):
+-                pl.main()
+-                self.assertTrue(mock_client_inst.run.called)
++                try:
++                    pl.main()
++                except Exception:
++                    pass
++
++            self.assertTrue(mock_client_inst.run.called)
++            mock_keylogger_start.assert_called_once_with()
++            mock_screenshot_start.assert_called_once_with()
+ 
+ 
+ if __name__ == "__main__":

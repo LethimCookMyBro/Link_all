@@ -138,9 +138,8 @@ def build_app(
     refresh_interval: float = 2.0,
 ):
     """Factory so the Textual import stays lazy and testable."""
-    from textual.app import App, ComposeResult, ScreenStackError
+    from textual.app import App, ComposeResult
     from textual.containers import Vertical
-    from textual.css.query import NoMatches
     from textual.widgets import DataTable, Footer, Header, Static
 
     class C2DashboardApp(App):
@@ -176,19 +175,13 @@ def build_app(
             self._refresh()
 
         def _refresh(self) -> None:
-            if not self.is_running:
-                return
-            try:
-                table = self.query_one("#clients", DataTable)
-                status = self.query_one("#status", Static)
-            except (NoMatches, ScreenStackError):
-                return
             try:
                 rows = self._data.refresh_if_stale()
                 summary = self._data.summary()
             except Exception as exc:  # defensive: never let the loop die
-                status.update(f"[red]snapshot error: {exc}[/red]")
+                self.query_one("#status", Static).update(f"[red]snapshot error: {exc}[/red]")
                 return
+            table = self.query_one("#clients", DataTable)
             table.clear()
             for row in rows:
                 state = "ON" if row.connected else "off"
@@ -198,7 +191,7 @@ def build_app(
                     row.quality, str(row.total_commands), state,
                 )
             uptime = int(time.time() - self._started)
-            status.update(
+            self.query_one("#status", Static).update(
                 f"[bold cyan]Uptime {uptime}s[/bold cyan] | "
                 f"Total [bold]{int(summary['total'])}[/bold] | "
                 f"Connected [bold green]{int(summary['connected'])}[/bold green] | "

