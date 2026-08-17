@@ -1,0 +1,3 @@
+?? debug-artifacts/managed-agent-preflight/
+?? debug-artifacts/task4-cli-store/
+?? debug-artifacts/task4-current.diff

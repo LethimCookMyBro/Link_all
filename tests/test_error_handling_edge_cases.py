@@ -239,7 +239,15 @@ class DiscordBotGatewayTests(unittest.TestCase):
         import discord_bot
 
         with patch("config.DISCORD_BOT_TOKEN", ""):
-            with patch("discord_bot.bot.start") as mock_start:
+            with patch("discord_bot.client.start") as mock_start:
+                asyncio.run(discord_bot.main())
+                mock_start.assert_not_called()
+
+    def test_whitespace_token_skips_start(self):
+        import discord_bot
+
+        with patch("config.DISCORD_BOT_TOKEN", "   "):
+            with patch("discord_bot.client.start") as mock_start:
                 asyncio.run(discord_bot.main())
                 mock_start.assert_not_called()
 
@@ -249,14 +257,14 @@ class DiscordBotGatewayTests(unittest.TestCase):
         import discord_bot
 
         with patch("config.DISCORD_BOT_TOKEN", "fake-token"):
-            with patch("discord_bot.bot.start", side_effect=discord.LoginFailure("nope")):
+            with patch("discord_bot.client.start", side_effect=discord.LoginFailure("nope")):
                 asyncio.run(discord_bot.main())  # must not raise
 
     def test_generic_gateway_error_swallowed(self):
         import discord_bot
 
         with patch("config.DISCORD_BOT_TOKEN", "fake-token"):
-            with patch("discord_bot.bot.start", side_effect=RuntimeError("rate limited")):
+            with patch("discord_bot.client.start", side_effect=RuntimeError("rate limited")):
                 asyncio.run(discord_bot.main())  # must not raise
 
 

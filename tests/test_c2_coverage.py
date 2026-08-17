@@ -149,11 +149,11 @@ class C2DeepCoverageTests(unittest.TestCase):
         t.join(timeout=2)
 
     def test_discord_helpers(self):
-        with patch("requests.post") as mock_post:
+        with patch("C2.C2.DISCORD_WEBHOOK", "https://example.invalid/webhook"), patch("C2.C2.requests.post") as mock_post:
             discord_logger("Test log message" * 200)
             self.assertTrue(mock_post.called)
 
-        with patch("requests.post") as mock_post, patch("builtins.open", unittest.mock.mock_open(read_data=b"filedata")):
+        with patch("C2.C2.DISCORD_WEBHOOK", "https://example.invalid/webhook"), patch("C2.C2.requests.post") as mock_post, patch("builtins.open", unittest.mock.mock_open(read_data=b"filedata")):
             discord_send_file("test.png", "msg")
             self.assertTrue(mock_post.called)
 

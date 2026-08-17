@@ -4,15 +4,12 @@ The data layer is pure and synchronous — tested directly. The Textual app is
 exercised headlessly through App.run_test() inside asyncio.run, so no real
 terminal, no sockets, and no hanging.
 """
-import sys
 import threading
 import time
 
 import pytest
 
-sys.path.insert(0, "C2")
-
-from dashboard import DashboardData, build_app  # noqa: E402
+from C2.dashboard import DashboardData, build_app, start_dashboard
 
 
 def make_health(latency=0.0, quality="good", total=0):
@@ -138,6 +135,37 @@ class TestDashboardData:
 
 
 class TestDashboardApp:
+    def test_start_dashboard_receives_managed_data_and_stop_event(self):
+        from unittest.mock import MagicMock, patch
+
+        managed_data = object()
+        stop_event = threading.Event()
+        app = MagicMock()
+        with (
+            patch("sys.stdin.isatty", return_value=True),
+            patch("C2.dashboard.build_app", return_value=app) as build,
+        ):
+            start_dashboard(
+                MagicMock(),
+                managed_data=managed_data,
+                stop_event=stop_event,
+            )
+
+        assert build.call_args.kwargs["managed_data"] is managed_data
+        assert build.call_args.kwargs["stop_event"] is stop_event
+        app.run.assert_called_once_with()
+
+    def test_late_refresh_after_teardown_is_contained(self):
+        import asyncio
+
+        async def run():
+            app = build_app(DashboardData(snapshot_fn=sample_snapshot), refresh_interval=0.05)
+            async with app.run_test(size=(80, 24)) as pilot:
+                await pilot.pause()
+            app._refresh()
+
+        asyncio.run(run())
+
     def test_headless_app_builds_table(self):
         import asyncio
 
@@ -145,10 +173,13 @@ class TestDashboardApp:
             app = build_app(DashboardData(snapshot_fn=sample_snapshot), refresh_interval=0.05)
             async with app.run_test(size=(100, 30)) as pilot:
                 await pilot.pause()
-                from textual.widgets import DataTable, Static
+                from textual.widgets import DataTable, Static, TabbedContent
                 table = app.query_one("#clients", DataTable)
                 n_rows = len(table.rows)
                 status = str(app.query_one("#status", Static).render())
+                tabs = app.query_one("#dashboard-tabs", TabbedContent)
+                assert tabs.active == "legacy"
+                assert [tab.id for tab in tabs.query("TabPane")] == ["legacy", "managed"]
                 await pilot.pause()
                 return n_rows, status
 

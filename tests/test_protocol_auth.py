@@ -3,15 +3,12 @@ modules. All framing tests use an in-memory buffer — no real sockets.
 """
 import socket
 import struct
-import sys
 from unittest.mock import MagicMock
 
 import pytest
 
-sys.path.insert(0, "C2")
-
-from auth import check_api_key, check_client_password  # noqa: E402
-from protocol import (  # noqa: E402
+from C2.auth import check_api_key, check_client_password
+from C2.protocol import (
     MAX_MESSAGE_SIZE,
     decode_message,
     encode_message,
