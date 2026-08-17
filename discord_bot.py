@@ -20,14 +20,17 @@ if __name__ == "__main__":
     if hasattr(sys.stdout, "buffer") and getattr(sys.stdout, "encoding", "").lower() != "utf-8":
         sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 import os
+import sys
 import config
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from config import DISCORD_WEBHOOK, API_KEY as CONFIG_API_KEY, SERVER_PORT
 DISCORD_CHANNEL_ID = 1525081606501568577
 
 # C2 Server config
 C2_HOST = "127.0.0.1"
-C2_PORT = SERVER_PORT if 'SERVER_PORT' in locals() else 5000
+C2_PORT = SERVER_PORT
 API_PORT = 5001
-API_KEY = CONFIG_API_KEY if 'CONFIG_API_KEY' in locals() else "PhantomLink-API-2026"
+API_KEY = CONFIG_API_KEY
 TARGET_CLIENT = "all"
 
 

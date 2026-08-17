@@ -98,9 +98,9 @@ class Milestone2Tests(unittest.TestCase):
         config_path = _REPO_ROOT / "config.py"
         target_file = config_path if config_path.exists() else (_REPO_ROOT / "C2" / "C2.py")
         c_content = target_file.read_text(encoding="utf-8")
-        lines_with_server_ip = [
+        lines_with_old_ip = [
             line for line in c_content.splitlines()
-            if "SERVER_IP" in line and not line.strip().startswith("#")
+            if "81.10.55.8" in line and not line.strip().startswith("#")
         ]
         self.assertEqual(lines_with_old_ip, [])
         self.assertIn('SERVER_IP = os.getenv("PHANTOMLINK_SERVER_IP",', c_content)
